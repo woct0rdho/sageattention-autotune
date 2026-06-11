@@ -1,0 +1,78 @@
+/*
+ * Copyright (c) 2024 by SageAttention team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "fused.h"
+
+#include <Python.h>
+#include <torch/csrc/stable/library.h>
+
+/* Creates a dummy empty _C module that can be imported from Python.
+   The import from Python will load the .so consisting of this file
+   in this extension, so that the TORCH_LIBRARY static initializers
+   below are run. */
+PyMODINIT_FUNC PyInit__fused(void)
+{
+    static struct PyModuleDef module_def = {
+        PyModuleDef_HEAD_INIT,
+        "_fused",       /* name of module */
+        NULL,           /* module documentation, may be NULL */
+        -1,             /* size of per-interpreter state of the module,
+                           or -1 if the module keeps state in global variables. */
+        NULL,           /* methods */
+    };
+    return PyModule_Create(&module_def);
+}
+
+// Defines the operators
+STABLE_TORCH_LIBRARY(sageattention_fused, m) {
+    m.def("quant_per_block_int8_cuda("
+            "Tensor input, "
+            "Tensor(a!) output, "
+            "Tensor scale, "
+            "int block_size, "
+            "int tensor_layout"
+          ") -> ()");
+    m.def("quant_per_block_int8_fuse_sub_mean_cuda("
+            "Tensor input, "
+            "Tensor mean, "
+            "Tensor(a!) output, "
+            "Tensor scale, "
+            "int block_size, "
+            "int tensor_layout"
+          ") -> ()");
+    m.def("quant_per_warp_int8_cuda("
+            "Tensor input, "
+            "Tensor(a!) output, "
+            "Tensor scale, "
+            "int block_size, "
+            "int wrap_block_size, "
+            "int tensor_layout"
+          ") -> ()");
+    m.def("sub_mean_cuda("
+            "Tensor input, "
+            "Tensor mean, "
+            "Tensor(a!) output, "
+            "int tensor_layout"
+          ") -> ()");
+}
+
+// Registers CUDA implementations
+STABLE_TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
+    m.impl("quant_per_block_int8_cuda", TORCH_BOX(quant_per_block_int8_cuda));
+    m.impl("quant_per_block_int8_fuse_sub_mean_cuda", TORCH_BOX(quant_per_block_int8_fuse_sub_mean_cuda));
+    m.impl("quant_per_warp_int8_cuda", TORCH_BOX(quant_per_warp_int8_cuda));
+    m.impl("sub_mean_cuda", TORCH_BOX(sub_mean_cuda));
+}
