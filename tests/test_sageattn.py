@@ -43,7 +43,7 @@ def _error_report(actual, expected):
     return passed, msg
 
 
-def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype):
+def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k):
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
 
@@ -57,7 +57,7 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dty
         is_causal,
         None,
         pv_accum_i,
-        True,
+        smooth_k,
         False,
         False,
         config,
@@ -81,6 +81,7 @@ def main():
             ("HND", "NHD"),
             (False, True),
             ("fp32", "fp16", "fp16+fp32"),
+            (False, True),
         )
     )
 
@@ -89,15 +90,15 @@ def main():
         config_errors = []
         config_tested = 0
 
-        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype in modes:
+        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in modes:
             q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
             if config not in _valid_configs(q, is_causal):
                 continue
 
             config_tested += 1
             name = (
-                f"head_dim={head_dim} layout={tensor_layout} is_causal={is_causal} "
-                f"dtype={dtype} pv_accum_dtype={pv_accum_dtype}"
+                f"head_dim={head_dim} dtype={dtype} layout={tensor_layout} is_causal={is_causal} "
+                f"pv_accum_dtype={pv_accum_dtype} smooth_k={smooth_k}"
             )
             try:
                 passed, msg = _run_case(
@@ -107,6 +108,7 @@ def main():
                     tensor_layout=tensor_layout,
                     is_causal=is_causal,
                     pv_accum_dtype=pv_accum_dtype,
+                    smooth_k=smooth_k,
                 )
             except Exception as e:
                 passed = False
