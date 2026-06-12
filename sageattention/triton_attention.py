@@ -16,6 +16,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
 ):
@@ -87,6 +88,7 @@ def sageattn_qk_int8_pv_fp16_triton(
         tensor_layout=tensor_layout,
         is_causal=is_causal,
         sm_scale=sm_scale,
+        pv_accum_dtype=pv_accum_dtype,
         output_dtype=dtype,
         return_lse=return_lse,
     )
