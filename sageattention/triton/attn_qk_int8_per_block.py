@@ -39,6 +39,7 @@ def _attn_fwd_inner(
     BLOCK_N: tl.constexpr,
     STAGE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    PV_ACCUM_FP32: tl.constexpr,
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,
 ):
@@ -79,7 +80,10 @@ def _attn_fwd_inner(
 
         v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n))
         p = p.to(tl.float16)
-        acc += tl.dot(p, v, out_dtype=tl.float16)
+        if PV_ACCUM_FP32:
+            acc += tl.dot(p, v, out_dtype=tl.float32)
+        else:
+            acc += tl.dot(p, v, out_dtype=tl.float16)
         m_i = m_ij
 
         K_ptrs += BLOCK_N * stride_kn
@@ -120,6 +124,7 @@ def _attn_fwd(
     BLOCK_N: tl.constexpr,
     RETURN_LSE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    PV_ACCUM_FP32: tl.constexpr,
 ):
     start_m = tl.program_id(0)
 
@@ -170,6 +175,7 @@ def _attn_fwd(
             BLOCK_N,
             1,
             IS_CAUSAL,
+            PV_ACCUM_FP32,
             offs_m,
             offs_n,
         )
@@ -192,6 +198,7 @@ def _attn_fwd(
             BLOCK_N,
             2,
             IS_CAUSAL,
+            PV_ACCUM_FP32,
             offs_m,
             offs_n,
         )
@@ -215,6 +222,7 @@ def _attn_fwd(
             BLOCK_N,
             0,
             IS_CAUSAL,
+            PV_ACCUM_FP32,
             offs_m,
             offs_n,
         )
@@ -237,6 +245,7 @@ def forward(
     tensor_layout="HND",
     is_causal=False,
     sm_scale=None,
+    pv_accum_dtype="fp32",
     output_dtype=torch.float16,
     return_lse=False,
 ):
@@ -275,7 +284,7 @@ def forward(
     if return_lse:
         lse = torch.empty([b, h_qo, qo_len], dtype=torch.float32, device=q.device)
     else:
-        lse = torch.empty([0], dtype=torch.float32, device="cpu")
+        lse = torch.empty([0], dtype=torch.float32, device=q.device)
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
     _attn_fwd[grid](
@@ -308,6 +317,7 @@ def forward(
         HEAD_DIM=head_dim,
         RETURN_LSE=return_lse,
         IS_CAUSAL=is_causal,
+        PV_ACCUM_FP32=(pv_accum_dtype == "fp32"),
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4,
     )
