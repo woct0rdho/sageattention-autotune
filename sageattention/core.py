@@ -150,10 +150,10 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
         if num_qo_heads % num_kv_heads != 0:
             raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
 
-        q_per_kv_heads = num_qo_heads // num_kv_heads
-        km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=head_dim_index) if q_per_kv_heads > 1 else km
-
         if return_lse:
+            q_per_kv_heads = num_qo_heads // num_kv_heads
+            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=head_dim_index) if q_per_kv_heads > 1 else km
+
             if tensor_layout == "NHD":
                 lse_correction = torch.matmul(
                     q.transpose(1, 2),
