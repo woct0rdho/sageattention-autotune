@@ -4,17 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sageattention import sageattn_qk_int8_pv_fp16_cuda
-from sageattention.autotune import _SM80_QK_AUTOTUNE_CONFIGS, _valid_sm80_qk_configs
-
-
-def _error_report(actual, expected):
-    actual = actual.float()
-    expected = expected.float()
-    diff = actual - expected
-    fro_rel_err = torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected).clamp(min=1e-6)
-    max_abs_err = diff.abs().max()
-    return fro_rel_err.item(), max_abs_err.item()
+from sageattention.autotune import _AUTOTUNE_CONFIGS, _valid_configs
+from sageattention.core import _sageattn_configured
 
 
 def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layout="HND", dtype=torch.float16):
@@ -28,44 +19,55 @@ def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layo
     return q, k, v
 
 
-def _sdpa_expected(q, k, v, tensor_layout, is_causal):
+def _expected(q, k, v, tensor_layout, is_causal):
     if tensor_layout == "NHD":
-        q_ref = q.transpose(1, 2)
-        k_ref = k.transpose(1, 2)
-        v_ref = v.transpose(1, 2)
-    else:
-        q_ref, k_ref, v_ref = q, k, v
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
     with sdpa_kernel(SDPBackend.MATH):
-        expected = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, is_causal=is_causal)
+        expected = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
 
     return expected.transpose(1, 2) if tensor_layout == "NHD" else expected
 
 
-def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype):
-    q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
-    expected = _sdpa_expected(q, k, v, tensor_layout, is_causal)
-    actual = sageattn_qk_int8_pv_fp16_cuda(
-        q,
-        k,
-        v,
-        tensor_layout=tensor_layout,
-        is_causal=is_causal,
-        pv_accum_dtype=pv_accum_dtype,
-        qk_config=config,
-    )
+def _error_report(actual, expected):
+    actual = actual.float()
+    expected = expected.float()
+    diff = actual - expected
+    fro_rel_err = (torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected).clamp(min=1e-6)).item()
+    max_abs_err = diff.abs().max().item()
 
-    fro_rel_err, max_abs_err = _error_report(actual, expected)
+    passed = fro_rel_err <= 0.02 and max_abs_err <= 0.1
     msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
-    fro_rel_tol = 0.02 if dtype == torch.bfloat16 else 0.02
-    max_abs_tol = 0.1 if dtype == torch.bfloat16 else 0.1
-    passed = fro_rel_err <= fro_rel_tol and max_abs_err <= max_abs_tol
     return passed, msg
 
 
+def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype):
+    q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
+    expected = _expected(q, k, v, tensor_layout, is_causal)
+
+    layout_i = {"NHD": 0, "HND": 1}[tensor_layout]
+    pv_accum_i = {"fp32": 0, "fp16": 1, "fp16+fp32": 2}[pv_accum_dtype]
+    actual = _sageattn_configured(
+        q,
+        k,
+        v,
+        layout_i,
+        is_causal,
+        None,
+        pv_accum_i,
+        True,
+        False,
+        False,
+        config,
+    )
+
+    return _error_report(actual, expected)
+
+
 def main():
-    torch.manual_seed(0)
-    print(f"Testing SageAttention sm80 autotune configs ({len(_SM80_QK_AUTOTUNE_CONFIGS)} compiled configs)\n")
+    print(f"Testing SageAttention autotune configs ({len(_AUTOTUNE_CONFIGS)} compiled configs)\n")
     print("Config format: (blk_q, blk_k, warp_q, warp_k)")
     print("=" * 80)
 
@@ -82,14 +84,14 @@ def main():
         )
     )
 
-    for config in _SM80_QK_AUTOTUNE_CONFIGS:
+    for config in _AUTOTUNE_CONFIGS:
         config_passed = True
         config_errors = []
         config_tested = 0
 
         for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype in modes:
             q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
-            if config not in _valid_sm80_qk_configs(q, is_causal):
+            if config not in _valid_configs(q, is_causal):
                 continue
 
             config_tested += 1
@@ -106,9 +108,9 @@ def main():
                     is_causal=is_causal,
                     pv_accum_dtype=pv_accum_dtype,
                 )
-            except Exception as exc:
+            except Exception as e:
                 passed = False
-                msg = f"error={exc!r}"
+                msg = f"error={e!r}"
 
             if not passed:
                 config_passed = False
@@ -124,16 +126,11 @@ def main():
                 print(error)
 
     print("=" * 80)
-    print(f"Summary: {len(passed_configs)}/{len(_SM80_QK_AUTOTUNE_CONFIGS)} configs passed")
+    print(f"Summary: {len(passed_configs)}/{len(_AUTOTUNE_CONFIGS)} configs passed")
 
     if failed_configs:
         print(f"\nFailed configs ({len(failed_configs)}):")
         for config in failed_configs:
-            print(f"  {config}")
-
-    if passed_configs:
-        print(f"\nPassed configs ({len(passed_configs)}):")
-        for config in passed_configs:
             print(f"  {config}")
 
     assert not failed_configs

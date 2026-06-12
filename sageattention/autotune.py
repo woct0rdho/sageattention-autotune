@@ -1,35 +1,20 @@
 import os
-from collections.abc import Callable
+from typing import Optional
 
 import torch
 import triton
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
-from torch.fx.experimental.symbolic_shapes import optimization_hint
 
-_SM80_QK_AUTOTUNE_CONFIGS = (
+_AUTOTUNE_CONFIGS = (
     (128, 64, 32, 64),
     (128, 32, 32, 32),
     (64, 64, 32, 64),
     (128, 64, 16, 64),
 )
-_SM80_QK_AUTOTUNE_CACHE = {}
-_PV_ACCUM_DTYPE_TO_ID = {"fp32": 0, "fp16": 1, "fp16+fp32": 2}
-_PV_ACCUM_DTYPE_FROM_ID = {value: key for key, value in _PV_ACCUM_DTYPE_TO_ID.items()}
+_AUTOTUNE_CACHE = {}
 
 
-def _padded_head_dim(head_dim: int) -> int:
-    if head_dim < 64:
-        return 64
-    if 64 < head_dim < 128:
-        return 128
-    if 128 < head_dim < 256:
-        return 256
-    if head_dim in (64, 128, 256):
-        return head_dim
-    raise ValueError(f"Unsupported head_dim: {head_dim}")
-
-
-def _sm80_qk_config_is_valid(
+def _config_is_valid(
     config: tuple[int, int, int, int],
     head_dim: int,
     is_causal: bool,
@@ -69,23 +54,21 @@ def _sm80_qk_config_is_valid(
     return smem_bytes <= smem_limit
 
 
-def _valid_sm80_qk_configs(
+def _valid_configs(
     q: torch.Tensor,
     is_causal: bool,
 ) -> tuple[tuple[int, int, int, int], ...]:
-    return _valid_sm80_qk_configs_for_head_dim(q.size(-1), is_causal, q.device)
+    return _valid_configs_for_head_dim(q.size(-1), is_causal, q.device)
 
 
-def _valid_sm80_qk_configs_for_head_dim(
+def _valid_configs_for_head_dim(
     head_dim: int,
     is_causal: bool,
     device: torch.device,
 ) -> tuple[tuple[int, int, int, int], ...]:
-    configs = tuple(
-        config for config in _SM80_QK_AUTOTUNE_CONFIGS if _sm80_qk_config_is_valid(config, head_dim, is_causal, device)
-    )
+    configs = tuple(config for config in _AUTOTUNE_CONFIGS if _config_is_valid(config, head_dim, is_causal, device))
     if not configs:
-        raise RuntimeError(f"No valid sm80 QK config for head_dim={head_dim} is_causal={is_causal}.")
+        raise RuntimeError(f"No valid config for head_dim={head_dim} is_causal={is_causal}.")
     return configs
 
 
@@ -93,9 +76,9 @@ def _autotune_cache_key(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    tensor_layout: str,
+    layout_i: int,
     is_causal: bool,
-    pv_accum_dtype: str,
+    pv_accum_i: int,
     smooth_k: bool,
     smooth_v: bool,
     return_lse: bool,
@@ -110,35 +93,35 @@ def _autotune_cache_key(
         tuple(q.stride()),
         tuple(k.stride()),
         tuple(v.stride()),
-        tensor_layout,
+        layout_i,
         is_causal,
-        pv_accum_dtype,
+        pv_accum_i,
         smooth_k,
         smooth_v,
         return_lse,
     )
 
 
-def _select_sm80_qk_config(
+def _eager_autotune_select(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    tensor_layout: str,
+    layout_i: int,
     is_causal: bool,
-    pv_accum_dtype: str,
+    pv_accum_i: int,
+    sm_scale: Optional[float],
     smooth_k: bool,
     smooth_v: bool,
     return_lse: bool,
-    run_fn: Callable[[tuple[int, int, int, int]], object],
 ) -> tuple[int, int, int, int]:
-    configs = _valid_sm80_qk_configs(q, is_causal)
-    if torch.compiler.is_compiling():
-        return configs[0]
-    if len(configs) == 1 or os.environ.get("SAGEATTN_AUTOTUNE", "1").lower() in ("0", "false", "off"):
+    from .core import _sageattn_configured
+
+    configs = _valid_configs(q, is_causal)
+    if len(configs) == 1:
         return configs[0]
 
-    key = _autotune_cache_key(q, k, v, tensor_layout, is_causal, pv_accum_dtype, smooth_k, smooth_v, return_lse)
-    cached = _SM80_QK_AUTOTUNE_CACHE.get(key)
+    key = _autotune_cache_key(q, k, v, layout_i, is_causal, pv_accum_i, smooth_k, smooth_v, return_lse)
+    cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
 
@@ -148,93 +131,95 @@ def _select_sm80_qk_config(
     best_ms = None
 
     for config in configs:
-        ms = triton.testing.do_bench(lambda config=config: run_fn(config), warmup=warmup_ms, rep=rep_ms)
+        ms = triton.testing.do_bench(
+            lambda config=config: _sageattn_configured(
+                q,
+                k,
+                v,
+                layout_i,
+                is_causal,
+                sm_scale,
+                pv_accum_i,
+                smooth_k,
+                smooth_v,
+                return_lse,
+                config,
+            ),
+            warmup=warmup_ms,
+            rep=rep_ms,
+        )
         if best_ms is None or ms < best_ms:
             best_ms = ms
             best_config = config
 
-    _SM80_QK_AUTOTUNE_CACHE[key] = best_config
-    print(f"sageattention autotune key={key} config={best_config} time={best_ms:.3f} ms")
+    _AUTOTUNE_CACHE[key] = best_config
     return best_config
 
 
-def _tensor_layout_from_id(tensor_layout: int) -> str:
-    if tensor_layout == 0:
-        return "NHD"
-    if tensor_layout == 1:
-        return "HND"
-    raise ValueError(f"Unknown tensor layout id: {tensor_layout}")
+@torch.library.custom_op("sageattention_internal::sageattn_autotuned", mutates_args=())
+def _sageattn_autotuned(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout_i: int,
+    is_causal: bool,
+    sm_scale: float,
+    pv_accum_i: int,
+    smooth_k: bool,
+    smooth_v: bool,
+    blk_q: int = 0,
+    blk_k: int = 0,
+    warp_q: int = 0,
+    warp_k: int = 0,
+) -> torch.Tensor:
+    from .core import _sageattn_configured
 
+    qk_config = (blk_q, blk_k, warp_q, warp_k)
+    if min(qk_config) <= 0 or qk_config not in _valid_configs(q, is_causal):
+        qk_config = _valid_configs(q, is_causal)[0]
 
-def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
-    @torch.library.custom_op("sageattention_internal::sageattn_sm80_autotuned", mutates_args=())
-    def _sageattn_qk_int8_pv_fp16_cuda_autotuned(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        tensor_layout: int,
-        is_causal: bool,
-        sm_scale: float,
-        pv_accum_dtype: int,
-        smooth_k: bool,
-        smooth_v: bool,
-        blk_q: int = 0,
-        blk_k: int = 0,
-        warp_q: int = 0,
-        warp_k: int = 0,
-    ) -> torch.Tensor:
-        tensor_layout_s = _tensor_layout_from_id(tensor_layout)
-        pv_accum_dtype_s = _PV_ACCUM_DTYPE_FROM_ID[pv_accum_dtype]
-
-        head_dim = _padded_head_dim(q.size(-1))
-        valid_configs = _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, q.device)
-        qk_config = (blk_q, blk_k, warp_q, warp_k)
-        if min(qk_config) <= 0 or qk_config not in valid_configs:
-            qk_config = valid_configs[0]
-
-        return impl_fn(
-            q,
-            k,
-            v,
-            tensor_layout=tensor_layout_s,
-            is_causal=is_causal,
-            sm_scale=sm_scale,
-            pv_accum_dtype=pv_accum_dtype_s,
-            smooth_k=smooth_k,
-            smooth_v=smooth_v,
-            return_lse=False,
-            qk_config=qk_config,
-        )
-
-    @_sageattn_qk_int8_pv_fp16_cuda_autotuned.register_fake
-    def _(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        tensor_layout: int,
-        is_causal: bool,
-        sm_scale: float,
-        pv_accum_dtype: int,
-        smooth_k: bool,
-        smooth_v: bool,
-        blk_q: int = 0,
-        blk_k: int = 0,
-        warp_q: int = 0,
-        warp_k: int = 0,
-    ) -> torch.Tensor:
-        return torch.empty_like(q)
-
-    def _generate_sm80_autotune_configs(fake_tensors: dict[str, torch.Tensor]):
-        q = fake_tensors["q"]
-        is_causal = bool(fake_tensors.get("is_causal", False))
-        head_dim = _padded_head_dim(optimization_hint(q.shape[-1]))
-        return [
-            CustomOpConfig(blk_q=cfg[0], blk_k=cfg[1], warp_q=cfg[2], warp_k=cfg[3])
-            for cfg in _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, q.device)
-        ]
-
-    register_custom_op_autotuning(
-        _sageattn_qk_int8_pv_fp16_cuda_autotuned,
-        config_generator=_generate_sm80_autotune_configs,
+    return _sageattn_configured(
+        q,
+        k,
+        v,
+        layout_i,
+        is_causal,
+        sm_scale,
+        pv_accum_i,
+        smooth_k,
+        smooth_v,
+        False,
+        qk_config,
     )
-    return _sageattn_qk_int8_pv_fp16_cuda_autotuned
+
+
+@_sageattn_autotuned.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout_i: int,
+    is_causal: bool,
+    sm_scale: float,
+    pv_accum_i: int,
+    smooth_k: bool,
+    smooth_v: bool,
+    blk_q: int = 0,
+    blk_k: int = 0,
+    warp_q: int = 0,
+    warp_k: int = 0,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+register_custom_op_autotuning(
+    _sageattn_autotuned,
+    config_generator=lambda fake_tensors: [
+        CustomOpConfig(blk_q=cfg[0], blk_k=cfg[1], warp_q=cfg[2], warp_k=cfg[3])
+        for cfg in _valid_configs_for_head_dim(
+            fake_tensors["q"].shape[-1],
+            False,
+            fake_tensors["q"].device,
+        )
+    ],
+)

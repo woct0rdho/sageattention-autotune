@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../dispatch_utils.h"
 #include "qk_int8_sv_f16_kernel_sm80.cuh"
+#include "../dispatch_utils.h"
 
 #include <stdexcept>
 
@@ -173,7 +173,10 @@ void launch_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
 
   const dim3 grid(div_ceil(ctx.params.qo_len, CtaQ), ctx.params.num_qo_heads, ctx.params.batch_size);
   const dim3 block(32, (CtaQ / WarpQ) * (CtaK / WarpK));
-  kernel_func<<<grid, block, smem_max>>>(
+  const auto device_guard = make_device_guard(ctx.query);
+  const auto stream = get_current_cuda_stream(ctx.query);
+
+  kernel_func<<<grid, block, smem_max, stream>>>(
     const_ptr<int8_t>(ctx.query),
     const_ptr<int8_t>(ctx.key),
     const_ptr<half>(ctx.value),
