@@ -32,11 +32,6 @@ enum class MaskMode {
   kCausal = 1,
 };
 
-enum class QuantGranularity {
-  kPerWarp = 2,
-  kPerThread = 3,
-};
-
 enum class ComputeUnit {
   kTensorCore,
   kCudaCore,

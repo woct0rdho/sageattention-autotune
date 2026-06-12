@@ -11,7 +11,7 @@ from .autotune import (
     _valid_sm80_qk_configs,
     register_sm80_autotune_op,
 )
-from .quant import per_warp_int8, sub_mean
+from .quant import sub_mean
 from .sm80_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
 
@@ -34,7 +34,6 @@ def sageattn(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    qk_quant_gran: str = "per_thread",
     sm_scale: Optional[float] = None,
     pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
@@ -47,7 +46,6 @@ def sageattn(
         v,
         tensor_layout=tensor_layout,
         is_causal=is_causal,
-        qk_quant_gran=qk_quant_gran,
         sm_scale=sm_scale,
         pv_accum_dtype=pv_accum_dtype,
         smooth_k=smooth_k,
@@ -62,7 +60,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    qk_quant_gran: str = "per_thread",
     sm_scale: Optional[float] = None,
     pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
@@ -72,8 +69,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
 ) -> torch.Tensor:
     if tensor_layout not in ("HND", "NHD"):
         raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
-    if qk_quant_gran not in ("per_warp", "per_thread"):
-        raise ValueError(f"Unsupported qk_quant_gran: {qk_quant_gran}")
     if pv_accum_dtype not in ("fp32", "fp16", "fp16+fp32"):
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
 
@@ -81,14 +76,12 @@ def sageattn_qk_int8_pv_fp16_cuda(
         if sm_scale is None:
             sm_scale = q.size(-1) ** -0.5
         layout_i = 1 if tensor_layout == "HND" else 0
-        qk_quant_gran_i = 3 if qk_quant_gran == "per_thread" else 2
         return _sageattn_qk_int8_pv_fp16_cuda_autotuned(
             q,
             k,
             v,
             layout_i,
             is_causal,
-            qk_quant_gran_i,
             float(sm_scale),
             _PV_ACCUM_DTYPE_TO_ID[pv_accum_dtype],
             smooth_k,
@@ -101,7 +94,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
         v,
         tensor_layout=tensor_layout,
         is_causal=is_causal,
-        qk_quant_gran=qk_quant_gran,
         sm_scale=sm_scale,
         pv_accum_dtype=pv_accum_dtype,
         smooth_k=smooth_k,
@@ -117,7 +109,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    qk_quant_gran: str = "per_thread",
     sm_scale: Optional[float] = None,
     pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
@@ -132,8 +123,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
         raise ValueError(f"Unsupported dtype: {dtype}")
     if tensor_layout not in ("HND", "NHD"):
         raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
-    if qk_quant_gran not in ("per_warp", "per_thread"):
-        raise ValueError(f"Unsupported qk_quant_gran: {qk_quant_gran}")
     if pv_accum_dtype not in ("fp32", "fp16", "fp16+fp32"):
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
     if q.device != k.device or q.device != v.device:
@@ -143,7 +132,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
 
     layout_i = 1 if tensor_layout == "HND" else 0
     is_causal_i = 1 if is_causal else 0
-    qk_quant_gran_i = 3 if qk_quant_gran == "per_thread" else 2
     return_lse_i = 1 if return_lse else 0
 
     head_dim, q, k, v = _pad_qkv(q, k, v)
@@ -191,7 +179,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
                 v,
                 tensor_layout=tensor_layout,
                 is_causal=is_causal,
-                qk_quant_gran=qk_quant_gran,
                 sm_scale=sm_scale,
                 pv_accum_dtype=pv_accum_dtype,
                 smooth_k=smooth_k,
@@ -206,39 +193,27 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
             v,
             tensor_layout,
             is_causal,
-            qk_quant_gran,
             pv_accum_dtype,
             smooth_k,
             smooth_v,
             return_lse,
             run_config,
         )
-    elif qk_config not in _valid_sm80_qk_configs(q, is_causal, qk_quant_gran):
+    elif qk_config not in _valid_sm80_qk_configs(q, is_causal):
         raise ValueError(f"Invalid sm80 QK config for this input: {qk_config}")
 
     blk_q, blk_k, warp_q, warp_k = qk_config
 
-    if qk_quant_gran == "per_warp":
-        q_int8, q_scale, k_int8, k_scale = per_warp_int8(
-            q,
-            k,
-            km,
-            tensor_layout=tensor_layout,
-            BLKQ=blk_q,
-            WARPQ=warp_q,
-            BLKK=blk_k,
-        )
-    else:
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8(
-            q,
-            k,
-            km,
-            tensor_layout=tensor_layout,
-            BLKQ=blk_q,
-            WARPQ=warp_q,
-            BLKK=blk_k,
-            WARPK=warp_k,
-        )
+    q_int8, q_scale, k_int8, k_scale = per_thread_int8(
+        q,
+        k,
+        km,
+        tensor_layout=tensor_layout,
+        BLKQ=blk_q,
+        WARPQ=warp_q,
+        BLKK=blk_k,
+        WARPK=warp_k,
+    )
 
     output = torch.empty(q.size(), dtype=dtype, device=q.device)
 
@@ -252,7 +227,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
             k_scale,
             layout_i,
             is_causal_i,
-            qk_quant_gran_i,
             sm_scale,
             blk_q,
             blk_k,
@@ -273,7 +247,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
                 vm,
                 layout_i,
                 is_causal_i,
-                qk_quant_gran_i,
                 sm_scale,
                 blk_q,
                 blk_k,
@@ -291,7 +264,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
                 k_scale,
                 layout_i,
                 is_causal_i,
-                qk_quant_gran_i,
                 sm_scale,
                 blk_q,
                 blk_k,
@@ -309,7 +281,6 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
             k_scale,
             layout_i,
             is_causal_i,
-            qk_quant_gran_i,
             sm_scale,
             blk_q,
             blk_k,

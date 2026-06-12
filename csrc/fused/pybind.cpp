@@ -38,29 +38,6 @@ PyMODINIT_FUNC PyInit__fused(void)
 
 // Defines the operators
 STABLE_TORCH_LIBRARY(sageattention_fused, m) {
-    m.def("quant_per_block_int8_cuda("
-            "Tensor input, "
-            "Tensor(a!) output, "
-            "Tensor scale, "
-            "int block_size, "
-            "int tensor_layout"
-          ") -> ()");
-    m.def("quant_per_block_int8_fuse_sub_mean_cuda("
-            "Tensor input, "
-            "Tensor mean, "
-            "Tensor(a!) output, "
-            "Tensor scale, "
-            "int block_size, "
-            "int tensor_layout"
-          ") -> ()");
-    m.def("quant_per_warp_int8_cuda("
-            "Tensor input, "
-            "Tensor(a!) output, "
-            "Tensor scale, "
-            "int block_size, "
-            "int wrap_block_size, "
-            "int tensor_layout"
-          ") -> ()");
     m.def("sub_mean_cuda("
             "Tensor input, "
             "Tensor mean, "
@@ -71,8 +48,5 @@ STABLE_TORCH_LIBRARY(sageattention_fused, m) {
 
 // Registers CUDA implementations
 STABLE_TORCH_LIBRARY_IMPL(sageattention_fused, CUDA, m) {
-    m.impl("quant_per_block_int8_cuda", TORCH_BOX(quant_per_block_int8_cuda));
-    m.impl("quant_per_block_int8_fuse_sub_mean_cuda", TORCH_BOX(quant_per_block_int8_fuse_sub_mean_cuda));
-    m.impl("quant_per_warp_int8_cuda", TORCH_BOX(quant_per_warp_int8_cuda));
     m.impl("sub_mean_cuda", TORCH_BOX(sub_mean_cuda));
 }

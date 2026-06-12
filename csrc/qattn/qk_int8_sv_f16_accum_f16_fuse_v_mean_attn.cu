@@ -25,7 +25,6 @@ Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(const Tensor &query,
                                                  const Tensor &value_mean,
                                                  const int64_t tensor_layout,
                                                  const int64_t is_causal,
-                                                 const int64_t qk_quant_gran,
                                                  const double sm_scale,
                                                  const int64_t blk_q,
                                                  const int64_t blk_k,
@@ -35,5 +34,5 @@ Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(const Tensor &query,
 {
   return run_sm80_qk_attn<half, false, ComputeUnit::kTensorCore, true>(
     query, key, value, output, query_scale, key_scale, &value_mean, tensor_layout, is_causal,
-    qk_quant_gran, sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse);
+    sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse);
 }

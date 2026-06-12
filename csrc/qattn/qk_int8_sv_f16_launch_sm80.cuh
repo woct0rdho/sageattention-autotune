@@ -19,7 +19,6 @@
 #include "../dispatch_utils.h"
 #include "qk_int8_sv_f16_kernel_sm80.cuh"
 
-#include <sstream>
 #include <stdexcept>
 
 struct Sm80QkLaunchParams {
@@ -174,43 +173,18 @@ struct Sm80QkLaunchContext {
   int64_t warp_q;
   int64_t warp_k;
   int64_t is_causal;
-  QuantGranularity qk_quant_gran;
   int64_t return_lse;
 };
 
-inline QuantGranularity parse_qk_quant_gran(const int64_t qk_quant_gran)
-{
-  if (qk_quant_gran == static_cast<int64_t>(QuantGranularity::kPerWarp))
-  {
-    return QuantGranularity::kPerWarp;
-  }
-  if (qk_quant_gran == static_cast<int64_t>(QuantGranularity::kPerThread))
-  {
-    return QuantGranularity::kPerThread;
-  }
-
-  STD_TORCH_CHECK(false, "Unsupported qk_quant_gran: ", qk_quant_gran);
-}
-
-template <int HeadDim, bool IsCausal, QuantGranularity QkQuantGran, bool ReturnLse, typename DTypeOut, int CtaQ, int CtaK, int WarpQ, int WarpK, typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
+template <int HeadDim, bool IsCausal, bool ReturnLse, typename DTypeOut, int CtaQ, int CtaK, int WarpQ, int WarpK, typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
 void launch_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
 {
-  static_assert(QkQuantGran == QuantGranularity::kPerWarp || QkQuantGran == QuantGranularity::kPerThread, "Unsupported quantization granularity");
-
-  if constexpr (QkQuantGran == QuantGranularity::kPerWarp)
-  {
-    CHECK_SHAPE(ctx.query_scale, ctx.params.batch_size, ctx.params.num_qo_heads, div_ceil(ctx.params.qo_len, CtaQ) * (CtaQ / WarpQ));
-    CHECK_SHAPE(ctx.key_scale, ctx.params.batch_size, ctx.params.num_kv_heads, div_ceil(ctx.params.kv_len, CtaK) * (CtaK / WarpK));
-  }
-  else
-  {
-    CHECK_SHAPE(ctx.query_scale, ctx.params.batch_size, ctx.params.num_qo_heads, div_ceil(ctx.params.qo_len, CtaQ) * (CtaQ / WarpQ) * 8);
-    CHECK_SHAPE(ctx.key_scale, ctx.params.batch_size, ctx.params.num_kv_heads, div_ceil(ctx.params.kv_len, CtaK) * (CtaK / WarpK) * 4);
-  }
+  CHECK_SHAPE(ctx.query_scale, ctx.params.batch_size, ctx.params.num_qo_heads, div_ceil(ctx.params.qo_len, CtaQ) * (CtaQ / WarpQ) * 8);
+  CHECK_SHAPE(ctx.key_scale, ctx.params.batch_size, ctx.params.num_kv_heads, div_ceil(ctx.params.kv_len, CtaK) * (CtaK / WarpK) * 4);
 
   constexpr MaskMode mask_mode = IsCausal ? MaskMode::kCausal : MaskMode::kNone;
   const size_t smem_max = std::max(CtaQ * HeadDim * sizeof(int8_t) + CtaK * HeadDim * sizeof(int8_t) + CtaK * HeadDim * sizeof(half), CtaQ * HeadDim * sizeof(half));
-  auto kernel_func = qk_int8_sv_f16_attn_kernel<CtaQ, CtaK, WarpQ, WarpK, HeadDim, QkQuantGran, QkQuantGran, DTypeSVAccum, UseInstBuffer, DTypeOut, DenominatorAccumUnit, mask_mode, ReturnLse, FuseVMean>;
+  auto kernel_func = qk_int8_sv_f16_attn_kernel<CtaQ, CtaK, WarpQ, WarpK, HeadDim, DTypeSVAccum, UseInstBuffer, DTypeOut, DenominatorAccumUnit, mask_mode, ReturnLse, FuseVMean>;
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
   const dim3 grid(div_ceil(ctx.params.qo_len, CtaQ), ctx.params.num_qo_heads, ctx.params.batch_size);
@@ -234,18 +208,18 @@ void launch_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
     ctx.sm_scale);
 }
 
-template <int HeadDim, bool IsCausal, QuantGranularity QkQuantGran, bool ReturnLse, typename DTypeOut, typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
+template <int HeadDim, bool IsCausal, bool ReturnLse, typename DTypeOut, typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
 void launch_configured_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
 {
   if (ctx.blk_q == 128 && ctx.blk_k == 64 && ctx.warp_q == 32 && ctx.warp_k == 64)
   {
-    launch_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, ReturnLse, DTypeOut, 128, 64, 32, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
+    launch_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, 128, 64, 32, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
   }
   else if (ctx.blk_q == 128 && ctx.blk_k == 32 && ctx.warp_q == 32 && ctx.warp_k == 32)
   {
     if constexpr (!IsCausal)
     {
-      launch_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, ReturnLse, DTypeOut, 128, 32, 32, 32, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
+      launch_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, 128, 32, 32, 32, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
     }
     else
     {
@@ -254,32 +228,15 @@ void launch_configured_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
   }
   else if (ctx.blk_q == 64 && ctx.blk_k == 64 && ctx.warp_q == 32 && ctx.warp_k == 64)
   {
-    launch_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, ReturnLse, DTypeOut, 64, 64, 32, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
+    launch_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, 64, 64, 32, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
   }
   else if (ctx.blk_q == 128 && ctx.blk_k == 64 && ctx.warp_q == 16 && ctx.warp_k == 64)
   {
-    launch_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, ReturnLse, DTypeOut, 128, 64, 16, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
+    launch_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, 128, 64, 16, 64, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
   }
   else
   {
     throw std::invalid_argument("Unsupported blk_q/blk_k/warp_q/warp_k configuration");
-  }
-}
-
-template <typename Func>
-void dispatch_qk_quant_gran(const QuantGranularity qk_quant_gran, const Func &func)
-{
-  if (qk_quant_gran == QuantGranularity::kPerWarp)
-  {
-    func.template operator()<QuantGranularity::kPerWarp>();
-  }
-  else if (qk_quant_gran == QuantGranularity::kPerThread)
-  {
-    func.template operator()<QuantGranularity::kPerThread>();
-  }
-  else
-  {
-    throw std::invalid_argument("Unsupported qk_quant_gran");
   }
 }
 
@@ -293,7 +250,6 @@ Tensor run_sm80_qk_attn(const Tensor &query,
                         const Tensor *value_mean,
                         const int64_t tensor_layout,
                         const int64_t is_causal,
-                        const int64_t qk_quant_gran,
                         const double sm_scale,
                         const int64_t blk_q,
                         const int64_t blk_k,
@@ -331,21 +287,18 @@ Tensor run_sm80_qk_attn(const Tensor &query,
     warp_q,
     warp_k,
     is_causal,
-    parse_qk_quant_gran(qk_quant_gran),
     return_lse,
   };
 
   sageattention::dispatch::fp16_dtype(ctx.output.scalar_type(), [&]<typename DTypeOut>() {
     sageattention::dispatch::head_dim(ctx.params.head_dim, [&]<int HeadDim>() {
       sageattention::dispatch::boolean(ctx.is_causal, "causal mode", [&]<bool IsCausal>() {
-        dispatch_qk_quant_gran(ctx.qk_quant_gran, [&]<QuantGranularity QkQuantGran>() {
-          // ReturnLse is currently disabled for compilation speed
-          // sageattention::dispatch::boolean(ctx.return_lse, "return_lse mode", [&]<bool ReturnLse>() {
-          //   launch_configured_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, ReturnLse, DTypeOut, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
-          // });
+        // ReturnLse is currently disabled for compilation speed
+        // sageattention::dispatch::boolean(ctx.return_lse, "return_lse mode", [&]<bool ReturnLse>() {
+        //   launch_configured_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
+        // });
 
-          launch_configured_sm80_qk_kernel<HeadDim, IsCausal, QkQuantGran, false, DTypeOut, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
-        });
+        launch_configured_sm80_qk_kernel<HeadDim, IsCausal, false, DTypeOut, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
       });
     });
   });
