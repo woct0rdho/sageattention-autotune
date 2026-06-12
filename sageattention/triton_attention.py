@@ -2,9 +2,10 @@ from typing import Optional
 
 import torch
 
-from .core import _pad_qkv
 from .triton.attn_qk_int8_per_block import forward as _attn_forward
 from .triton.quant_per_block import per_block_int8
+from .triton_autotune import _eager_triton_autotune_select, _sageattn_triton_autotuned
+from .utils import _pad_qkv
 
 LOG2_E = 1.44269504
 
@@ -19,6 +20,61 @@ def sageattn_qk_int8_pv_fp16_triton(
     pv_accum_dtype: str = "fp32",
     smooth_k: bool = True,
     return_lse: bool = False,
+):
+    layout_i = {"NHD": 0, "HND": 1}[tensor_layout]
+    pv_accum_i = {"fp32": 0, "fp16": 1}[pv_accum_dtype]
+
+    if torch.compiler.is_compiling() and not return_lse:
+        if sm_scale is None:
+            sm_scale = q.size(-1) ** -0.5
+        return _sageattn_triton_autotuned(
+            q,
+            k,
+            v,
+            layout_i,
+            is_causal,
+            float(sm_scale),
+            pv_accum_i,
+            smooth_k,
+        )
+
+    config = _eager_triton_autotune_select(
+        q,
+        k,
+        v,
+        layout_i,
+        is_causal,
+        pv_accum_i,
+        sm_scale,
+        smooth_k,
+        return_lse,
+    )
+
+    return _sageattn_triton_configured(
+        q,
+        k,
+        v,
+        layout_i,
+        is_causal,
+        sm_scale,
+        pv_accum_i,
+        smooth_k,
+        return_lse,
+        config,
+    )
+
+
+def _sageattn_triton_configured(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout_i: int,
+    is_causal: bool,
+    sm_scale: Optional[float],
+    pv_accum_i: int,
+    smooth_k: bool,
+    return_lse: bool,
+    triton_config: tuple[int, int, int, int, int],
 ):
     dtype = q.dtype
     if not q.is_cuda:
@@ -37,14 +93,16 @@ def sageattn_qk_int8_pv_fp16_triton(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    if tensor_layout == "NHD":
+    if layout_i == 0:
+        tensor_layout = "NHD"
         seq_dim = 1
         head_dim_index = 2
-    elif tensor_layout == "HND":
+    elif layout_i == 1:
+        tensor_layout = "HND"
         seq_dim = 2
         head_dim_index = 1
     else:
-        raise ValueError("tensor_layout must be 'HND' or 'NHD'.")
+        raise ValueError("layout_i must be 0 (NHD) or 1 (HND).")
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
@@ -68,15 +126,18 @@ def sageattn_qk_int8_pv_fp16_triton(
     else:
         km = None
 
-    blk_q = 64 if q.size(-1) == 256 else 128
-    blk_k = 32 if q.size(-1) == 256 else 64
+    pv_accum_dtype = {0: "fp32", 1: "fp16"}[pv_accum_i]
+
+    block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages = triton_config
+
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
         km=km,
-        BLKQ=blk_q,
-        BLKK=blk_k,
+        BLKQ=block_m,
+        BLKK=block_n,
         tensor_layout=tensor_layout,
+        quant_num_warps=quant_num_warps,
     )
 
     output, lse = _attn_forward(
@@ -89,6 +150,10 @@ def sageattn_qk_int8_pv_fp16_triton(
         is_causal=is_causal,
         sm_scale=sm_scale,
         pv_accum_dtype=pv_accum_dtype,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        attn_num_warps=attn_num_warps,
+        attn_num_stages=attn_num_stages,
         output_dtype=dtype,
         return_lse=return_lse,
     )
