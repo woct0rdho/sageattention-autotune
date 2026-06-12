@@ -49,6 +49,10 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
+            "int blk_q, "
+            "int blk_k, "
+            "int warp_q, "
+            "int warp_k, "
             "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn("
@@ -62,7 +66,10 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
-            "int qk_tile_config, "
+            "int blk_q, "
+            "int blk_k, "
+            "int warp_q, "
+            "int warp_k, "
             "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf("
@@ -76,6 +83,10 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
+            "int blk_q, "
+            "int blk_k, "
+            "int warp_q, "
+            "int warp_k, "
             "int return_lse"
           ") -> Tensor");
     m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn("
@@ -90,6 +101,10 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int is_causal, "
             "int qk_quant_gran, "
             "float sm_scale, "
+            "int blk_q, "
+            "int blk_k, "
+            "int warp_q, "
+            "int warp_k, "
             "int return_lse"
           ") -> Tensor");
 }
