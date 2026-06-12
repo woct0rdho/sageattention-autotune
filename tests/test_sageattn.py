@@ -17,11 +17,11 @@ def _error_report(actual, expected):
     return fro_rel_err.item(), max_abs_err.item()
 
 
-def _make_qkv(head_dim=128, tensor_layout="HND", dtype=torch.float16):
+def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layout="HND", dtype=torch.float16):
     if tensor_layout == "HND":
-        shape = (2, 8, 128, head_dim)
+        shape = (batch_size, num_heads, seq_len, head_dim)
     else:
-        shape = (2, 128, 8, head_dim)
+        shape = (batch_size, seq_len, num_heads, head_dim)
     q = torch.randn(shape, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -58,9 +58,9 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, qk_quant_gra
 
     fro_rel_err, max_abs_err = _error_report(actual, expected)
     msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
-    max_fro_rel_err = 0.03 if dtype == torch.bfloat16 else 0.025
-    max_abs_err_allowed = 0.2 if dtype == torch.bfloat16 else 0.12
-    passed = fro_rel_err <= max_fro_rel_err and max_abs_err <= max_abs_err_allowed
+    fro_rel_tol = 0.02 if dtype == torch.bfloat16 else 0.02
+    max_abs_tol = 0.1 if dtype == torch.bfloat16 else 0.1
+    passed = fro_rel_err <= fro_rel_tol and max_abs_err <= max_abs_tol
     return passed, msg
 
 

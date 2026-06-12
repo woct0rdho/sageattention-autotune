@@ -51,12 +51,16 @@ def _quant_query_per_thread_int8_kernel(
 @triton.jit
 def _quant_key_per_thread_int8_kernel(
     input_ptr,
+    mean_ptr,
     output_ptr,
     scale_ptr,
     seq_len,
     stride_input_b,
     stride_input_h,
     stride_input_n,
+    stride_mean_b,
+    stride_mean_h,
+    stride_mean_d,
     stride_output_b,
     stride_output_h,
     stride_output_n,
@@ -64,6 +68,7 @@ def _quant_key_per_thread_int8_kernel(
     stride_scale_h,
     head_dim: tl.constexpr,
     warp_block: tl.constexpr,
+    HAS_MEAN: tl.constexpr,
 ):
     block_id = tl.program_id(0) // 4
     thread_group_id = tl.program_id(0) % 4
@@ -96,6 +101,13 @@ def _quant_key_per_thread_int8_kernel(
 
     values0 = tl.load(input_ptr + input_offsets0, mask=offsets_n0[:, None] < seq_len).to(tl.float32)
     values1 = tl.load(input_ptr + input_offsets1, mask=offsets_n1[:, None] < seq_len).to(tl.float32)
+
+    if HAS_MEAN:
+        mean_offsets = batch_id * stride_mean_b + head_id * stride_mean_h + offsets_d * stride_mean_d
+        mean = tl.load(mean_ptr + mean_offsets).to(tl.float32)
+        values0 -= mean[None, :]
+        values1 -= mean[None, :]
+
     scale = tl.maximum(tl.max(tl.abs(values0)), tl.max(tl.abs(values1))) / 127.0 + 0.0000001
 
     values0 = values0 / scale
@@ -121,9 +133,6 @@ def per_thread_int8(
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
-    if km is not None:
-        k = k - km
-
     if tensor_layout == "HND":
         batch_size, num_qo_heads, qo_len, head_dim = q.shape
         _, num_kv_heads, kv_len, _ = k.shape
@@ -131,6 +140,8 @@ def per_thread_int8(
         q_int8_strides = (q_int8.stride(0), q_int8.stride(1), q_int8.stride(2))
         k_strides = (k.stride(0), k.stride(1), k.stride(2))
         k_int8_strides = (k_int8.stride(0), k_int8.stride(1), k_int8.stride(2))
+        if km is not None:
+            km = km.squeeze(2)
     elif tensor_layout == "NHD":
         batch_size, qo_len, num_qo_heads, head_dim = q.shape
         _, kv_len, num_kv_heads, _ = k.shape
@@ -138,8 +149,14 @@ def per_thread_int8(
         q_int8_strides = (q_int8.stride(0), q_int8.stride(2), q_int8.stride(1))
         k_strides = (k.stride(0), k.stride(2), k.stride(1))
         k_int8_strides = (k_int8.stride(0), k_int8.stride(2), k_int8.stride(1))
+        if km is not None:
+            km = km.squeeze(1)
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    has_mean = km is not None
+    mean = km if has_mean else k
+    mean_strides = (mean.stride(0), mean.stride(1), mean.stride(2)) if has_mean else (0, 0, 0)
 
     q_scale = torch.empty(
         (batch_size, num_qo_heads, ((qo_len + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ) * 8),
@@ -169,15 +186,18 @@ def per_thread_int8(
     grid = ((kv_len + BLKK - 1) // BLKK * (BLKK // WARPK) * 4, num_kv_heads, batch_size)
     _quant_key_per_thread_int8_kernel[grid](
         k,
+        mean,
         k_int8,
         k_scale,
         kv_len,
         *k_strides,
+        *mean_strides,
         *k_int8_strides,
         k_scale.stride(0),
         k_scale.stride(1),
         head_dim=head_dim,
         warp_block=WARPK,
+        HAS_MEAN=has_mean,
     )
 
     return q_int8, q_scale, k_int8, k_scale

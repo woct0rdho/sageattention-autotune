@@ -18,14 +18,6 @@ from .triton.quant_per_thread import per_thread_int8
 LOG2_E = 1.44269504
 
 
-def _layout_id(tensor_layout: str) -> int:
-    if tensor_layout == "NHD":
-        return 0
-    if tensor_layout == "HND":
-        return 1
-    raise ValueError(f"Unknown tensor layout: {tensor_layout}")
-
-
 def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     head_dim = q.size(-1)
     pad_to = _padded_head_dim(head_dim)
@@ -78,21 +70,23 @@ def sageattn_qk_int8_pv_fp16_cuda(
     return_lse: bool = False,
     qk_config: Optional[tuple[int, int, int, int]] = None,
 ) -> torch.Tensor:
+    if tensor_layout not in ("HND", "NHD"):
+        raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
     if qk_quant_gran not in ("per_warp", "per_thread"):
-        raise ValueError("qk_quant_gran must be 'per_warp' or 'per_thread'.")
+        raise ValueError(f"Unsupported qk_quant_gran: {qk_quant_gran}")
     if pv_accum_dtype not in ("fp32", "fp16", "fp16+fp32"):
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
 
     if torch.compiler.is_compiling() and not return_lse and qk_config is None:
         if sm_scale is None:
             sm_scale = q.size(-1) ** -0.5
-        tensor_layout_i = _layout_id(tensor_layout)
+        layout_i = 1 if tensor_layout == "HND" else 0
         qk_quant_gran_i = 3 if qk_quant_gran == "per_thread" else 2
         return _sageattn_qk_int8_pv_fp16_cuda_autotuned(
             q,
             k,
             v,
-            tensor_layout_i,
+            layout_i,
             is_causal,
             qk_quant_gran_i,
             float(sm_scale),
@@ -135,9 +129,11 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
     if not q.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
     if dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("Input tensors must be torch.float16 or torch.bfloat16.")
+        raise ValueError(f"Unsupported dtype: {dtype}")
+    if tensor_layout not in ("HND", "NHD"):
+        raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
     if qk_quant_gran not in ("per_warp", "per_thread"):
-        raise ValueError("qk_quant_gran must be 'per_warp' or 'per_thread'.")
+        raise ValueError(f"Unsupported qk_quant_gran: {qk_quant_gran}")
     if pv_accum_dtype not in ("fp32", "fp16", "fp16+fp32"):
         raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
     if q.device != k.device or q.device != v.device:
@@ -145,7 +141,7 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("All tensors must have the same dtype.")
 
-    layout = _layout_id(tensor_layout)
+    layout_i = 1 if tensor_layout == "HND" else 0
     is_causal_i = 1 if is_causal else 0
     qk_quant_gran_i = 3 if qk_quant_gran == "per_thread" else 2
     return_lse_i = 1 if return_lse else 0
@@ -157,8 +153,8 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    seq_dim = 1 if layout == 0 else 2
-    head_dim_index = 2 if layout == 0 else 1
+    seq_dim = 1 if layout_i == 0 else 2
+    head_dim_index = 2 if layout_i == 0 else 1
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
@@ -254,7 +250,7 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
             output,
             q_scale,
             k_scale,
-            layout,
+            layout_i,
             is_causal_i,
             qk_quant_gran_i,
             sm_scale,
@@ -275,7 +271,7 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
                 q_scale,
                 k_scale,
                 vm,
-                layout,
+                layout_i,
                 is_causal_i,
                 qk_quant_gran_i,
                 sm_scale,
@@ -293,7 +289,7 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
                 output,
                 q_scale,
                 k_scale,
-                layout,
+                layout_i,
                 is_causal_i,
                 qk_quant_gran_i,
                 sm_scale,
@@ -311,7 +307,7 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
             output,
             q_scale,
             k_scale,
-            layout,
+            layout_i,
             is_causal_i,
             qk_quant_gran_i,
             sm_scale,
