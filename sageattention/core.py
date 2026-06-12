@@ -11,7 +11,6 @@ from .autotune import (
     _valid_sm80_qk_configs,
     register_sm80_autotune_op,
 )
-from .quant import sub_mean
 from .sm80_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
 
@@ -236,7 +235,8 @@ def _sageattn_qk_int8_pv_fp16_cuda_impl(
         )
     elif pv_accum_dtype == "fp16":
         if smooth_v:
-            smoothed_v, vm = sub_mean(v, tensor_layout=tensor_layout)
+            vm = v.mean(dim=seq_dim)
+            smoothed_v = (v - vm.unsqueeze(seq_dim)).to(torch.float16)
             lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
                 q_int8,
                 k_int8,

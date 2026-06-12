@@ -113,12 +113,6 @@ ext_modules = [
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
         py_limited_api=True,
     ),
-    CUDAExtension(
-        name="sageattention._fused",
-        sources=["csrc/fused/pybind.cpp", "csrc/fused/fused.cu"],
-        extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
-        py_limited_api=True,
-    ),
 ]
 
 max_jobs = os.getenv("EXT_PARALLEL", os.getenv("MAX_JOBS", str(os.cpu_count() or 1)))
