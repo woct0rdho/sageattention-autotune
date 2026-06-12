@@ -4,15 +4,18 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from .autotune import (
+    _PV_ACCUM_DTYPE_TO_ID,
+    _padded_head_dim,
+    _select_sm80_qk_config,
+    _valid_sm80_qk_configs,
+    register_sm80_autotune_op,
+)
 from .quant import per_warp_int8, sub_mean
 from .sm80_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
 
 LOG2_E = 1.44269504
-
-_SM80_QK_TILE_DEFAULT = 0
-_SM80_QK_TILE_128X32 = 1
-_SM80_QK_TILE_64X64 = 2
 
 
 def _layout_id(tensor_layout: str) -> int:
@@ -25,43 +28,12 @@ def _layout_id(tensor_layout: str) -> int:
 
 def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     head_dim = q.size(-1)
-    if head_dim < 64:
-        pad_to = 64
-    elif 64 < head_dim < 128:
-        pad_to = 128
-    elif 128 < head_dim < 256:
-        pad_to = 256
-    elif head_dim in (64, 128, 256):
+    pad_to = _padded_head_dim(head_dim)
+    if pad_to == head_dim:
         return head_dim, q, k, v
-    else:
-        raise ValueError(f"Unsupported head_dim: {head_dim}")
 
     padding = (0, pad_to - head_dim)
     return head_dim, F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
-
-
-def _get_sm80_qk_config(
-    q: torch.Tensor,
-    is_causal: bool,
-    qk_quant_gran: str,
-    pv_accum_dtype: str,
-    smooth_v: bool,
-):
-    head_dim = q.size(-1)
-    warp_q = 16 if head_dim > 64 and pv_accum_dtype == "fp16+fp32" else 32
-    blk_q, blk_k, warp_k = 128, 64, 64
-    tile_config = _SM80_QK_TILE_DEFAULT
-
-    if pv_accum_dtype == "fp16" and not smooth_v:
-        if qk_quant_gran == "per_thread" and head_dim == 128 and not is_causal:
-            blk_k = 32
-            warp_k = 32
-            tile_config = _SM80_QK_TILE_128X32
-        elif head_dim in (128, 256) and is_causal:
-            blk_q = 64
-            tile_config = _SM80_QK_TILE_64X64
-
-    return blk_q, warp_q, blk_k, warp_k, tile_config
 
 
 def sageattn(
@@ -104,6 +76,60 @@ def sageattn_qk_int8_pv_fp16_cuda(
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
+    qk_config: Optional[tuple[int, int, int, int]] = None,
+) -> torch.Tensor:
+    if qk_quant_gran not in ("per_warp", "per_thread"):
+        raise ValueError("qk_quant_gran must be 'per_warp' or 'per_thread'.")
+    if pv_accum_dtype not in ("fp32", "fp16", "fp16+fp32"):
+        raise ValueError(f"Unsupported pv_accum_dtype: {pv_accum_dtype}")
+
+    if torch.compiler.is_compiling() and not return_lse and qk_config is None:
+        if sm_scale is None:
+            sm_scale = q.size(-1) ** -0.5
+        tensor_layout_i = _layout_id(tensor_layout)
+        qk_quant_gran_i = 3 if qk_quant_gran == "per_thread" else 2
+        return _sageattn_qk_int8_pv_fp16_cuda_autotuned(
+            q,
+            k,
+            v,
+            tensor_layout_i,
+            is_causal,
+            qk_quant_gran_i,
+            float(sm_scale),
+            _PV_ACCUM_DTYPE_TO_ID[pv_accum_dtype],
+            smooth_k,
+            smooth_v,
+        )
+
+    return _sageattn_qk_int8_pv_fp16_cuda_impl(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        qk_quant_gran=qk_quant_gran,
+        sm_scale=sm_scale,
+        pv_accum_dtype=pv_accum_dtype,
+        smooth_k=smooth_k,
+        smooth_v=smooth_v,
+        return_lse=return_lse,
+        qk_config=qk_config,
+    )
+
+
+def _sageattn_qk_int8_pv_fp16_cuda_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    qk_quant_gran: str = "per_thread",
+    sm_scale: Optional[float] = None,
+    pv_accum_dtype: str = "fp32",
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: bool = False,
+    qk_config: Optional[tuple[int, int, int, int]] = None,
 ) -> torch.Tensor:
     dtype = q.dtype
     if not q.is_cuda:
@@ -156,13 +182,45 @@ def sageattn_qk_int8_pv_fp16_cuda(
     else:
         km = None
 
-    blk_q, warp_q, blk_k, warp_k, qk_tile_config = _get_sm80_qk_config(
-        q,
-        is_causal,
-        qk_quant_gran,
-        pv_accum_dtype,
-        smooth_v,
-    )
+    if pv_accum_dtype in ("fp32", "fp16+fp32") and smooth_v:
+        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.", stacklevel=2)
+        smooth_v = False
+
+    if qk_config is None:
+
+        def run_config(config: tuple[int, int, int, int]):
+            return _sageattn_qk_int8_pv_fp16_cuda_impl(
+                q,
+                k,
+                v,
+                tensor_layout=tensor_layout,
+                is_causal=is_causal,
+                qk_quant_gran=qk_quant_gran,
+                sm_scale=sm_scale,
+                pv_accum_dtype=pv_accum_dtype,
+                smooth_k=smooth_k,
+                smooth_v=smooth_v,
+                return_lse=return_lse,
+                qk_config=config,
+            )
+
+        qk_config = _select_sm80_qk_config(
+            q,
+            k,
+            v,
+            tensor_layout,
+            is_causal,
+            qk_quant_gran,
+            pv_accum_dtype,
+            smooth_k,
+            smooth_v,
+            return_lse,
+            run_config,
+        )
+    elif qk_config not in _valid_sm80_qk_configs(q, is_causal, qk_quant_gran):
+        raise ValueError(f"Invalid sm80 QK config for this input: {qk_config}")
+
+    blk_q, blk_k, warp_q, warp_k = qk_config
 
     if qk_quant_gran == "per_warp":
         q_int8, q_scale, k_int8, k_scale = per_warp_int8(
@@ -188,10 +246,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
 
     output = torch.empty(q.size(), dtype=dtype, device=q.device)
 
-    if pv_accum_dtype in ("fp32", "fp16+fp32") and smooth_v:
-        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.", stacklevel=2)
-        smooth_v = False
-
     if pv_accum_dtype == "fp32":
         lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(
             q_int8,
@@ -204,6 +258,10 @@ def sageattn_qk_int8_pv_fp16_cuda(
             is_causal_i,
             qk_quant_gran_i,
             sm_scale,
+            blk_q,
+            blk_k,
+            warp_q,
+            warp_k,
             return_lse_i,
         )
     elif pv_accum_dtype == "fp16":
@@ -221,6 +279,10 @@ def sageattn_qk_int8_pv_fp16_cuda(
                 is_causal_i,
                 qk_quant_gran_i,
                 sm_scale,
+                blk_q,
+                blk_k,
+                warp_q,
+                warp_k,
                 return_lse_i,
             )
         else:
@@ -235,7 +297,10 @@ def sageattn_qk_int8_pv_fp16_cuda(
                 is_causal_i,
                 qk_quant_gran_i,
                 sm_scale,
-                qk_tile_config,
+                blk_q,
+                blk_k,
+                warp_q,
+                warp_k,
                 return_lse_i,
             )
     else:
@@ -250,6 +315,10 @@ def sageattn_qk_int8_pv_fp16_cuda(
             is_causal_i,
             qk_quant_gran_i,
             sm_scale,
+            blk_q,
+            blk_k,
+            warp_q,
+            warp_k,
             return_lse_i,
         )
 
@@ -261,3 +330,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
     if smooth_k:
         lse = lse + lse_correction * sm_scale
     return output, lse
+
+
+_sageattn_qk_int8_pv_fp16_cuda_autotuned = register_sm80_autotune_op(_sageattn_qk_int8_pv_fp16_cuda_impl)

@@ -5,19 +5,7 @@ from . import _qattn_sm80
 _qattn_sm80 = torch.ops.sageattention_qattn_sm80  # noqa: F811
 
 
-def _sm80_qk_fake_impl(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    output: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    tensor_layout: int,
-    is_causal: int,
-    qk_quant_gran: int,
-    sm_scale: float,
-    return_lse: int,
-) -> torch.Tensor:
+def _empty_lse(query: torch.Tensor, tensor_layout: int, return_lse: int) -> torch.Tensor:
     batch_size = query.size(0)
     if tensor_layout == 0:
         qo_len = query.size(1)
@@ -31,12 +19,7 @@ def _sm80_qk_fake_impl(
     return torch.empty((0,), dtype=torch.float32, device=query.device)
 
 
-torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f32_attn")(_sm80_qk_fake_impl)
-torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf")(_sm80_qk_fake_impl)
-
-
-@torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn")
-def _qk_int8_sv_f16_accum_f16_attn_fake_impl(
+def _sm80_qk_fake_impl(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -47,22 +30,18 @@ def _qk_int8_sv_f16_accum_f16_attn_fake_impl(
     is_causal: int,
     qk_quant_gran: int,
     sm_scale: float,
-    qk_tile_config: int,
+    blk_q: int,
+    blk_k: int,
+    warp_q: int,
+    warp_k: int,
     return_lse: int,
 ) -> torch.Tensor:
-    return _sm80_qk_fake_impl(
-        query,
-        key,
-        value,
-        output,
-        query_scale,
-        key_scale,
-        tensor_layout,
-        is_causal,
-        qk_quant_gran,
-        sm_scale,
-        return_lse,
-    )
+    return _empty_lse(query, tensor_layout, return_lse)
+
+
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f32_attn")(_sm80_qk_fake_impl)
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn")(_sm80_qk_fake_impl)
+torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_attn_inst_buf")(_sm80_qk_fake_impl)
 
 
 @torch.library.register_fake("sageattention_qattn_sm80::qk_int8_sv_f16_accum_f16_fuse_v_mean_attn")
@@ -78,18 +57,10 @@ def _qk_int8_sv_f16_accum_f16_fuse_v_mean_attn_fake_impl(
     is_causal: int,
     qk_quant_gran: int,
     sm_scale: float,
+    blk_q: int,
+    blk_k: int,
+    warp_q: int,
+    warp_k: int,
     return_lse: int,
 ) -> torch.Tensor:
-    return _sm80_qk_fake_impl(
-        query,
-        key,
-        value,
-        output,
-        query_scale,
-        key_scale,
-        tensor_layout,
-        is_causal,
-        qk_quant_gran,
-        sm_scale,
-        return_lse,
-    )
+    return _empty_lse(query, tensor_layout, return_lse)
