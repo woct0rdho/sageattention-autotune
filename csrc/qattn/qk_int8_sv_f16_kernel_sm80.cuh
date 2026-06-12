@@ -58,7 +58,7 @@ T *mutable_ptr(const Tensor &tensor)
 #define MMA_SV_N 16
 #define MMA_SV_K 16
 
-template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, QuantGranularity Q_GRAN, QuantGranularity K_GRAN,
+template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim,
          typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false>
 __global__ void qk_int8_sv_f16_attn_kernel(const int8_t *__restrict__ Q, const int8_t *__restrict__ K, const half *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                                            const float *__restrict__ Q_scale, const float *__restrict__ K_scale, const DTypeOut *__restrict__ V_mean,
@@ -70,8 +70,6 @@ __global__ void qk_int8_sv_f16_attn_kernel(const int8_t *__restrict__ Q, const i
                                            float sm_scale)
 {
   // compile time check
-  static_assert(Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerWarp or kPerThread");
-  static_assert(K_GRAN == QuantGranularity::kPerWarp || K_GRAN == QuantGranularity::kPerThread, "K_GRAN must be kPerWarp or kPerThread");
   static_assert(std::is_same<DTypeSVAccum, float>::value || !use_inst_buffer, "use_inst_buffer only supports DTypeSVAccum as float");
   static_assert(std::is_same<DTypeSVAccum, float>::value || std::is_same<DTypeSVAccum, half>::value, "DTypeSVAccum must be float or half");
   static_assert(std::is_same<DTypeOut, half>::value || std::is_same<DTypeOut, nv_bfloat16>::value, "DTypeOut must be half or nv_bfloat16");
@@ -115,29 +113,17 @@ __global__ void qk_int8_sv_f16_attn_kernel(const int8_t *__restrict__ Q, const i
 
   uint32_t q_scale_idx, k_scale_idx;
 
-  if constexpr (Q_GRAN == QuantGranularity::kPerWarp)
-  {
-    const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
-    q_scale_idx = batch_id * num_qo_heads * num_warp_block_q + head_id * num_warp_block_q + bx * num_warps_q + get_warp_idx_q<num_warps_q, num_warps_k>();
-  }
-  else if constexpr (Q_GRAN == QuantGranularity::kPerThread)
   {
     const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
     q_scale_idx = batch_id * num_qo_heads * (num_warp_block_q * 8) + head_id * (num_warp_block_q * 8) + bx * (num_warps_q * 8) + get_warp_idx_q<num_warps_q, num_warps_k>() * 8 + lane_id / 4;
   }
 
-  if constexpr (K_GRAN == QuantGranularity::kPerWarp)
-  {
-    const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
-    k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * num_warp_block_k + (head_id / num_kv_groups) * num_warp_block_k + get_warp_idx_k<num_warps_q, num_warps_k>();
-  }
-  else if constexpr (K_GRAN == QuantGranularity::kPerThread)
   {
     const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
     k_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) + (head_id / num_kv_groups) * (num_warp_block_k * 4) + get_warp_idx_k<num_warps_q, num_warps_k>() * 4 + lane_id % 4;
   }
 
-  constexpr uint32_t k_scale_advance_offset = (K_GRAN == QuantGranularity::kPerWarp) ? (CTA_K / WARP_K) : (CTA_K / WARP_K) * 4;
+  constexpr uint32_t k_scale_advance_offset = (CTA_K / WARP_K) * 4;
 
   // initialize o, m, d
 #pragma unroll

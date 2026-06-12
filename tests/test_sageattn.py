@@ -42,7 +42,7 @@ def _sdpa_expected(q, k, v, tensor_layout, is_causal):
     return expected.transpose(1, 2) if tensor_layout == "NHD" else expected
 
 
-def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, qk_quant_gran, pv_accum_dtype):
+def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype):
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _sdpa_expected(q, k, v, tensor_layout, is_causal)
     actual = sageattn_qk_int8_pv_fp16_cuda(
@@ -51,7 +51,6 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, qk_quant_gra
         v,
         tensor_layout=tensor_layout,
         is_causal=is_causal,
-        qk_quant_gran=qk_quant_gran,
         pv_accum_dtype=pv_accum_dtype,
         qk_config=config,
     )
@@ -79,7 +78,6 @@ def main():
             (torch.float16, torch.bfloat16),
             ("HND", "NHD"),
             (False, True),
-            ("per_thread", "per_warp"),
             ("fp32", "fp16", "fp16+fp32"),
         )
     )
@@ -89,15 +87,15 @@ def main():
         config_errors = []
         config_tested = 0
 
-        for head_dim, dtype, tensor_layout, is_causal, qk_quant_gran, pv_accum_dtype in modes:
+        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype in modes:
             q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
-            if config not in _valid_sm80_qk_configs(q, is_causal, qk_quant_gran):
+            if config not in _valid_sm80_qk_configs(q, is_causal):
                 continue
 
             config_tested += 1
             name = (
                 f"head_dim={head_dim} layout={tensor_layout} is_causal={is_causal} "
-                f"dtype={dtype} qk_quant_gran={qk_quant_gran} pv_accum_dtype={pv_accum_dtype}"
+                f"dtype={dtype} pv_accum_dtype={pv_accum_dtype}"
             )
             try:
                 passed, msg = _run_case(
@@ -106,7 +104,6 @@ def main():
                     dtype=dtype,
                     tensor_layout=tensor_layout,
                     is_causal=is_causal,
-                    qk_quant_gran=qk_quant_gran,
                     pv_accum_dtype=pv_accum_dtype,
                 )
             except Exception as exc:

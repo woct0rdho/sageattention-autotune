@@ -20,26 +20,6 @@
 
 using torch::stable::Tensor;
 
-void quant_per_block_int8_cuda(const Tensor &input,
-                               const Tensor &output,
-                               const Tensor &scale,
-                               int64_t block_size,
-                               int64_t tensor_layout);
-
-void quant_per_block_int8_fuse_sub_mean_cuda(const Tensor &input,
-                                             const Tensor &mean,
-                                             const Tensor &output,
-                                             const Tensor &scale,
-                                             int64_t block_size,
-                                             int64_t tensor_layout);
-
-void quant_per_warp_int8_cuda(const Tensor &input,
-                              const Tensor &output,
-                              const Tensor &scale,
-                              int64_t block_size,
-                              int64_t warp_block_size,
-                              int64_t tensor_layout);
-
 void sub_mean_cuda(const Tensor &input,
                    const Tensor &mean,
                    const Tensor &output,

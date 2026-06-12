@@ -33,7 +33,6 @@ def _sm80_qk_config_is_valid(
     config: tuple[int, int, int, int],
     head_dim: int,
     is_causal: bool,
-    qk_quant_gran: str,
     device: torch.device,
 ) -> bool:
     blk_q, blk_k, warp_q, warp_k = config
@@ -42,8 +41,6 @@ def _sm80_qk_config_is_valid(
     if blk_q % warp_q != 0 or blk_k % warp_k != 0:
         return False
     if warp_q % 16 != 0 or warp_k % 16 != 0:
-        return False
-    if qk_quant_gran == "per_warp" and (warp_k != blk_k or blk_k not in (64, 128)):
         return False
     if is_causal and blk_q // blk_k > 2:
         return False
@@ -75,26 +72,20 @@ def _sm80_qk_config_is_valid(
 def _valid_sm80_qk_configs(
     q: torch.Tensor,
     is_causal: bool,
-    qk_quant_gran: str,
 ) -> tuple[tuple[int, int, int, int], ...]:
-    return _valid_sm80_qk_configs_for_head_dim(q.size(-1), is_causal, qk_quant_gran, q.device)
+    return _valid_sm80_qk_configs_for_head_dim(q.size(-1), is_causal, q.device)
 
 
 def _valid_sm80_qk_configs_for_head_dim(
     head_dim: int,
     is_causal: bool,
-    qk_quant_gran: str,
     device: torch.device,
 ) -> tuple[tuple[int, int, int, int], ...]:
     configs = tuple(
-        config
-        for config in _SM80_QK_AUTOTUNE_CONFIGS
-        if _sm80_qk_config_is_valid(config, head_dim, is_causal, qk_quant_gran, device)
+        config for config in _SM80_QK_AUTOTUNE_CONFIGS if _sm80_qk_config_is_valid(config, head_dim, is_causal, device)
     )
     if not configs:
-        raise RuntimeError(
-            f"No valid sm80 QK config for head_dim={head_dim} is_causal={is_causal} qk_quant_gran={qk_quant_gran}."
-        )
+        raise RuntimeError(f"No valid sm80 QK config for head_dim={head_dim} is_causal={is_causal}.")
     return configs
 
 
@@ -104,7 +95,6 @@ def _autotune_cache_key(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    qk_quant_gran: str,
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,
@@ -122,7 +112,6 @@ def _autotune_cache_key(
         tuple(v.stride()),
         tensor_layout,
         is_causal,
-        qk_quant_gran,
         pv_accum_dtype,
         smooth_k,
         smooth_v,
@@ -136,22 +125,19 @@ def _select_sm80_qk_config(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    qk_quant_gran: str,
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,
     return_lse: bool,
     run_fn: Callable[[tuple[int, int, int, int]], object],
 ) -> tuple[int, int, int, int]:
-    configs = _valid_sm80_qk_configs(q, is_causal, qk_quant_gran)
+    configs = _valid_sm80_qk_configs(q, is_causal)
     if torch.compiler.is_compiling():
         return configs[0]
     if len(configs) == 1 or os.environ.get("SAGEATTN_AUTOTUNE", "1").lower() in ("0", "false", "off"):
         return configs[0]
 
-    key = _autotune_cache_key(
-        q, k, v, tensor_layout, is_causal, qk_quant_gran, pv_accum_dtype, smooth_k, smooth_v, return_lse
-    )
+    key = _autotune_cache_key(q, k, v, tensor_layout, is_causal, pv_accum_dtype, smooth_k, smooth_v, return_lse)
     cached = _SM80_QK_AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -180,14 +166,6 @@ def _tensor_layout_from_id(tensor_layout: int) -> str:
     raise ValueError(f"Unknown tensor layout id: {tensor_layout}")
 
 
-def _qk_quant_gran_from_id(qk_quant_gran: int) -> str:
-    if qk_quant_gran == 3:
-        return "per_thread"
-    if qk_quant_gran == 2:
-        return "per_warp"
-    raise ValueError(f"Unknown qk quantization granularity id: {qk_quant_gran}")
-
-
 def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
     @torch.library.custom_op("sageattention_internal::sageattn_sm80_autotuned", mutates_args=())
     def _sageattn_qk_int8_pv_fp16_cuda_autotuned(
@@ -196,7 +174,6 @@ def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
         v: torch.Tensor,
         tensor_layout: int,
         is_causal: bool,
-        qk_quant_gran: int,
         sm_scale: float,
         pv_accum_dtype: int,
         smooth_k: bool,
@@ -207,11 +184,10 @@ def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
         warp_k: int = 0,
     ) -> torch.Tensor:
         tensor_layout_s = _tensor_layout_from_id(tensor_layout)
-        qk_quant_gran_s = _qk_quant_gran_from_id(qk_quant_gran)
         pv_accum_dtype_s = _PV_ACCUM_DTYPE_FROM_ID[pv_accum_dtype]
 
         head_dim = _padded_head_dim(q.size(-1))
-        valid_configs = _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, qk_quant_gran_s, q.device)
+        valid_configs = _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, q.device)
         qk_config = (blk_q, blk_k, warp_q, warp_k)
         if min(qk_config) <= 0 or qk_config not in valid_configs:
             qk_config = valid_configs[0]
@@ -222,7 +198,6 @@ def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
             v,
             tensor_layout=tensor_layout_s,
             is_causal=is_causal,
-            qk_quant_gran=qk_quant_gran_s,
             sm_scale=sm_scale,
             pv_accum_dtype=pv_accum_dtype_s,
             smooth_k=smooth_k,
@@ -238,7 +213,6 @@ def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
         v: torch.Tensor,
         tensor_layout: int,
         is_causal: bool,
-        qk_quant_gran: int,
         sm_scale: float,
         pv_accum_dtype: int,
         smooth_k: bool,
@@ -253,12 +227,10 @@ def register_sm80_autotune_op(impl_fn: Callable[..., torch.Tensor]):
     def _generate_sm80_autotune_configs(fake_tensors: dict[str, torch.Tensor]):
         q = fake_tensors["q"]
         is_causal = bool(fake_tensors.get("is_causal", False))
-        qk_quant_gran = int(fake_tensors.get("qk_quant_gran", 3))
-        qk_quant_gran_s = _qk_quant_gran_from_id(qk_quant_gran)
         head_dim = _padded_head_dim(optimization_hint(q.shape[-1]))
         return [
             CustomOpConfig(blk_q=cfg[0], blk_k=cfg[1], warp_q=cfg[2], warp_k=cfg[3])
-            for cfg in _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, qk_quant_gran_s, q.device)
+            for cfg in _valid_sm80_qk_configs_for_head_dim(head_dim, is_causal, q.device)
         ]
 
     register_custom_op_autotuning(

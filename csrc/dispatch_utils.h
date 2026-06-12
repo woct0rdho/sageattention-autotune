@@ -64,40 +64,6 @@ inline void head_dim(const int64_t head_dim, const Func &func)
 }
 
 template <typename Func>
-inline void block_size(const int64_t block_size, const Func &func)
-{
-  if (block_size == 64)
-  {
-    func.template operator()<64>();
-  }
-  else if (block_size == 128)
-  {
-    func.template operator()<128>();
-  }
-  else
-  {
-    STD_TORCH_CHECK(false, "Unsupported block_size: ", block_size);
-  }
-}
-
-template <typename Func>
-inline void warp_block_size(const int64_t warp_block_size, const Func &func)
-{
-  if (warp_block_size == 16)
-  {
-    func.template operator()<16>();
-  }
-  else if (warp_block_size == 32)
-  {
-    func.template operator()<32>();
-  }
-  else
-  {
-    STD_TORCH_CHECK(false, "Unsupported warp_block_size: ", warp_block_size);
-  }
-}
-
-template <typename Func>
 inline void boolean(const int64_t value, const char *name, const Func &func)
 {
   if (value == 1)
