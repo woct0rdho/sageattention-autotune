@@ -28,13 +28,13 @@
 #define div_ceil(M, N) (((M) + (N) - 1) / (N))
 
 enum class MaskMode {
-    kNone = 0,
-    kCausal = 1,
+  kNone = 0,
+  kCausal = 1,
 };
 
 enum class QuantGranularity {
-    kPerWarp = 2,
-    kPerThread = 3,
+  kPerWarp = 2,
+  kPerThread = 3,
 };
 
 enum class ComputeUnit {
@@ -64,11 +64,11 @@ __device__ __forceinline__ uint32_t get_warp_idx_k()
   return get_warp_id() % num_warps_k;
 }
 
-template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter, 
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA, typename T>
 __device__ __forceinline__ void load_global_to_share(const T **lane_ptr, uint32_t &smem_offset,
-                                                    const uint32_t gmem_stride,
-                                                    const smem_t<swizzle_mode, stride> &smem)
+                                                     const uint32_t gmem_stride,
+                                                     const smem_t<swizzle_mode, stride> &smem)
 {
   static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
   static_assert(std::is_same<T, half>::value || std::is_same<T, int8_t>::value);
@@ -94,11 +94,11 @@ __device__ __forceinline__ void load_global_to_share(const T **lane_ptr, uint32_
 }
 
 // with predicate
-template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter, 
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA, typename T>
 __device__ __forceinline__ void load_global_to_share(const T **lane_ptr, uint32_t &smem_offset,
-                                                    const uint32_t gmem_stride,
-                                                    const smem_t<swizzle_mode, stride> &smem, uint32_t base_idx, const uint32_t max_len)
+                                                     const uint32_t gmem_stride,
+                                                     const smem_t<swizzle_mode, stride> &smem, uint32_t base_idx, const uint32_t max_len)
 {
   static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
   static_assert(std::is_same<T, half>::value || std::is_same<T, int8_t>::value);
@@ -124,8 +124,8 @@ __device__ __forceinline__ void load_global_to_share(const T **lane_ptr, uint32_
   *lane_ptr += (CTA - smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
 }
 
-template <uint32_t num_warps_q, uint32_t num_warps_k, 
-          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner, 
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
           SwizzleMode swizzle_mode, uint32_t stride>
 __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride> &smem_Q, const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8], uint32_t &offset_Q, uint32_t &offset_K)
 {
@@ -198,8 +198,8 @@ __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride
 }
 
 // for case when num_tiles_qk_inner = 1
-template <uint32_t num_warps_q, uint32_t num_warps_k, 
-          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner, 
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_qk_inner,
           SwizzleMode swizzle_mode, uint32_t stride>
 __device__ __forceinline__ void compute_int_qk(const smem_t<swizzle_mode, stride> &smem_K, int32_t RS[][num_tiles_k][8], uint32_t RQ[][4], uint32_t offset_K)
 {
@@ -317,7 +317,7 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
 
       half2 o_scale2;
       if constexpr (use_half_o_scale)
-      {  
+      {
         o_scale2 = __floats2half2_rn(o_scale, o_scale);
       }
 
@@ -386,7 +386,7 @@ __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit =
 {
   // for compute unit cuda core, RS is float
   // for compute unit tensor core, RS is packed half
-  static_assert((std::is_same<T, float>::value && compute_unit == ComputeUnit::kCudaCore) || 
+  static_assert((std::is_same<T, float>::value && compute_unit == ComputeUnit::kCudaCore) ||
                 (std::is_same<T, uint32_t>::value && compute_unit == ComputeUnit::kTensorCore));
 
 #pragma unroll
@@ -401,7 +401,7 @@ __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit =
         mma::rowsum_f16f16f32(d[fq], (uint32_t*)(RS[fq][fk]));
       }
       else if constexpr (compute_unit == ComputeUnit::kCudaCore)
-      { 
+      {
         // partial accumulate with cuda core
         d[fq][0] += RS[fq][fk][0] + RS[fq][fk][1] + RS[fq][fk][4] + RS[fq][fk][5];
         d[fq][1] += RS[fq][fk][2] + RS[fq][fk][3] + RS[fq][fk][6] + RS[fq][fk][7];
@@ -410,7 +410,7 @@ __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit =
   }
 }
 
-template <uint32_t num_warps_q, uint32_t num_warps_k, 
+template <uint32_t num_warps_q, uint32_t num_warps_k,
           uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
           SwizzleMode swizzle_mode, uint32_t stride, uint32_t RS_width=4, typename T, typename DTypeSVAccum>
 __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mode, stride> &smem_V, T RS_f16[][num_tiles_k][RS_width], DTypeSVAccum RO[][num_tiles_v][8], float d[][2], uint32_t &offset_V)
@@ -430,7 +430,7 @@ __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mo
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; fq++)
       {
-        if constexpr (std::is_same<DTypeSVAccum, float>::value) 
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
         {
           mma::mma_sync_m16n16k16_row_col_f16f16f32(RO[fq][fv], (uint32_t*)(RS_f16[fq][fk]), RV);
         }
@@ -449,7 +449,7 @@ __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mo
   offset_V -= (16 * num_tiles_k * stride);
 }
 
-template <uint32_t num_warps_q, uint32_t num_warps_k, 
+template <uint32_t num_warps_q, uint32_t num_warps_k,
           uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
           SwizzleMode swizzle_mode, uint32_t stride, uint32_t RS_width=4, typename T, typename DTypeSVAccum>
 __device__ __forceinline__ void compute_fp16_sv_permuted_inst_buf(const smem_t<swizzle_mode, stride> &smem_V, T RS_f16[][num_tiles_k][RS_width], DTypeSVAccum RO[][num_tiles_v][8], float d[][2], uint32_t &offset_V)
@@ -523,12 +523,12 @@ __device__ __forceinline__ void compute_fp16_sv_permuted_inst_buf(const smem_t<s
 }
 
 template<uint32_t num_tiles_q, uint32_t num_tiles_v,
-       ComputeUnit compute_unit = ComputeUnit::kTensorCore, // compute unit for accumulate_d
-       typename DTypeQKAccum, typename DTypeSVAccum>
+         ComputeUnit compute_unit = ComputeUnit::kTensorCore, // compute unit for accumulate_d
+         typename DTypeQKAccum, typename DTypeSVAccum>
 __device__ __forceinline__ void normalize_d(DTypeSVAccum RO[][num_tiles_v][8], DTypeQKAccum m[][2], float d[][2])
 {
   if constexpr (compute_unit == ComputeUnit::kCudaCore)
-  { 
+  {
     // accumulate_d performs partial accumulation with cuda core
     // aggregate d
 #pragma unroll

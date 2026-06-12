@@ -1,14 +1,11 @@
-import sys
 from itertools import product
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from sageattention import _SM80_QK_AUTOTUNE_CONFIGS, _valid_sm80_qk_configs, sageattn_qk_int8_pv_fp16_cuda
+from sageattention import sageattn_qk_int8_pv_fp16_cuda
+from sageattention.autotune import _SM80_QK_AUTOTUNE_CONFIGS, _valid_sm80_qk_configs
 
 
 def _error_report(actual, expected):

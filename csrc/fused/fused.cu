@@ -24,7 +24,12 @@
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 
+#include <cstdint>
+#include <type_traits>
+
 using torch::stable::Tensor;
+
+namespace sa_dispatch = sageattention::dispatch;
 
 template <typename T>
 const T *const_ptr(const Tensor &tensor)
@@ -61,11 +66,11 @@ __device__ __forceinline__ float convert_to_float(T val)
 }
 
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, bool sub_mean = false, typename T>
-__global__ void QuantInt8Kernel(const T *__restrict__ input, const T *__restrict__ mean, int8_t *__restrict__ output, float *__restrict__ scale, const uint32_t num_tokens, 
-                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
-                            const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output,
-                            const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
+__global__ void QuantInt8Kernel(const T *__restrict__ input, const T *__restrict__ mean, int8_t *__restrict__ output, float *__restrict__ scale, const uint32_t num_tokens,
+                                const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
+                                const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
+                                const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output,
+                                const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
   static_assert(num_pack_per_thread > 0, "The number of pack per thread must be greater than 0");
@@ -179,7 +184,7 @@ __global__ void QuantInt8Kernel(const T *__restrict__ input, const T *__restrict
 #pragma unroll
   for (uint32_t i = 0; i < num_pack_per_thread; i++)
   {
-    
+
     if (thread_base_token + i * iter_stride < num_tokens)
     {
       *reinterpret_cast<float2*>(output_ptr_base + i * iter_stride * stride_seq_output) = *reinterpret_cast<float2*>(&o_val[i][0]);
@@ -188,10 +193,10 @@ __global__ void QuantInt8Kernel(const T *__restrict__ input, const T *__restrict
 }
 
 template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename T>
-__global__ void SubMeanKernel(const T *__restrict__ input, const T *__restrict__ mean, half *__restrict__ output, const uint32_t num_tokens, 
-                            const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
-                            const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
-                            const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output)
+__global__ void SubMeanKernel(const T *__restrict__ input, const T *__restrict__ mean, half *__restrict__ output, const uint32_t num_tokens,
+                              const uint32_t stride_bz_input, const uint32_t stride_seq_input, const uint32_t stride_h_input,
+                              const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
+                              const uint32_t stride_bz_output, const uint32_t stride_seq_output, const uint32_t stride_h_output)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
   static_assert(num_pack_per_thread > 0, "The number of pack per thread must be greater than 0");
@@ -233,7 +238,7 @@ __global__ void SubMeanKernel(const T *__restrict__ input, const T *__restrict__
 
         if constexpr (std::is_same<T, nv_bfloat16>::value)
         {
-          ((half2*)x_val[i])[j] = __float22half2_rn(__bfloat1622float2(x_val[i][j])); 
+          ((half2*)x_val[i])[j] = __float22half2_rn(__bfloat1622float2(x_val[i][j]));
         }
       }
     }
@@ -249,17 +254,16 @@ __global__ void SubMeanKernel(const T *__restrict__ input, const T *__restrict__
   }
 }
 
-void quant_per_block_int8_cuda(
-                const Tensor &input,
-                const Tensor &output,
-                const Tensor &scale,
-                const int64_t block_size,
-                const int64_t tensor_layout)
+void quant_per_block_int8_cuda(const Tensor &input,
+                               const Tensor &output,
+                               const Tensor &scale,
+                               const int64_t block_size,
+                               const int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
-  
+
   CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
   CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
@@ -301,10 +305,9 @@ void quant_per_block_int8_cuda(
 
   const auto input_dtype = input.scalar_type();
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-
+  sa_dispatch::fp16_dtype(input_dtype, [&]<typename CType>() {
+    sa_dispatch::block_size(block_size, [&]<int BLOCK_SIZE>() {
+      sa_dispatch::head_dim(head_dim, [&]<int HEAD_DIM>() {
         CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
         CHECK_SHAPE(scale, batch_size, num_heads, (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
@@ -314,8 +317,8 @@ void quant_per_block_int8_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, c_type><<<grid, block>>>(
-          const_ptr<c_type>(input),
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, CType><<<grid, block>>>(
+          const_ptr<CType>(input),
           nullptr,
           mutable_ptr<int8_t>(output),
           mutable_ptr<float>(scale),
@@ -330,19 +333,18 @@ void quant_per_block_int8_cuda(
   });
 }
 
-void quant_per_block_int8_fuse_sub_mean_cuda(
-                const Tensor &input,
-                const Tensor &mean,
-                const Tensor &output,
-                const Tensor &scale,
-                const int64_t block_size,
-                const int64_t tensor_layout)
+void quant_per_block_int8_fuse_sub_mean_cuda(const Tensor &input,
+                                             const Tensor &mean,
+                                             const Tensor &output,
+                                             const Tensor &scale,
+                                             const int64_t block_size,
+                                             const int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(mean);
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
-  
+
   CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
   CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
@@ -389,10 +391,9 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
   STD_TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-
+  sa_dispatch::fp16_dtype(input_dtype, [&]<typename CType>() {
+    sa_dispatch::block_size(block_size, [&]<int BLOCK_SIZE>() {
+      sa_dispatch::head_dim(head_dim, [&]<int HEAD_DIM>() {
         CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
         CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
         CHECK_SHAPE(scale, batch_size, num_heads, (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -403,9 +404,9 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, c_type><<<grid, block>>>(
-          const_ptr<c_type>(input),
-          const_ptr<c_type>(mean),
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, CType><<<grid, block>>>(
+          const_ptr<CType>(input),
+          const_ptr<CType>(mean),
           mutable_ptr<int8_t>(output),
           mutable_ptr<float>(scale),
           num_tokens,
@@ -420,18 +421,17 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 }
 
 // use block size 128 and warp_block size 32
-void quant_per_warp_int8_cuda(
-                const Tensor &input,
-                const Tensor &output,
-                const Tensor &scale,
-                const int64_t block_size,
-                const int64_t warp_block_size,
-                const int64_t tensor_layout)
+void quant_per_warp_int8_cuda(const Tensor &input,
+                              const Tensor &output,
+                              const Tensor &scale,
+                              const int64_t block_size,
+                              const int64_t warp_block_size,
+                              const int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(output);
   CHECK_CUDA(scale);
-  
+
   CHECK_DTYPE(output, torch::headeronly::ScalarType::Char);
   CHECK_DTYPE(scale, torch::headeronly::ScalarType::Float);
 
@@ -473,11 +473,10 @@ void quant_per_warp_int8_cuda(
 
   const auto input_dtype = input.scalar_type();
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
-      DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_BLOCK_SIZE, {
-        DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-
+  sa_dispatch::fp16_dtype(input_dtype, [&]<typename CType>() {
+    sa_dispatch::block_size(block_size, [&]<int BLOCK_SIZE>() {
+      sa_dispatch::warp_block_size(warp_block_size, [&]<int WARP_BLOCK_SIZE>() {
+        sa_dispatch::head_dim(head_dim, [&]<int HEAD_DIM>() {
           CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
           CHECK_SHAPE(scale, batch_size, num_heads, (num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE * (BLOCK_SIZE / WARP_BLOCK_SIZE));
 
@@ -487,8 +486,8 @@ void quant_per_warp_int8_cuda(
 
           dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, c_type><<<grid, block>>>(
-            const_ptr<c_type>(input),
+          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, CType><<<grid, block>>>(
+            const_ptr<CType>(input),
             nullptr,
             mutable_ptr<int8_t>(output),
             mutable_ptr<float>(scale),
@@ -504,16 +503,15 @@ void quant_per_warp_int8_cuda(
   });
 }
 
-void sub_mean_cuda(
-                const Tensor &input,
-                const Tensor &mean,
-                const Tensor &output,
-                const int64_t tensor_layout)
+void sub_mean_cuda(const Tensor &input,
+                   const Tensor &mean,
+                   const Tensor &output,
+                   const int64_t tensor_layout)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(mean);
   CHECK_CUDA(output);
-  
+
   CHECK_LASTDIM_CONTIGUOUS(input);
   CHECK_CONTIGUOUS(mean);
   CHECK_CONTIGUOUS(output);
@@ -557,29 +555,28 @@ void sub_mean_cuda(
 
   STD_TORCH_CHECK(input_dtype == mean_dtype, "Input and mean must have the same data type");
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        
-        CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
-        CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
-  
-        constexpr int BLOCK_SIZE = (HEAD_DIM == 128) ? 64 : 128;
+  sa_dispatch::fp16_dtype(input_dtype, [&]<typename CType>() {
+    sa_dispatch::head_dim(head_dim, [&]<int HEAD_DIM>() {
+      CHECK_SHAPE(mean, batch_size, num_heads, head_dim);
+      CHECK_SHAPE(output, input.size(0), input.size(1), input.size(2), input.size(3));
 
-        dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, num_heads, batch_size);
+      constexpr int BLOCK_SIZE = (HEAD_DIM == 128) ? 64 : 128;
 
-        constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+      dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, num_heads, batch_size);
 
-        dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+      constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
-        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block>>>(
-          const_ptr<c_type>(input),
-          const_ptr<c_type>(mean),
-          mutable_ptr<half>(output),
-          num_tokens,
-          stride_bz_input, stride_seq_input, stride_h_input,
-          mean.stride(0), mean.stride(1),
-          stride_bz_output, stride_seq_output, stride_h_output
-        );
+      dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+
+      SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, CType><<<grid, block>>>(
+        const_ptr<CType>(input),
+        const_ptr<CType>(mean),
+        mutable_ptr<half>(output),
+        num_tokens,
+        stride_bz_input, stride_seq_input, stride_h_input,
+        mean.stride(0), mean.stride(1),
+        stride_bz_output, stride_seq_output, stride_h_output
+      );
     });
   });
 }
