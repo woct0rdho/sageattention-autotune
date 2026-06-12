@@ -56,11 +56,17 @@ def _enable_ccache(ccache_path):
     cpp_extension._write_ninja_file = write_ninja_file_with_ccache
 
 
-if CUDA_HOME is None:
+def _env_flag_enabled(name):
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+build_triton_only = _env_flag_enabled("SAGEATTN_BUILD_TRITON_ONLY")
+
+if not build_triton_only and CUDA_HOME is None:
     raise RuntimeError("Cannot find CUDA_HOME. CUDA must be available to build SageAttention.")
 
 ccache_path = shutil.which("ccache")
-if ccache_path:
+if ccache_path and not build_triton_only:
     _enable_ccache(ccache_path)
 
 if os.name == "nt":
@@ -100,20 +106,23 @@ nvcc_append = os.getenv("NVCC_APPEND_FLAGS", "").strip()
 if nvcc_append:
     nvcc_flags += nvcc_append.split()
 
-ext_modules = [
-    CUDAExtension(
-        name="sageattention._qattn_sm80",
-        sources=[
-            "csrc/qattn/pybind_sm80.cpp",
-            "csrc/qattn/qk_int8_sv_f16_accum_f16_attn.cu",
-            "csrc/qattn/qk_int8_sv_f16_accum_f16_attn_inst_buf.cu",
-            "csrc/qattn/qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.cu",
-            "csrc/qattn/qk_int8_sv_f16_accum_f32_attn.cu",
-        ],
-        extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
-        py_limited_api=True,
-    ),
-]
+if build_triton_only:
+    ext_modules = []
+else:
+    ext_modules = [
+        CUDAExtension(
+            name="sageattention._qattn_sm80",
+            sources=[
+                "csrc/qattn/pybind_sm80.cpp",
+                "csrc/qattn/qk_int8_sv_f16_accum_f16_attn.cu",
+                "csrc/qattn/qk_int8_sv_f16_accum_f16_attn_inst_buf.cu",
+                "csrc/qattn/qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.cu",
+                "csrc/qattn/qk_int8_sv_f16_accum_f32_attn.cu",
+            ],
+            extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+            py_limited_api=True,
+        ),
+    ]
 
 max_jobs = os.getenv("EXT_PARALLEL", os.getenv("MAX_JOBS", str(os.cpu_count() or 1)))
 os.environ.setdefault("MAX_JOBS", max_jobs)

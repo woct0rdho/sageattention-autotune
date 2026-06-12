@@ -57,7 +57,7 @@ def _eager_autotune_select(
     smooth_v: bool,
     return_lse: bool,
 ) -> tuple[int, int, int, int]:
-    from .core import _sageattn_configured
+    from .cuda_attn import _sageattn_configured
 
     configs = _valid_configs(q, is_causal)
     key = autotune_utils._tensor_autotune_cache_key(
@@ -99,7 +99,7 @@ def _sageattn_autotuned(
     warp_q: int = 0,
     warp_k: int = 0,
 ) -> torch.Tensor:
-    from .core import _sageattn_configured
+    from .cuda_attn import _sageattn_configured
 
     qk_config = (blk_q, blk_k, warp_q, warp_k)
     if min(qk_config) <= 0 or qk_config not in _valid_configs(q, is_causal):
