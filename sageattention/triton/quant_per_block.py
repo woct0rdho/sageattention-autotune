@@ -68,7 +68,7 @@ def quant_per_block_int8_kernel(
     tl.store(scale_ptrs, scale)
 
 
-def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, tensor_layout="HND"):
+def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, tensor_layout="HND", quant_num_warps=4):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 
@@ -126,6 +126,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, tensor_layout="HND"):
         C=head_dim,
         BLK=BLKQ,
         HAS_MEAN=False,
+        num_warps=quant_num_warps,
     )
 
     grid = (k_blocks, h_kv, b)
@@ -149,6 +150,7 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, tensor_layout="HND"):
         C=head_dim,
         BLK=BLKK,
         HAS_MEAN=has_mean,
+        num_warps=quant_num_warps,
     )
 
     return q_int8, q_scale, k_int8, k_scale

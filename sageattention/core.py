@@ -1,36 +1,16 @@
+import os
 import warnings
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
-from .autotune import _eager_autotune_select, _sageattn_autotuned
-from .sm80_compile import _qattn_sm80
+from .core_autotune import _eager_autotune_select, _sageattn_autotuned
+from .core_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
+from .triton_attention import sageattn_qk_int8_pv_fp16_triton
+from .utils import _pad_qkv
 
 LOG2_E = 1.44269504
-
-
-def _padded_head_dim(head_dim: int) -> int:
-    if head_dim < 64:
-        return 64
-    if 64 < head_dim < 128:
-        return 128
-    if 128 < head_dim < 256:
-        return 256
-    if head_dim in (64, 128, 256):
-        return head_dim
-    raise ValueError(f"Unsupported head_dim: {head_dim}")
-
-
-def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    head_dim = q.size(-1)
-    pad_to = _padded_head_dim(head_dim)
-    if pad_to == head_dim:
-        return head_dim, q, k, v
-
-    padding = (0, pad_to - head_dim)
-    return head_dim, F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
 
 
 def sageattn_qk_int8_pv_fp16_cuda(
@@ -114,9 +94,6 @@ def _sageattn_configured(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("All tensors must have the same dtype.")
 
-    is_causal_i = 1 if is_causal else 0
-    return_lse_i = 1 if return_lse else 0
-
     head_dim, q, k, v = _pad_qkv(q, k, v)
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Last dimension of q, k, and v must be contiguous.")
@@ -126,6 +103,9 @@ def _sageattn_configured(
 
     seq_dim = 1 if layout_i == 0 else 2
     head_dim_index = 2 if layout_i == 0 else 1
+
+    is_causal_i = 1 if is_causal else 0
+    return_lse_i = 1 if return_lse else 0
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
@@ -252,4 +232,7 @@ def _sageattn_configured(
     return output, lse
 
 
-sageattn = sageattn_qk_int8_pv_fp16_cuda
+if os.getenv("SAGEATTN_TRITON_BACKEND", "0") == "1":
+    sageattn = sageattn_qk_int8_pv_fp16_triton
+else:
+    sageattn = sageattn_qk_int8_pv_fp16_cuda

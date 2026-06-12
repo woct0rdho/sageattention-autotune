@@ -246,12 +246,13 @@ def forward(
     is_causal=False,
     sm_scale=None,
     pv_accum_dtype="fp32",
+    BLOCK_M=128,
+    BLOCK_N=64,
+    attn_num_warps=4,
+    attn_num_stages=3,
     output_dtype=torch.float16,
     return_lse=False,
 ):
-    BLOCK_M = 64 if q.size(-1) == 256 else 128
-    BLOCK_N = 32 if q.size(-1) == 256 else 64
-
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
     if tensor_layout == "HND":
@@ -318,8 +319,8 @@ def forward(
         RETURN_LSE=return_lse,
         IS_CAUSAL=is_causal,
         PV_ACCUM_FP32=(pv_accum_dtype == "fp32"),
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4,
+        num_warps=attn_num_warps,
+        num_stages=attn_num_stages,
     )
 
     return o, lse
