@@ -3,7 +3,7 @@ from itertools import product
 import torch
 from test_sageattn import _error_report, _expected, _make_qkv
 
-from sageattention.triton_attention import _sageattn_triton_configured
+from sageattention.triton_attn import _sageattn_triton_configured
 from sageattention.triton_autotune import _valid_triton_configs_for_head_dim
 
 

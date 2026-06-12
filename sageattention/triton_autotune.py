@@ -115,7 +115,7 @@ def _eager_triton_autotune_select(
     smooth_k: bool,
     return_lse: bool,
 ) -> tuple[int, int, int, int, int]:
-    from .triton_attention import _sageattn_triton_configured
+    from .triton_attn import _sageattn_triton_configured
 
     configs = _valid_triton_configs(q, is_causal)
     key = autotune_utils._tensor_autotune_cache_key(q, k, v, layout_i, is_causal, pv_accum_i, smooth_k, return_lse)
@@ -154,7 +154,7 @@ def _sageattn_triton_autotuned(
     attn_num_warps: int = 0,
     attn_num_stages: int = 0,
 ) -> torch.Tensor:
-    from .triton_attention import _sageattn_triton_configured
+    from .triton_attn import _sageattn_triton_configured
 
     config = (block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages)
     if min(config) <= 0 or config not in _valid_triton_configs(q, is_causal):

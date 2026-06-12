@@ -4,8 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sageattention.core import _sageattn_configured
-from sageattention.core_autotune import _AUTOTUNE_CONFIGS, _valid_configs
+from sageattention.cuda_attn import _sageattn_configured
+from sageattention.cuda_autotune import _AUTOTUNE_CONFIGS, _valid_configs
 
 
 def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layout="HND", dtype=torch.float16):
