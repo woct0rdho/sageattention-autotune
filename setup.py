@@ -105,7 +105,10 @@ ext_modules = [
         name="sageattention._qattn_sm80",
         sources=[
             "csrc/qattn/pybind_sm80.cpp",
-            "csrc/qattn/qk_int_sv_f16_cuda_sm80.cu",
+            "csrc/qattn/qk_int8_sv_f16_accum_f16_attn.cu",
+            "csrc/qattn/qk_int8_sv_f16_accum_f16_attn_inst_buf.cu",
+            "csrc/qattn/qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.cu",
+            "csrc/qattn/qk_int8_sv_f16_accum_f32_attn.cu",
         ],
         extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
         py_limited_api=True,
