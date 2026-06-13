@@ -48,19 +48,15 @@ inline void head_dim(const int64_t head_dim, const Func &func)
 }
 
 template <typename Func>
-inline void boolean(const int64_t value, const char *name, const Func &func)
+inline void boolean(const bool value, const Func &func)
 {
-  if (value == 1)
+  if (value)
   {
     func.template operator()<true>();
   }
-  else if (value == 0)
-  {
-    func.template operator()<false>();
-  }
   else
   {
-    STD_TORCH_CHECK(false, "Unsupported ", name, ": ", value);
+    func.template operator()<false>();
   }
 }
 

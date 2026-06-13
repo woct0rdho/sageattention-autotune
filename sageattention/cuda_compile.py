@@ -5,7 +5,7 @@ from . import _qattn_sm80
 _qattn_sm80 = torch.ops.sageattention_qattn_sm80  # noqa: F811
 
 
-def _empty_lse(query: torch.Tensor, tensor_layout: int, return_lse: int) -> torch.Tensor:
+def _empty_lse(query: torch.Tensor, tensor_layout: int, return_lse: bool) -> torch.Tensor:
     batch_size = query.size(0)
 
     if tensor_layout == 0:
@@ -30,13 +30,13 @@ def _fake_impl(
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
     tensor_layout: int,
-    is_causal: int,
+    is_causal: bool,
     sm_scale: float,
     blk_q: int,
     blk_k: int,
     warp_q: int,
     warp_k: int,
-    return_lse: int,
+    return_lse: bool,
 ) -> torch.Tensor:
     return _empty_lse(query, tensor_layout, return_lse)
 
@@ -56,12 +56,12 @@ def _qk_int8_sv_f16_accum_f16_fuse_v_mean_attn_fake_impl(
     key_scale: torch.Tensor,
     value_mean: torch.Tensor,
     tensor_layout: int,
-    is_causal: int,
+    is_causal: bool,
     sm_scale: float,
     blk_q: int,
     blk_k: int,
     warp_q: int,
     warp_k: int,
-    return_lse: int,
+    return_lse: bool,
 ) -> torch.Tensor:
     return _empty_lse(query, tensor_layout, return_lse)
