@@ -20,10 +20,12 @@ import torch
 import triton
 import triton.language as tl
 
+from ..autotune_utils import _autotune_seq_len_bucket
+
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
-    key=["L", "C", "BLK", "HAS_MEAN"],
+    key=["L_BUCKET", "C", "BLK", "HAS_MEAN"],
 )
 @triton.jit
 def quant_per_block_int8_kernel(
@@ -32,6 +34,7 @@ def quant_per_block_int8_kernel(
     Output,
     Scale,
     L,
+    L_BUCKET,
     stride_iz,
     stride_ih,
     stride_in,
@@ -125,6 +128,7 @@ def per_block_int8(
         q_int8,
         q_scale,
         qo_len,
+        _autotune_seq_len_bucket(qo_len),
         stride_bz_q,
         stride_h_q,
         stride_seq_q,
@@ -148,6 +152,7 @@ def per_block_int8(
         k_int8,
         k_scale,
         kv_len,
+        _autotune_seq_len_bucket(kv_len),
         stride_bz_k,
         stride_h_k,
         stride_seq_k,
