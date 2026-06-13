@@ -244,7 +244,6 @@ def forward(
     k_scale,
     tensor_layout="HND",
     is_causal=False,
-    sm_scale=None,
     pv_accum_dtype="fp32",
     BLOCK_M=128,
     BLOCK_N=64,
@@ -274,8 +273,7 @@ def forward(
     else:
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
+    sm_scale = head_dim**-0.5
 
     if is_causal and qo_len != kv_len:
         raise ValueError("qo_len and kv_len must be equal for causal attention")

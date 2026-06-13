@@ -1,14 +1,11 @@
 import warnings
-from typing import Optional
 
 import torch
 
 from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
 from .cuda_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
-from .utils import DEFAULT_PV_ACCUM_DTYPE, _pad_qkv
-
-LOG2_E = 1.44269504
+from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _pad_qkv
 
 
 def sageattn_qk_int8_pv_fp16_cuda(
@@ -17,22 +14,18 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    sm_scale: Optional[float] = None,
     pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
 ) -> torch.Tensor:
     if torch.compiler.is_compiling() and not return_lse:
-        if sm_scale is None:
-            sm_scale = q.size(-1) ** -0.5
         return _sageattn_autotuned(
             q,
             k,
             v,
             tensor_layout,
             is_causal,
-            float(sm_scale),
             pv_accum_dtype,
             smooth_k,
             smooth_v,
@@ -45,7 +38,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
         tensor_layout,
         is_causal,
         pv_accum_dtype,
-        sm_scale,
         smooth_k,
         smooth_v,
         return_lse,
@@ -57,7 +49,6 @@ def sageattn_qk_int8_pv_fp16_cuda(
         v,
         tensor_layout,
         is_causal,
-        sm_scale,
         pv_accum_dtype,
         smooth_k,
         smooth_v,
@@ -72,7 +63,6 @@ def _sageattn_configured(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: Optional[float],
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,
@@ -93,22 +83,21 @@ def _sageattn_configured(
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Last dimension of q, k, and v must be contiguous.")
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
+    sm_scale = head_dim**-0.5
 
     if tensor_layout == "NHD":
         layout_i = 0
-        seq_dim = 1
+        seq_dim_index = 1
         head_dim_index = 2
     elif tensor_layout == "HND":
         layout_i = 1
-        seq_dim = 2
+        seq_dim_index = 2
         head_dim_index = 1
     else:
         raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
 
     if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
+        km = k.mean(dim=seq_dim_index, keepdim=True)
         num_qo_heads = q.size(head_dim_index)
         num_kv_heads = k.size(head_dim_index)
         if num_qo_heads % num_kv_heads != 0:
@@ -138,12 +127,12 @@ def _sageattn_configured(
     q_int8, q_scale, k_int8, k_scale = per_thread_int8(
         q,
         k,
-        km,
-        tensor_layout=tensor_layout,
+        km=km,
         BLKQ=blk_q,
         WARPQ=warp_q,
         BLKK=blk_k,
         WARPK=warp_k,
+        tensor_layout=tensor_layout,
     )
 
     output = torch.empty(q.size(), dtype=dtype, device=q.device)
@@ -167,8 +156,8 @@ def _sageattn_configured(
         )
     elif pv_accum_dtype == "fp16":
         if smooth_v:
-            vm = v.mean(dim=seq_dim)
-            smoothed_v = (v - vm.unsqueeze(seq_dim)).to(torch.float16)
+            vm = v.mean(dim=seq_dim_index)
+            smoothed_v = (v - vm.unsqueeze(seq_dim_index)).to(torch.float16)
             lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
                 q_int8,
                 k_int8,

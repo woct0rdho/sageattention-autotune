@@ -3,6 +3,8 @@ import os
 import torch
 import torch.nn.functional as F
 
+LOG2_E = 1.44269504
+
 DEFAULT_PV_ACCUM_DTYPE = os.getenv("SAGEATTN_DEFAULT_PV_ACCUM_DTYPE", "fp32").lower()
 if DEFAULT_PV_ACCUM_DTYPE not in ("fp32", "fp16", "fp16+fp32"):
     DEFAULT_PV_ACCUM_DTYPE = "fp32"

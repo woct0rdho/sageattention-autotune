@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
@@ -111,7 +109,6 @@ def _eager_triton_autotune_select(
     tensor_layout: str,
     is_causal: bool,
     pv_accum_dtype: str,
-    sm_scale: Optional[float],
     smooth_k: bool,
     return_lse: bool,
 ) -> tuple[int, int, int, int, int]:
@@ -131,7 +128,6 @@ def _eager_triton_autotune_select(
             v,
             tensor_layout,
             is_causal,
-            sm_scale,
             pv_accum_dtype,
             smooth_k,
             return_lse,
@@ -147,7 +143,6 @@ def _sageattn_triton_autotuned(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: float,
     pv_accum_dtype: str,
     smooth_k: bool,
     block_m: int = 0,
@@ -168,7 +163,6 @@ def _sageattn_triton_autotuned(
         v,
         tensor_layout,
         is_causal,
-        sm_scale,
         pv_accum_dtype,
         smooth_k,
         False,
@@ -183,7 +177,6 @@ def _(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: float,
     pv_accum_dtype: str,
     smooth_k: bool,
     block_m: int = 0,

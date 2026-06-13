@@ -17,7 +17,6 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dty
         v,
         tensor_layout,
         is_causal,
-        None,
         pv_accum_dtype,
         smooth_k,
         False,
