@@ -1,7 +1,8 @@
 import importlib
+import os
 
 from .triton_attn import sageattn_qk_int8_pv_fp16_triton
-from .utils import _env_flag_enabled
+from .triton_bwd import sageattn_qk_int8_pv_fp16_triton_trainable
 
 try:
     importlib.import_module(f"{__package__}._qattn_sm80")
@@ -10,8 +11,10 @@ except (ImportError, OSError):
 else:
     from .cuda_attn import sageattn_qk_int8_pv_fp16_cuda
 
-if _env_flag_enabled("SAGEATTN_TRITON_BACKEND") or sageattn_qk_int8_pv_fp16_cuda is None:
+if os.getenv("SAGEATTN_BACKEND", "").lower() == "triton":
     sageattn = sageattn_qk_int8_pv_fp16_triton
+elif os.getenv("SAGEATTN_BACKEND", "").lower() == "triton_trainable":
+    sageattn = sageattn_qk_int8_pv_fp16_triton_trainable
 else:
     sageattn = sageattn_qk_int8_pv_fp16_cuda
 

@@ -9,8 +9,8 @@ from torch.nn.functional import scaled_dot_product_attention as sdpa
 from sageattention import sageattn
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", type=str, default="sdpa", choices=["sdpa", "flash_attn", "sage_attn"])
-parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--method", type=str, default="sage_attn", choices=["sdpa", "flash_attn", "sage_attn"])
+parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--num_heads", type=int, default=32)
 parser.add_argument("--head_dim", type=int, default=128)
 args = parser.parse_args()
@@ -46,6 +46,7 @@ def run_benchmark(is_causal: bool) -> None:
         elif args.method == "sage_attn":
 
             def fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+                assert sageattn is not None
                 return sageattn(q, k, v, tensor_layout="NHD", is_causal=is_causal)
         else:
 

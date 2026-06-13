@@ -46,7 +46,7 @@ def _estimated_triton_smem_bytes(
 
 
 @functools.cache
-def _triton_attn_config_is_valid(
+def _attn_config_is_valid(
     block_m: int,
     block_n: int,
     attn_num_stages: int,
@@ -79,12 +79,12 @@ def _prune_attn_configs(
     return [
         config
         for config in configs
-        if _triton_attn_config_is_valid(block_m, block_n, config.num_stages, head_dim, is_causal, q.device.index)
+        if _attn_config_is_valid(block_m, block_n, config.num_stages, head_dim, is_causal, q.device.index)
     ]
 
 
 @functools.cache
-def _valid_triton_attn_configs(
+def _valid_attn_configs(
     block_config: tuple[int, int],
     head_dim: int,
     is_causal: bool,
@@ -94,5 +94,5 @@ def _valid_triton_attn_configs(
     return tuple(
         attn_config
         for attn_config in _TRITON_ATTN_CONFIGS
-        if _triton_attn_config_is_valid(block_m, block_n, attn_config[1], head_dim, is_causal, device_index)
+        if _attn_config_is_valid(block_m, block_n, attn_config[1], head_dim, is_causal, device_index)
     )

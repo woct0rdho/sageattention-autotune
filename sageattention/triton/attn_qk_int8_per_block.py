@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
-from .autotune_utils import _TRITON_ATTN_CONFIGS, _prune_attn_configs
+from .attn_autotune import _TRITON_ATTN_CONFIGS, _prune_attn_configs
 
 LOG2_E = 1.44269504088896340736
 

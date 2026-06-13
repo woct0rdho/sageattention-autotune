@@ -62,18 +62,18 @@ def quant_per_block_int8_kernel(
     output_ptrs = Output + off_b * stride_oz + off_h * stride_oh + offs_n[:, None] * stride_on + offs_k[None, :]
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk
 
-    x = tl.load(input_ptrs, mask=offs_n[:, None] < L)
-    x = x.to(tl.float32)
+    x = tl.load(input_ptrs, mask=offs_n[:, None] < L).to(tl.float32)
 
     if HAS_MEAN:
         mean_ptrs = Mean + off_b * stride_mz + off_h * stride_mh + offs_k * stride_mk
         mean = tl.load(mean_ptrs).to(tl.float32)
         x -= mean[None, :]
 
-    scale = tl.max(tl.abs(x)) / 127.0
+    scale = tl.max(tl.abs(x)) / 127.0 + 1e-7
     x_int8 = x / scale
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
     x_int8 = x_int8.to(tl.int8)
+
     tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 

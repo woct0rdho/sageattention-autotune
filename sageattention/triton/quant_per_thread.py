@@ -49,11 +49,13 @@ def quant_query_per_thread_int8_kernel(
     scale_ptrs = Scale + off_b * stride_sz + off_h * stride_sh + off_blk * 8 + off_tld
 
     x = tl.load(input_ptrs, mask=offs_n[:, None] < L).to(tl.float32)
-    scale = tl.max(tl.abs(x)) / 127.0 + 0.0000001
+
+    scale = tl.max(tl.abs(x)) / 127.0 + 1e-7
     x_int8 = x / scale
     x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
+    x_int8 = x_int8.to(tl.int8)
 
-    tl.store(output_ptrs, x_int8.to(tl.int8), mask=offs_n[:, None] < L)
+    tl.store(output_ptrs, x_int8, mask=offs_n[:, None] < L)
     tl.store(scale_ptrs, scale)
 
 
@@ -103,15 +105,16 @@ def quant_key_per_thread_int8_kernel(
         x0 -= mean[None, :]
         x1 -= mean[None, :]
 
-    scale = tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127.0 + 0.0000001
-
+    scale = tl.maximum(tl.max(tl.abs(x0)), tl.max(tl.abs(x1))) / 127.0 + 1e-7
     x0_int8 = x0 / scale
     x1_int8 = x1 / scale
     x0_int8 += 0.5 * tl.where(x0_int8 >= 0, 1, -1)
     x1_int8 += 0.5 * tl.where(x1_int8 >= 0, 1, -1)
+    x0_int8 = x0_int8.to(tl.int8)
+    x1_int8 = x1_int8.to(tl.int8)
 
-    tl.store(output_ptrs0, x0_int8.to(tl.int8), mask=offs_n0[:, None] < L)
-    tl.store(output_ptrs1, x1_int8.to(tl.int8), mask=offs_n1[:, None] < L)
+    tl.store(output_ptrs0, x0_int8, mask=offs_n0[:, None] < L)
+    tl.store(output_ptrs1, x1_int8, mask=offs_n1[:, None] < L)
     tl.store(scale_ptrs, scale)
 
 
