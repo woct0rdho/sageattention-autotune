@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -116,15 +118,15 @@ def quant_key_per_thread_int8_kernel(
 
 
 def per_thread_int8(
-    q,
-    k,
-    km=None,
-    BLKQ=128,
-    WARPQ=32,
-    BLKK=64,
-    WARPK=64,
-    tensor_layout="HND",
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    km: Optional[torch.Tensor] = None,
+    BLKQ: int = 128,
+    WARPQ: int = 32,
+    BLKK: int = 64,
+    WARPK: int = 64,
+    tensor_layout: str = "HND",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
 

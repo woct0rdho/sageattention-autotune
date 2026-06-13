@@ -10,7 +10,7 @@ if DEFAULT_PV_ACCUM_DTYPE not in ("fp32", "fp16", "fp16+fp32"):
     DEFAULT_PV_ACCUM_DTYPE = "fp32"
 
 
-def _env_flag_enabled(name):
+def _env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
@@ -26,7 +26,7 @@ def _padded_head_dim(head_dim: int) -> int:
     raise ValueError(f"Unsupported head_dim: {head_dim}")
 
 
-def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     head_dim = q.size(-1)
     pad_to = _padded_head_dim(head_dim)
     if pad_to == head_dim:

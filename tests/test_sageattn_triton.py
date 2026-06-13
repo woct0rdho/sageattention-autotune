@@ -1,4 +1,5 @@
 from itertools import product
+from typing import Optional
 
 import torch
 from test_sageattn import _error_report, _expected, _make_qkv
@@ -7,7 +8,16 @@ from sageattention.triton_attn import _sageattn_triton_configured
 from sageattention.triton_autotune import _valid_triton_configs_for_head_dim
 
 
-def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k):
+def _run_case(
+    config: tuple[int, int, int, int, int],
+    *,
+    head_dim: int,
+    dtype: torch.dtype,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+) -> tuple[bool, str]:
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
 
@@ -26,14 +36,22 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dty
     return _error_report(actual, expected)
 
 
-def _representative_config(block_config, *, head_dim, is_causal, device):
+def _representative_config(
+    block_config: tuple[int, int],
+    *,
+    head_dim: int,
+    is_causal: bool,
+    device: torch.device,
+) -> Optional[tuple[int, int, int, int, int]]:
     for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
         if config[:2] == block_config:
             return config
     return None
 
 
-def _valid_block_configs(modes, device):
+def _valid_block_configs(
+    modes: list[tuple[int, torch.dtype, str, bool, str, bool]], device: torch.device
+) -> tuple[tuple[int, int], ...]:
     block_configs = []
     for head_dim, _, _, is_causal, _, _ in modes:
         for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
@@ -43,7 +61,7 @@ def _valid_block_configs(modes, device):
     return tuple(block_configs)
 
 
-def main():
+def main() -> None:
     print("Testing SageAttention Triton block configs")
     print("Config format: (BLOCK_M, BLOCK_N)")
     print("=" * 80)

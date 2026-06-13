@@ -7,3 +7,9 @@ line-length = 120
 
 [tool.ruff.lint]
 extend-select = ["I"]
+
+[tool.ty.analysis]
+replace-imports-with-any = ["triton", "triton.**"]
+
+[tool.ty.environment]
+python-version = "3.9"

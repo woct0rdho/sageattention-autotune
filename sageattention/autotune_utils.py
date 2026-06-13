@@ -13,7 +13,7 @@ def _shared_memory_limit(device: torch.device) -> int:
     return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
 
 
-def _tensor_autotune_cache_key(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *extra):
+def _tensor_autotune_cache_key(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *extra: object) -> tuple[object, ...]:
     device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
     return (
         device_index,
@@ -43,8 +43,8 @@ def _valid_configs_for_head_dim(
 
 def _eager_autotune_select(
     configs: Sequence[ConfigT],
-    cache: dict,
-    cache_key,
+    cache: dict[object, ConfigT],
+    cache_key: object,
     benchmark: Callable[[ConfigT], object],
 ) -> ConfigT:
     if len(configs) == 1:

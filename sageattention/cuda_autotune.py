@@ -10,7 +10,7 @@ _AUTOTUNE_CONFIGS = (
     (64, 64, 32, 64),
     (128, 64, 16, 64),
 )
-_AUTOTUNE_CACHE = {}
+_AUTOTUNE_CACHE: dict[object, tuple[int, int, int, int]] = {}
 
 
 def _config_is_valid(

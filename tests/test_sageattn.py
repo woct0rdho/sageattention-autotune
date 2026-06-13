@@ -8,7 +8,14 @@ from sageattention.cuda_attn import _sageattn_configured
 from sageattention.cuda_autotune import _AUTOTUNE_CONFIGS, _valid_configs
 
 
-def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layout="HND", dtype=torch.float16):
+def _make_qkv(
+    batch_size: int = 2,
+    num_heads: int = 16,
+    seq_len: int = 1024,
+    head_dim: int = 64,
+    tensor_layout: str = "HND",
+    dtype: torch.dtype = torch.float16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if tensor_layout == "HND":
         shape = (batch_size, num_heads, seq_len, head_dim)
     else:
@@ -19,7 +26,7 @@ def _make_qkv(batch_size=2, num_heads=16, seq_len=1024, head_dim=64, tensor_layo
     return q, k, v
 
 
-def _expected(q, k, v, tensor_layout, is_causal):
+def _expected(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tensor_layout: str, is_causal: bool) -> torch.Tensor:
     if tensor_layout == "NHD":
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -31,7 +38,7 @@ def _expected(q, k, v, tensor_layout, is_causal):
     return expected.transpose(1, 2) if tensor_layout == "NHD" else expected
 
 
-def _error_report(actual, expected):
+def _error_report(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, str]:
     actual = actual.float()
     expected = expected.float()
     diff = actual - expected
@@ -43,7 +50,16 @@ def _error_report(actual, expected):
     return passed, msg
 
 
-def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k):
+def _run_case(
+    config: tuple[int, int, int, int],
+    *,
+    head_dim: int,
+    dtype: torch.dtype,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+) -> tuple[bool, str]:
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
 
@@ -63,7 +79,7 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dty
     return _error_report(actual, expected)
 
 
-def main():
+def main() -> None:
     print(f"Testing SageAttention autotune configs ({len(_AUTOTUNE_CONFIGS)} compiled configs)\n")
     print("Config format: (blk_q, blk_k, warp_q, warp_k)")
     print("=" * 80)

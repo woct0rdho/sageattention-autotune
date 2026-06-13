@@ -2,6 +2,7 @@ import os
 import shlex
 import shutil
 import subprocess
+from typing import Any
 
 import torch
 from setuptools import find_packages, setup
@@ -9,29 +10,37 @@ from torch.utils import cpp_extension
 from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 
-def _quote_command_arg(arg):
+def _quote_command_arg(arg: str) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline([arg])
     return shlex.quote(arg)
 
 
-def _prepend_ccache(command, ccache_path):
+def _prepend_ccache(command: str, ccache_path: str) -> str:
     if "ccache" in command.lower():
         return command
     return f"{_quote_command_arg(ccache_path)} {command}"
 
 
-def _enable_ccache(ccache_path):
+def _enable_ccache() -> None:
+    ccache_path = shutil.which("ccache")
+    if not ccache_path:
+        return
+
+    assert CUDA_HOME is not None
     nvcc = os.path.join(CUDA_HOME, "bin", "nvcc.exe" if os.name == "nt" else "nvcc")
     os.environ["PYTORCH_NVCC"] = _prepend_ccache(os.getenv("PYTORCH_NVCC", _quote_command_arg(nvcc)), ccache_path)
 
-    original_write_ninja_file = cpp_extension._write_ninja_file
+    original_write_ninja_file = getattr(cpp_extension, "_write_ninja_file")
+    if original_write_ninja_file is None:
+        return
+
     if getattr(original_write_ninja_file, "_sageattention_ccache", False):
         return
 
     ccache_prefix = "" if "ccache" in os.getenv("CXX", "").lower() else f"{_quote_command_arg(ccache_path)} "
 
-    def write_ninja_file_with_ccache(*args, **kwargs):
+    def write_ninja_file_with_ccache(*args: Any, **kwargs: Any) -> None:
         original_write_ninja_file(*args, **kwargs)
         path = kwargs.get("path", args[0] if args else None)
         if path is None or not os.path.exists(path):
@@ -52,22 +61,20 @@ def _enable_ccache(ccache_path):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(patched)
 
-    write_ninja_file_with_ccache._sageattention_ccache = True
-    cpp_extension._write_ninja_file = write_ninja_file_with_ccache
+    setattr(write_ninja_file_with_ccache, "_sageattention_ccache", True)
+    setattr(cpp_extension, "_write_ninja_file", write_ninja_file_with_ccache)
 
 
-def _env_flag_enabled(name):
+def _env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
 build_triton_only = _env_flag_enabled("SAGEATTN_BUILD_TRITON_ONLY")
 
-if not build_triton_only and CUDA_HOME is None:
-    raise RuntimeError("Cannot find CUDA_HOME. CUDA must be available to build SageAttention.")
-
-ccache_path = shutil.which("ccache")
-if ccache_path and not build_triton_only:
-    _enable_ccache(ccache_path)
+if not build_triton_only:
+    if CUDA_HOME is None:
+        raise RuntimeError("Cannot find CUDA_HOME. CUDA must be available to build SageAttention.")
+    _enable_ccache()
 
 if os.name == "nt":
     cxx_flags = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
