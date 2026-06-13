@@ -12,7 +12,6 @@ _TRITON_BLOCK_CONFIGS = (
     (64, 32),
     (32, 32),
 )
-_TRITON_QUANT_NUM_WARPS = (4, 8)
 _TRITON_ATTN_CONFIGS = (
     # (attn_num_warps, attn_num_stages)
     (4, 2),
@@ -23,12 +22,11 @@ _TRITON_ATTN_CONFIGS = (
     (8, 4),
 )
 _TRITON_AUTOTUNE_CONFIGS = tuple(
-    (block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages)
+    (block_m, block_n, attn_num_warps, attn_num_stages)
     for block_m, block_n in _TRITON_BLOCK_CONFIGS
-    for quant_num_warps in _TRITON_QUANT_NUM_WARPS
     for attn_num_warps, attn_num_stages in _TRITON_ATTN_CONFIGS
 )
-_TRITON_AUTOTUNE_CACHE: dict[object, tuple[int, int, int, int, int]] = {}
+_TRITON_AUTOTUNE_CACHE: dict[object, tuple[int, int, int, int]] = {}
 
 
 def _estimated_triton_smem_bytes(
@@ -60,12 +58,12 @@ def _estimated_triton_smem_bytes(
 
 
 def _triton_config_is_valid(
-    config: tuple[int, int, int, int, int],
+    config: tuple[int, int, int, int],
     head_dim: int,
     is_causal: bool,
     device: torch.device,
 ) -> bool:
-    block_m, block_n, _, _, attn_num_stages = config
+    block_m, block_n, _, attn_num_stages = config
     if is_causal and block_m % block_n != 0:
         return False
 
@@ -78,7 +76,7 @@ def _triton_config_is_valid(
 def _valid_triton_configs(
     q: torch.Tensor,
     is_causal: bool,
-) -> tuple[tuple[int, int, int, int, int], ...]:
+) -> tuple[tuple[int, int, int, int], ...]:
     return _valid_triton_configs_for_head_dim(q.size(-1), is_causal, q.device)
 
 
@@ -86,7 +84,7 @@ def _valid_triton_configs_for_head_dim(
     head_dim: int,
     is_causal: bool,
     device: torch.device,
-) -> tuple[tuple[int, int, int, int, int], ...]:
+) -> tuple[tuple[int, int, int, int], ...]:
     return autotune_utils._valid_configs_for_head_dim(
         _TRITON_AUTOTUNE_CONFIGS, _triton_config_is_valid, head_dim, is_causal, device
     )
@@ -111,7 +109,7 @@ def _eager_triton_autotune_select(
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: bool,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int]:
     from .triton_attn import _sageattn_triton_configured
 
     configs = _valid_triton_configs(q, is_causal)
@@ -147,13 +145,12 @@ def _sageattn_triton_autotuned(
     smooth_k: bool,
     block_m: int = 0,
     block_n: int = 0,
-    quant_num_warps: int = 0,
     attn_num_warps: int = 0,
     attn_num_stages: int = 0,
 ) -> torch.Tensor:
     from .triton_attn import _sageattn_triton_configured
 
-    config = (block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages)
+    config = (block_m, block_n, attn_num_warps, attn_num_stages)
     if min(config) <= 0 or config not in _valid_triton_configs(q, is_causal):
         config = _valid_triton_configs(q, is_causal)[0]
 
@@ -181,7 +178,6 @@ def _(
     smooth_k: bool,
     block_m: int = 0,
     block_n: int = 0,
-    quant_num_warps: int = 0,
     attn_num_warps: int = 0,
     attn_num_stages: int = 0,
 ) -> torch.Tensor:
@@ -194,9 +190,8 @@ register_custom_op_autotuning(
         CustomOpConfig(
             block_m=cfg[0],
             block_n=cfg[1],
-            quant_num_warps=cfg[2],
-            attn_num_warps=cfg[3],
-            attn_num_stages=cfg[4],
+            attn_num_warps=cfg[2],
+            attn_num_stages=cfg[3],
         )
         for cfg in _valid_triton_configs_for_head_dim(
             fake_tensors["q"].size(-1),

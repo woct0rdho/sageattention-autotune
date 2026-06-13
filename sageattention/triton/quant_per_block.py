@@ -21,6 +21,10 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
+    key=["L", "C", "BLK", "HAS_MEAN"],
+)
 @triton.jit
 def quant_per_block_int8_kernel(
     Input,
@@ -77,7 +81,6 @@ def per_block_int8(
     BLKQ: int = 128,
     BLKK: int = 64,
     tensor_layout: str = "HND",
-    quant_num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
@@ -136,7 +139,6 @@ def per_block_int8(
         C=head_dim,
         BLK=BLKQ,
         HAS_MEAN=False,
-        num_warps=quant_num_warps,
     )
 
     grid = (k_blocks, h_kv, b)
@@ -160,7 +162,6 @@ def per_block_int8(
         C=head_dim,
         BLK=BLKK,
         HAS_MEAN=has_mean,
-        num_warps=quant_num_warps,
     )
 
     return q_int8, q_scale, k_int8, k_scale

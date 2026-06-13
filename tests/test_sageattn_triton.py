@@ -9,7 +9,7 @@ from sageattention.triton_autotune import _valid_triton_configs_for_head_dim
 
 
 def _run_case(
-    config: tuple[int, int, int, int, int],
+    config: tuple[int, int, int, int],
     *,
     head_dim: int,
     dtype: torch.dtype,
@@ -42,7 +42,7 @@ def _representative_config(
     head_dim: int,
     is_causal: bool,
     device: torch.device,
-) -> Optional[tuple[int, int, int, int, int]]:
+) -> Optional[tuple[int, int, int, int]]:
     for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
         if config[:2] == block_config:
             return config
