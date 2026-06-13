@@ -96,7 +96,7 @@ def _sageattn_triton_configured(
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: Literal[False],
-    triton_config: tuple[int, int, int, int, int],
+    triton_config: tuple[int, int, int, int],
 ) -> torch.Tensor: ...
 
 
@@ -110,7 +110,7 @@ def _sageattn_triton_configured(
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: Literal[True],
-    triton_config: tuple[int, int, int, int, int],
+    triton_config: tuple[int, int, int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -123,7 +123,7 @@ def _sageattn_triton_configured(
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: bool,
-    triton_config: tuple[int, int, int, int, int],
+    triton_config: tuple[int, int, int, int],
 ) -> SageAttnResult:
     dtype = q.dtype
     if not q.is_cuda:
@@ -160,7 +160,7 @@ def _sageattn_triton_configured(
     if pv_accum_dtype not in ("fp32", "fp16"):
         raise ValueError("pv_accum_dtype must be 'fp32' or 'fp16'.")
 
-    block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages = triton_config
+    block_m, block_n, attn_num_warps, attn_num_stages = triton_config
 
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
@@ -169,7 +169,6 @@ def _sageattn_triton_configured(
         BLKQ=block_m,
         BLKK=block_n,
         tensor_layout=tensor_layout,
-        quant_num_warps=quant_num_warps,
     )
 
     output, lse = _attn_forward(
