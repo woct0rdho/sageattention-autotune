@@ -24,6 +24,7 @@ def _config_is_valid(
         return False
 
     head_dim = _padded_head_dim(head_dim)
+    # See smem_max in launch_sm80_qk_kernel
     smem_bytes = head_dim * max(blk_q + 3 * blk_k, 2 * blk_q)
     return smem_bytes <= autotune_utils._shared_memory_limit(device)
 
@@ -142,7 +143,7 @@ register_custom_op_autotuning(
             warp_k=cfg[3],
         )
         for cfg in _valid_configs_for_head_dim(
-            fake_tensors["q"].shape[-1],
+            fake_tensors["q"].size(-1),
             False,
             fake_tensors["q"].device,
         )
