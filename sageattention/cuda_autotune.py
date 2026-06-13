@@ -2,11 +2,23 @@ import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
 from . import autotune_utils
+from .cuda_compile import use_fp8_backend
 from .utils import _padded_head_dim
 
 _AUTOTUNE_CONFIGS = (
     (128, 64, 32, 64),
     (128, 32, 32, 32),
+    (64, 64, 32, 64),
+    (128, 64, 16, 64),
+)
+
+# Candidate block configs for the fp8 (sm89/sm120) kernels. These must each be
+# one of the configs the launcher's runtime dispatch instantiates
+# (see launch_configured_sm89_qk_kernel). fp8 V is half the bytes of fp16, so
+# larger CTA_K (128) is affordable, which tends to help on RTX 50xx. The
+# autotuner benchmarks these per workload/device and caches the winner.
+_SM89_AUTOTUNE_CONFIGS = (
+    (128, 64, 32, 64),
     (64, 64, 32, 64),
     (128, 64, 16, 64),
 )
@@ -29,6 +41,22 @@ def _config_is_valid(
     return smem_bytes <= autotune_utils._shared_memory_limit(device)
 
 
+def _config_is_valid_fp8(
+    config: tuple[int, int, int, int],
+    head_dim: int,
+    is_causal: bool,
+    device: torch.device,
+) -> bool:
+    blk_q, blk_k, _, _ = config
+    if is_causal and blk_q // blk_k > 2:
+        return False
+
+    head_dim = _padded_head_dim(head_dim)
+    # See smem_max in launch_sm89_qk_kernel: Q + K + V(fp8, 1 byte) vs O(fp16).
+    smem_bytes = head_dim * max(blk_q + 2 * blk_k, 2 * blk_q)
+    return smem_bytes <= autotune_utils._shared_memory_limit(device)
+
+
 def _valid_configs(
     q: torch.Tensor,
     is_causal: bool,
@@ -41,6 +69,8 @@ def _valid_configs_for_head_dim(
     is_causal: bool,
     device: torch.device,
 ) -> tuple[tuple[int, int, int, int], ...]:
+    if use_fp8_backend(device):
+        return autotune_utils._valid_configs_for_head_dim(_SM89_AUTOTUNE_CONFIGS, _config_is_valid_fp8, head_dim, is_causal, device)
     return autotune_utils._valid_configs_for_head_dim(_AUTOTUNE_CONFIGS, _config_is_valid, head_dim, is_causal, device)
 
 

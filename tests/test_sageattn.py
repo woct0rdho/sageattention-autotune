@@ -39,14 +39,21 @@ def _expected(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tensor_layout: 
 
 
 def _error_report(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, str]:
+    # The fp8 (sv_f8) backend on Ada/Blackwell is inherently less precise than the
+    # fp16 PV path, so use looser tolerances when it is active for this device.
+    from sageattention.cuda_compile import use_fp8_backend
+
+    fp8 = actual.is_cuda and use_fp8_backend(actual.device)
+    rel_tol, abs_tol = (0.05, 0.25) if fp8 else (0.02, 0.1)
+
     actual = actual.float()
     expected = expected.float()
     diff = actual - expected
     fro_rel_err = (torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected).clamp(min=1e-6)).item()
     max_abs_err = diff.abs().max().item()
 
-    passed = fro_rel_err <= 0.02 and max_abs_err <= 0.1
-    msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
+    passed = fro_rel_err <= rel_tol and max_abs_err <= abs_tol
+    msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g} (fp8={fp8})"
     return passed, msg
 
 

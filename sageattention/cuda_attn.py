@@ -1,14 +1,30 @@
+import os
 import warnings
-from typing import Literal, Union, overload
+from typing import Literal, Optional, Union, overload
 
 import torch
 
 from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
-from .cuda_compile import _qattn_sm80
+from .cuda_compile import _qattn_sm80, _qattn_sm89, use_fp8_backend
+from .quant_fp8 import per_channel_fp8_v
 from .triton.quant_per_thread import per_thread_int8
 from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _lse_correction, _pad_qkv
 
 SageAttnResult = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+
+
+def _resolve_default_pv_accum_dtype(device: torch.device) -> str:
+    """Pick the default pv_accum_dtype when the caller didn't specify one.
+
+    On Ada/Blackwell (fp8 backend) default to the SageAttention2++ fast path;
+    elsewhere keep the package default. An explicit
+    SAGEATTN_DEFAULT_PV_ACCUM_DTYPE env var always wins.
+    """
+    if os.getenv("SAGEATTN_DEFAULT_PV_ACCUM_DTYPE"):
+        return DEFAULT_PV_ACCUM_DTYPE
+    if use_fp8_backend(device):
+        return "fp16+fp32"
+    return DEFAULT_PV_ACCUM_DTYPE
 
 
 @overload
@@ -18,7 +34,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    pv_accum_dtype: Optional[str] = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: Literal[False] = False,
@@ -33,7 +49,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    pv_accum_dtype: Optional[str] = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: Literal[True] = True,
@@ -47,13 +63,16 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    pv_accum_dtype: Optional[str] = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
     attn_mask: object = None,  # For ComfyUI compatibility. Not implemented yet.
 ) -> SageAttnResult:
     assert attn_mask is None
+
+    if pv_accum_dtype is None:
+        pv_accum_dtype = _resolve_default_pv_accum_dtype(q.device)
 
     if torch.compiler.is_compiling() and not return_lse:
         return _sageattn_autotuned(
@@ -188,7 +207,27 @@ def _sageattn_configured(
 
     output = torch.empty(q.size(), dtype=dtype, device=q.device)
 
-    if pv_accum_dtype == "fp32":
+    if use_fp8_backend(q.device):
+        # Ada (sm_89) / Blackwell (sm_120): int8-QK / fp8-PV (SageAttention2++ sv_f8).
+        if smooth_v:
+            warnings.warn(
+                "smooth_v is not supported on the fp8 (sm89/sm120) backend; ignoring.",
+                stacklevel=2,
+            )
+        v_fp8, v_scale = per_channel_fp8_v(v, tensor_layout)
+        if pv_accum_dtype == "fp32":
+            # accurate per-block f32 accumulation
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
+                q_int8, k_int8, v_fp8, output, q_scale, k_scale, v_scale,
+                layout_i, is_causal, sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse,
+            )
+        else:
+            # "fp16" / "fp16+fp32" -> SageAttention2++ fp16-accumulation fast path
+            lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+                q_int8, k_int8, v_fp8, output, q_scale, k_scale, v_scale,
+                layout_i, is_causal, sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse,
+            )
+    elif pv_accum_dtype == "fp32":
         lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(
             q_int8,
             k_int8,
