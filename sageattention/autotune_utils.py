@@ -1,3 +1,4 @@
+import logging
 import os
 from collections.abc import Callable, Sequence
 from typing import TypeVar
@@ -7,6 +8,8 @@ import triton
 
 ConfigT = TypeVar("ConfigT", bound=tuple[int, ...])
 
+_logger = logging.getLogger(__name__)
+
 
 def _shared_memory_limit(device: torch.device) -> int:
     props = torch.cuda.get_device_properties(device)
@@ -14,13 +17,11 @@ def _shared_memory_limit(device: torch.device) -> int:
 
 
 def _tensor_autotune_cache_key(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *extra: object) -> tuple[object, ...]:
-    device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
     return (
-        device_index,
+        q.device.index,
         q.dtype,
         tuple(q.shape),
         tuple(k.shape),
-        tuple(v.shape),
         tuple(q.stride()),
         tuple(k.stride()),
         tuple(v.stride()),
@@ -70,4 +71,5 @@ def _eager_autotune_select(
             best_config = config
 
     cache[cache_key] = best_config
+    _logger.info("SageAttention cached autotune config %s for key %s", best_config, cache_key)
     return best_config
