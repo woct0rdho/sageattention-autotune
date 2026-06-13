@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
@@ -52,7 +50,6 @@ def _eager_autotune_select(
     tensor_layout: str,
     is_causal: bool,
     pv_accum_dtype: str,
-    sm_scale: Optional[float],
     smooth_k: bool,
     smooth_v: bool,
     return_lse: bool,
@@ -73,7 +70,6 @@ def _eager_autotune_select(
             v,
             tensor_layout,
             is_causal,
-            sm_scale,
             pv_accum_dtype,
             smooth_k,
             smooth_v,
@@ -90,7 +86,6 @@ def _sageattn_autotuned(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: float,
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,
@@ -111,7 +106,6 @@ def _sageattn_autotuned(
         v,
         tensor_layout,
         is_causal,
-        sm_scale,
         pv_accum_dtype,
         smooth_k,
         smooth_v,
@@ -127,7 +121,6 @@ def _(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: float,
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,

@@ -1,13 +1,9 @@
-from typing import Optional
-
 import torch
 
 from .triton.attn_qk_int8_per_block import forward as _attn_forward
 from .triton.quant_per_block import per_block_int8
 from .triton_autotune import _eager_triton_autotune_select, _sageattn_triton_autotuned
-from .utils import DEFAULT_PV_ACCUM_DTYPE, _pad_qkv
-
-LOG2_E = 1.44269504
+from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _pad_qkv
 
 
 def sageattn_qk_int8_pv_fp16_triton(
@@ -16,21 +12,17 @@ def sageattn_qk_int8_pv_fp16_triton(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    sm_scale: Optional[float] = None,
     pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
     smooth_k: bool = True,
     return_lse: bool = False,
 ):
     if torch.compiler.is_compiling() and not return_lse:
-        if sm_scale is None:
-            sm_scale = q.size(-1) ** -0.5
         return _sageattn_triton_autotuned(
             q,
             k,
             v,
             tensor_layout,
             is_causal,
-            float(sm_scale),
             pv_accum_dtype,
             smooth_k,
         )
@@ -42,7 +34,6 @@ def sageattn_qk_int8_pv_fp16_triton(
         tensor_layout,
         is_causal,
         pv_accum_dtype,
-        sm_scale,
         smooth_k,
         return_lse,
     )
@@ -53,7 +44,6 @@ def sageattn_qk_int8_pv_fp16_triton(
         v,
         tensor_layout,
         is_causal,
-        sm_scale,
         pv_accum_dtype,
         smooth_k,
         return_lse,
@@ -67,7 +57,6 @@ def _sageattn_triton_configured(
     v: torch.Tensor,
     tensor_layout: str,
     is_causal: bool,
-    sm_scale: Optional[float],
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: bool,
@@ -87,20 +76,19 @@ def _sageattn_triton_configured(
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Last dimension of q, k, and v must be contiguous.")
 
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
+    sm_scale = head_dim**-0.5
 
     if tensor_layout == "NHD":
-        seq_dim = 1
+        seq_dim_index = 1
         head_dim_index = 2
     elif tensor_layout == "HND":
-        seq_dim = 2
+        seq_dim_index = 2
         head_dim_index = 1
     else:
         raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
 
     if smooth_k:
-        km = k.mean(dim=seq_dim, keepdim=True)
+        km = k.mean(dim=seq_dim_index, keepdim=True)
         num_qo_heads = q.size(head_dim_index)
         num_kv_heads = k.size(head_dim_index)
         if num_qo_heads % num_kv_heads != 0:
@@ -144,7 +132,6 @@ def _sageattn_triton_configured(
         k_scale,
         tensor_layout=tensor_layout,
         is_causal=is_causal,
-        sm_scale=sm_scale,
         pv_accum_dtype=pv_accum_dtype,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
