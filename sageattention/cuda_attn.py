@@ -144,6 +144,8 @@ def _sageattn_configured(
         raise ValueError("All tensors must be on the same device.")
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("All tensors must have the same dtype.")
+    if k.shape != v.shape:
+        raise ValueError("k and v must have the same shape.")
 
     head_dim, q, k, v = _pad_qkv(q, k, v)
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
