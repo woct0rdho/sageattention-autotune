@@ -27,8 +27,8 @@
 namespace mma {
 
 enum class MMAMode {
-  kInit = 0U,
-  kInplaceUpdate = 1U,
+  kInit,
+  kInplaceUpdate,
 };
 
 template <typename T>

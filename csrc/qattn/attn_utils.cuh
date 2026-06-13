@@ -28,8 +28,8 @@
 #define div_ceil(M, N) (((M) + (N) - 1) / (N))
 
 enum class MaskMode {
-  kNone = 0,
-  kCausal = 1,
+  kNone,
+  kCausal,
 };
 
 enum class ComputeUnit {
