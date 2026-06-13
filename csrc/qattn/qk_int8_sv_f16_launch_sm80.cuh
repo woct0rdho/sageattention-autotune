@@ -35,7 +35,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
                                                         const Tensor &query_scale,
                                                         const Tensor &key_scale,
                                                         const int64_t tensor_layout,
-                                                        const int64_t return_lse)
+                                                        const bool return_lse)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -156,8 +156,8 @@ struct Sm80QkLaunchContext {
   int64_t blk_k;
   int64_t warp_q;
   int64_t warp_k;
-  int64_t is_causal;
-  int64_t return_lse;
+  bool is_causal;
+  bool return_lse;
 };
 
 template <int HeadDim, bool IsCausal, bool ReturnLse, typename DTypeOut, int CtaQ, int CtaK, int WarpQ, int WarpK, typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
@@ -236,13 +236,13 @@ Tensor run_sm80_qk_attn(const Tensor &query,
                         const Tensor &key_scale,
                         const Tensor *value_mean,
                         const int64_t tensor_layout,
-                        const int64_t is_causal,
+                        const bool is_causal,
                         const double sm_scale,
                         const int64_t blk_q,
                         const int64_t blk_k,
                         const int64_t warp_q,
                         const int64_t warp_k,
-                        const int64_t return_lse)
+                        const bool return_lse)
 {
   const auto params = prepare_sm80_qk_launch_params(query, key, value, output, query_scale, key_scale, tensor_layout, return_lse);
   const void *value_mean_ptr = nullptr;
@@ -279,9 +279,9 @@ Tensor run_sm80_qk_attn(const Tensor &query,
 
   sageattention::dispatch::fp16_dtype(ctx.output.scalar_type(), [&]<typename DTypeOut>() {
     sageattention::dispatch::head_dim(ctx.params.head_dim, [&]<int HeadDim>() {
-      sageattention::dispatch::boolean(ctx.is_causal, "causal mode", [&]<bool IsCausal>() {
+      sageattention::dispatch::boolean(ctx.is_causal, [&]<bool IsCausal>() {
         // ReturnLse is currently disabled for compilation speed
-        // sageattention::dispatch::boolean(ctx.return_lse, "return_lse mode", [&]<bool ReturnLse>() {
+        // sageattention::dispatch::boolean(ctx.return_lse, [&]<bool ReturnLse>() {
         //   launch_configured_sm80_qk_kernel<HeadDim, IsCausal, ReturnLse, DTypeOut, DTypeSVAccum, UseInstBuffer, DenominatorAccumUnit, FuseVMean>(ctx);
         // });
 

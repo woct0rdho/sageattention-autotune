@@ -102,9 +102,6 @@ def _sageattn_configured(
     seq_dim = 1 if layout_i == 0 else 2
     head_dim_index = 2 if layout_i == 0 else 1
 
-    is_causal_i = 1 if is_causal else 0
-    return_lse_i = 1 if return_lse else 0
-
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
         num_qo_heads = q.size(head_dim_index)
@@ -156,13 +153,13 @@ def _sageattn_configured(
             q_scale,
             k_scale,
             layout_i,
-            is_causal_i,
+            is_causal,
             sm_scale,
             blk_q,
             blk_k,
             warp_q,
             warp_k,
-            return_lse_i,
+            return_lse,
         )
     elif pv_accum_i == 1:  # fp16
         if smooth_v:
@@ -177,13 +174,13 @@ def _sageattn_configured(
                 k_scale,
                 vm,
                 layout_i,
-                is_causal_i,
+                is_causal,
                 sm_scale,
                 blk_q,
                 blk_k,
                 warp_q,
                 warp_k,
-                return_lse_i,
+                return_lse,
             )
         else:
             lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(
@@ -194,13 +191,13 @@ def _sageattn_configured(
                 q_scale,
                 k_scale,
                 layout_i,
-                is_causal_i,
+                is_causal,
                 sm_scale,
                 blk_q,
                 blk_k,
                 warp_q,
                 warp_k,
-                return_lse_i,
+                return_lse,
             )
     else:  # fp16+fp32
         lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(
@@ -211,13 +208,13 @@ def _sageattn_configured(
             q_scale,
             k_scale,
             layout_i,
-            is_causal_i,
+            is_causal,
             sm_scale,
             blk_q,
             blk_k,
             warp_q,
             warp_k,
-            return_lse_i,
+            return_lse,
         )
 
     output = output[..., :head_dim]
