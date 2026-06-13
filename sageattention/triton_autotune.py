@@ -195,7 +195,7 @@ register_custom_op_autotuning(
         )
         for cfg in _valid_triton_configs_for_head_dim(
             fake_tensors["q"].size(-1),
-            False,
+            False,  # For now we hardcode is_causal=False and we assume it allows more configs than is_causal=True
             fake_tensors["q"].device,
         )
     ],
