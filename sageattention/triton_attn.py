@@ -15,7 +15,10 @@ def sageattn_qk_int8_pv_fp16_triton(
     pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
     smooth_k: bool = True,
     return_lse: bool = False,
+    attn_mask: object = None,  # For ComfyUI compatibility. Not implemented yet.
 ):
+    assert attn_mask is None
+
     if torch.compiler.is_compiling() and not return_lse:
         return _sageattn_triton_autotuned(
             q,
