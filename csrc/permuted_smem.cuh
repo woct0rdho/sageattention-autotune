@@ -25,8 +25,8 @@
 #include <cuda_runtime.h>
 
 enum class SwizzleMode {
-  k32B, // for k32B mode, a line of shared memory must have 32B (16 half value)
-  k64B, // for k64B mode, a line of shared memory must have 64B (32 half value)
+  k32B,  // for k32B mode, a line of shared memory must have 32B (16 half value)
+  k64B,  // for k64B mode, a line of shared memory must have 64B (32 half value)
   k128B, // 128B already spans all banks in shared memory. a line of shared memory can have multiple 128B.
 };
 

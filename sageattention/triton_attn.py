@@ -21,9 +21,6 @@ def sageattn_qk_int8_pv_fp16_triton(
     smooth_k: bool = True,
     return_lse: bool = False,
 ):
-    layout_i = {"NHD": 0, "HND": 1}[tensor_layout]
-    pv_accum_i = {"fp32": 0, "fp16": 1}[pv_accum_dtype]
-
     if torch.compiler.is_compiling() and not return_lse:
         if sm_scale is None:
             sm_scale = q.size(-1) ** -0.5
@@ -31,10 +28,10 @@ def sageattn_qk_int8_pv_fp16_triton(
             q,
             k,
             v,
-            layout_i,
+            tensor_layout,
             is_causal,
             float(sm_scale),
-            pv_accum_i,
+            pv_accum_dtype,
             smooth_k,
         )
 
@@ -42,9 +39,9 @@ def sageattn_qk_int8_pv_fp16_triton(
         q,
         k,
         v,
-        layout_i,
+        tensor_layout,
         is_causal,
-        pv_accum_i,
+        pv_accum_dtype,
         sm_scale,
         smooth_k,
         return_lse,
@@ -54,10 +51,10 @@ def sageattn_qk_int8_pv_fp16_triton(
         q,
         k,
         v,
-        layout_i,
+        tensor_layout,
         is_causal,
         sm_scale,
-        pv_accum_i,
+        pv_accum_dtype,
         smooth_k,
         return_lse,
         config,
@@ -68,10 +65,10 @@ def _sageattn_triton_configured(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    layout_i: int,
+    tensor_layout: str,
     is_causal: bool,
     sm_scale: Optional[float],
-    pv_accum_i: int,
+    pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: bool,
     triton_config: tuple[int, int, int, int, int],
@@ -93,16 +90,14 @@ def _sageattn_triton_configured(
     if sm_scale is None:
         sm_scale = head_dim**-0.5
 
-    if layout_i == 0:
-        tensor_layout = "NHD"
+    if tensor_layout == "NHD":
         seq_dim = 1
         head_dim_index = 2
-    elif layout_i == 1:
-        tensor_layout = "HND"
+    elif tensor_layout == "HND":
         seq_dim = 2
         head_dim_index = 1
     else:
-        raise ValueError("layout_i must be 0 (NHD) or 1 (HND).")
+        raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
 
     if smooth_k:
         km = k.mean(dim=seq_dim, keepdim=True)
@@ -126,7 +121,8 @@ def _sageattn_triton_configured(
     else:
         km = None
 
-    pv_accum_dtype = {0: "fp32", 1: "fp16"}[pv_accum_i]
+    if pv_accum_dtype not in ("fp32", "fp16"):
+        raise ValueError("pv_accum_dtype must be 'fp32' or 'fp16'.")
 
     block_m, block_n, quant_num_warps, attn_num_warps, attn_num_stages = triton_config
 

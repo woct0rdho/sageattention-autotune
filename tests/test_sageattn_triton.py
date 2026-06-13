@@ -11,16 +11,14 @@ def _run_case(config, *, head_dim, dtype, tensor_layout, is_causal, pv_accum_dty
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
 
-    layout_i = {"NHD": 0, "HND": 1}[tensor_layout]
-    pv_accum_i = {"fp32": 0, "fp16": 1}[pv_accum_dtype]
     actual = _sageattn_triton_configured(
         q,
         k,
         v,
-        layout_i,
+        tensor_layout,
         is_causal,
         None,
-        pv_accum_i,
+        pv_accum_dtype,
         smooth_k,
         False,
         config,

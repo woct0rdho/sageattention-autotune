@@ -5,6 +5,24 @@
 
 #include <stdexcept>
 
+enum class TensorLayout {
+  kNHD,
+  kHND,
+};
+
+inline TensorLayout parse_tensor_layout(const int64_t tensor_layout)
+{
+  if (tensor_layout == 0)
+  {
+    return TensorLayout::kNHD;
+  }
+  if (tensor_layout == 1)
+  {
+    return TensorLayout::kHND;
+  }
+  throw std::invalid_argument("tensor_layout must be 0 (NHD) or 1 (HND)");
+}
+
 struct Sm80QkLaunchParams {
   int head_dim;
   int batch_size;
@@ -34,7 +52,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
                                                         const Tensor &output,
                                                         const Tensor &query_scale,
                                                         const Tensor &key_scale,
-                                                        const int64_t tensor_layout,
+                                                        const TensorLayout tensor_layout,
                                                         const bool return_lse)
 {
   CHECK_CUDA(query);
@@ -87,7 +105,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float)),
   };
 
-  if (tensor_layout == 0)
+  if (tensor_layout == TensorLayout::kNHD)
   {
     params.qo_len = static_cast<int>(query.size(1));
     params.kv_len = static_cast<int>(key.size(1));
@@ -106,7 +124,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     params.stride_h_v = static_cast<int>(value.stride(2));
     params.stride_h_o = static_cast<int>(output.stride(2));
   }
-  else if (tensor_layout == 1)
+  else if (tensor_layout == TensorLayout::kHND)
   {
     params.qo_len = static_cast<int>(query.size(2));
     params.kv_len = static_cast<int>(key.size(2));
@@ -124,10 +142,6 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     params.stride_h_k = static_cast<int>(key.stride(1));
     params.stride_h_v = static_cast<int>(value.stride(1));
     params.stride_h_o = static_cast<int>(output.stride(1));
-  }
-  else
-  {
-    throw std::invalid_argument("tensor_layout must be 0 or 1");
   }
 
   if (params.num_qo_heads % params.num_kv_heads != 0) {
@@ -244,7 +258,8 @@ Tensor run_sm80_qk_attn(const Tensor &query,
                         const int64_t warp_k,
                         const bool return_lse)
 {
-  const auto params = prepare_sm80_qk_launch_params(query, key, value, output, query_scale, key_scale, tensor_layout, return_lse);
+  const auto layout = parse_tensor_layout(tensor_layout);
+  const auto params = prepare_sm80_qk_launch_params(query, key, value, output, query_scale, key_scale, layout, return_lse);
   const void *value_mean_ptr = nullptr;
 
   if constexpr (FuseVMean)
