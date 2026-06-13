@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+LOG2_E = 1.44269504088896340736
+
 
 @triton.jit
 def _attn_fwd_inner(
@@ -278,6 +280,9 @@ def forward(
     if is_causal and qo_len != kv_len:
         raise ValueError("qo_len and kv_len must be equal for causal attention")
 
+    if h_qo % h_kv != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+
     num_kv_groups = h_qo // h_kv
 
     if return_lse:
@@ -308,7 +313,7 @@ def forward(
         stride_seq_o,
         qo_len,
         kv_len,
-        sm_scale * 1.44269504,
+        sm_scale * LOG2_E,
         h_qo,
         num_kv_groups,
         BLOCK_M=BLOCK_M,

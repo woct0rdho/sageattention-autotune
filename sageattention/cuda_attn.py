@@ -5,7 +5,7 @@ import torch
 from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
 from .cuda_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
-from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _pad_qkv
+from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _lse_correction, _pad_qkv
 
 
 def sageattn_qk_int8_pv_fp16_cuda(
@@ -98,23 +98,6 @@ def _sageattn_configured(
 
     if smooth_k:
         km = k.mean(dim=seq_dim_index, keepdim=True)
-        num_qo_heads = q.size(head_dim_index)
-        num_kv_heads = k.size(head_dim_index)
-        if num_qo_heads % num_kv_heads != 0:
-            raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
-
-        if return_lse:
-            q_per_kv_heads = num_qo_heads // num_kv_heads
-            km_broadcast = torch.repeat_interleave(km, q_per_kv_heads, dim=head_dim_index) if q_per_kv_heads > 1 else km
-
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(
-                    q.transpose(1, 2),
-                    km_broadcast.transpose(1, 2).transpose(2, 3),
-                ).squeeze(-1)
-            else:
-                lse_correction = torch.matmul(q, km_broadcast.transpose(2, 3)).squeeze(-1)
-            lse_correction = lse_correction.to(torch.float32)
     else:
         km = None
 
@@ -216,7 +199,7 @@ def _sageattn_configured(
     if not return_lse:
         return output
 
-    lse = lse / LOG2_E
+    lse /= LOG2_E
     if smooth_k:
-        lse = lse + lse_correction * sm_scale
+        lse += _lse_correction(q, km, tensor_layout, head_dim_index) * sm_scale
     return output, lse

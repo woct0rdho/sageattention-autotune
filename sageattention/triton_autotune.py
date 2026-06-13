@@ -199,7 +199,7 @@ register_custom_op_autotuning(
             attn_num_stages=cfg[4],
         )
         for cfg in _valid_triton_configs_for_head_dim(
-            fake_tensors["q"].shape[-1],
+            fake_tensors["q"].size(-1),
             False,
             fake_tensors["q"].device,
         )
