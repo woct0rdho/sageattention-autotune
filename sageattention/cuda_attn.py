@@ -6,7 +6,7 @@ import torch
 from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
 from .cuda_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
-from .utils import _pad_qkv
+from .utils import DEFAULT_PV_ACCUM_DTYPE, _pad_qkv
 
 LOG2_E = 1.44269504
 
@@ -18,7 +18,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
-    pv_accum_dtype: str = "fp32",
+    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,

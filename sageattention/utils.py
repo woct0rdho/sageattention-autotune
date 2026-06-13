@@ -1,5 +1,15 @@
+import os
+
 import torch
 import torch.nn.functional as F
+
+DEFAULT_PV_ACCUM_DTYPE = os.getenv("SAGEATTN_DEFAULT_PV_ACCUM_DTYPE", "fp32").lower()
+if DEFAULT_PV_ACCUM_DTYPE not in ("fp32", "fp16", "fp16+fp32"):
+    DEFAULT_PV_ACCUM_DTYPE = "fp32"
+
+
+def _env_flag_enabled(name):
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
 def _padded_head_dim(head_dim: int) -> int:
