@@ -18,7 +18,10 @@ def sageattn_qk_int8_pv_fp16_cuda(
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
+    attn_mask: object = None,  # For ComfyUI compatibility. Not implemented yet.
 ) -> torch.Tensor:
+    assert attn_mask is None
+
     if torch.compiler.is_compiling() and not return_lse:
         return _sageattn_autotuned(
             q,
