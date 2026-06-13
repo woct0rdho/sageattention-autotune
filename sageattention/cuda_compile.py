@@ -1,8 +1,9 @@
+import importlib
+
 import torch
 
-from . import _qattn_sm80
-
-_qattn_sm80 = torch.ops.sageattention_qattn_sm80  # noqa: F811
+importlib.import_module(f"{__package__}._qattn_sm80")
+_qattn_sm80 = torch.ops.sageattention_qattn_sm80
 
 
 def _empty_lse(query: torch.Tensor, tensor_layout: int, return_lse: bool) -> torch.Tensor:

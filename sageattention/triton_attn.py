@@ -1,9 +1,41 @@
+from typing import Literal, Union, overload
+
 import torch
 
 from .triton.attn_qk_int8_per_block import forward as _attn_forward
 from .triton.quant_per_block import per_block_int8
 from .triton_autotune import _eager_triton_autotune_select, _sageattn_triton_autotuned
 from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _lse_correction, _pad_qkv
+
+SageAttnResult = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+
+
+@overload
+def sageattn_qk_int8_pv_fp16_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    smooth_k: bool = True,
+    return_lse: Literal[False] = False,
+    attn_mask: object = None,
+) -> torch.Tensor: ...
+
+
+@overload
+def sageattn_qk_int8_pv_fp16_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    smooth_k: bool = True,
+    return_lse: Literal[True] = True,
+    attn_mask: object = None,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def sageattn_qk_int8_pv_fp16_triton(
@@ -16,7 +48,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     smooth_k: bool = True,
     return_lse: bool = False,
     attn_mask: object = None,  # For ComfyUI compatibility. Not implemented yet.
-):
+) -> SageAttnResult:
     assert attn_mask is None
 
     if torch.compiler.is_compiling() and not return_lse:
@@ -54,6 +86,34 @@ def sageattn_qk_int8_pv_fp16_triton(
     )
 
 
+@overload
+def _sageattn_triton_configured(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+    return_lse: Literal[False],
+    triton_config: tuple[int, int, int, int, int],
+) -> torch.Tensor: ...
+
+
+@overload
+def _sageattn_triton_configured(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+    return_lse: Literal[True],
+    triton_config: tuple[int, int, int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
 def _sageattn_triton_configured(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -64,7 +124,7 @@ def _sageattn_triton_configured(
     smooth_k: bool,
     return_lse: bool,
     triton_config: tuple[int, int, int, int, int],
-):
+) -> SageAttnResult:
     dtype = q.dtype
     if not q.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
@@ -133,5 +193,6 @@ def _sageattn_triton_configured(
 
     lse /= LOG2_E
     if smooth_k:
+        assert km is not None
         lse += _lse_correction(q, km, tensor_layout, head_dim_index) * sm_scale
     return output, lse

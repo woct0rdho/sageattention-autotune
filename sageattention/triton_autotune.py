@@ -28,7 +28,7 @@ _TRITON_AUTOTUNE_CONFIGS = tuple(
     for quant_num_warps in _TRITON_QUANT_NUM_WARPS
     for attn_num_warps, attn_num_stages in _TRITON_ATTN_CONFIGS
 )
-_TRITON_AUTOTUNE_CACHE = {}
+_TRITON_AUTOTUNE_CACHE: dict[object, tuple[int, int, int, int, int]] = {}
 
 
 def _estimated_triton_smem_bytes(

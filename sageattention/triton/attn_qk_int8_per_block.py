@@ -239,21 +239,21 @@ def _attn_fwd(
 
 
 def forward(
-    q,
-    k,
-    v,
-    q_scale,
-    k_scale,
-    tensor_layout="HND",
-    is_causal=False,
-    pv_accum_dtype="fp32",
-    BLOCK_M=128,
-    BLOCK_N=64,
-    attn_num_warps=4,
-    attn_num_stages=3,
-    output_dtype=torch.float16,
-    return_lse=False,
-):
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    pv_accum_dtype: str = "fp32",
+    BLOCK_M: int = 128,
+    BLOCK_N: int = 64,
+    attn_num_warps: int = 4,
+    attn_num_stages: int = 3,
+    output_dtype: torch.dtype = torch.float16,
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
     if tensor_layout == "HND":

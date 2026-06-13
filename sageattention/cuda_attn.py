@@ -1,4 +1,5 @@
 import warnings
+from typing import Literal, Union, overload
 
 import torch
 
@@ -6,6 +7,38 @@ from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
 from .cuda_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
 from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _lse_correction, _pad_qkv
+
+SageAttnResult = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+
+
+@overload
+def sageattn_qk_int8_pv_fp16_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: Literal[False] = False,
+    attn_mask: object = None,
+) -> torch.Tensor: ...
+
+
+@overload
+def sageattn_qk_int8_pv_fp16_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    pv_accum_dtype: str = DEFAULT_PV_ACCUM_DTYPE,
+    smooth_k: bool = True,
+    smooth_v: bool = False,
+    return_lse: Literal[True] = True,
+    attn_mask: object = None,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def sageattn_qk_int8_pv_fp16_cuda(
@@ -19,7 +52,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     smooth_v: bool = False,
     return_lse: bool = False,
     attn_mask: object = None,  # For ComfyUI compatibility. Not implemented yet.
-) -> torch.Tensor:
+) -> SageAttnResult:
     assert attn_mask is None
 
     if torch.compiler.is_compiling() and not return_lse:
@@ -60,6 +93,36 @@ def sageattn_qk_int8_pv_fp16_cuda(
     )
 
 
+@overload
+def _sageattn_configured(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+    smooth_v: bool,
+    return_lse: Literal[False],
+    qk_config: tuple[int, int, int, int],
+) -> torch.Tensor: ...
+
+
+@overload
+def _sageattn_configured(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+    smooth_v: bool,
+    return_lse: Literal[True],
+    qk_config: tuple[int, int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
 def _sageattn_configured(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -71,7 +134,7 @@ def _sageattn_configured(
     smooth_v: bool,
     return_lse: bool,
     qk_config: tuple[int, int, int, int],
-) -> torch.Tensor:
+) -> SageAttnResult:
     dtype = q.dtype
     if not q.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
@@ -204,5 +267,6 @@ def _sageattn_configured(
 
     lse /= LOG2_E
     if smooth_k:
+        assert km is not None
         lse += _lse_correction(q, km, tensor_layout, head_dim_index) * sm_scale
     return output, lse
