@@ -202,4 +202,135 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, uint32_t* s)
       : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(1006648320), "r"(1006648320), "f"(d[0]), "f"(d[1]));
 }
 
+// ---------------------------------------------------------------------------
+// FP8 (e4m3) tensor-core instructions. These require SM >= 89 (Ada) and
+// CUDA >= 12.4 (SM >= 120 / Blackwell with CUDA >= 12.8). They are only
+// instantiated by the sm89 extension, which is compiled for those arches, so
+// (matching the rest of this header) we emit the asm directly without arch
+// guards.
+// ---------------------------------------------------------------------------
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k32_row_col_f8f8f32(float* c, uint32_t* a, uint32_t* b)
+{
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]),
+          "f"(c[2]), "f"(c[3]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(0.f), "f"(0.f),
+          "f"(0.f), "f"(0.f));
+  }
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f16(uint32_t* c, uint32_t* a, uint32_t* b)
+{
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(c[0]), "=r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(c[0]), "r"(c[1]));
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(c[2]), "=r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "r"(c[2]), "r"(c[3]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(c[0]), "=r"(c[1])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0), "r"(0));
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+        "{%0,  %1},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  %9};\n"
+        : "=r"(c[2]), "=r"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "r"(0), "r"(0));
+  }
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* c, uint32_t* a, uint32_t* b)
+{
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]),
+          "f"(c[2]), "f"(c[3]));
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "f"(c[4]), "f"(c[5]),
+          "f"(c[6]), "f"(c[7]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[0]), "=f"(c[1]), "=f"(c[2]), "=f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(0.f), "f"(0.f),
+          "f"(0.f), "f"(0.f));
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(c[4]), "=f"(c[5]), "=f"(c[6]), "=f"(c[7])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2]), "r"(b[3]), "f"(0.f), "f"(0.f),
+          "f"(0.f), "f"(0.f));
+  }
+}
+
+__device__ __forceinline__ void rowsum_f8f8f32(float* d, uint32_t* s)
+{
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,  _,  %1,  _},"
+      "{%2,  %3,  %4,  %5},"
+      "{%6,  %7},"
+      "{%8,  0.,  %9,  0.};\n"
+      : "=f"(d[0]), "=f"(d[1])
+      : "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(943208504), "r"(943208504), // 943208504 packs four 1.0f in e4m3
+        "f"(d[0]), "f"(d[1]));
+}
+
 } // namespace mma

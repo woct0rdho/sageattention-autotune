@@ -76,7 +76,21 @@ def _expected(
     return _from_flash_layout(result, tensor_layout)
 
 
-def _error_report(actual: torch.Tensor, expected: torch.Tensor, rtol: float, atol: float) -> tuple[bool, str]:
+def _error_report(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float = 0.013,
+    atol: float = 0.08,
+) -> tuple[bool, str]:
+    # The fp8 (sv_f8) backend on Ada/Blackwell is inherently less precise than the
+    # fp16 PV path, so use looser tolerances when it is active for this device.
+    from sageattention.cuda_compile import use_fp8_backend
+
+    fp8 = actual.is_cuda and use_fp8_backend(actual.device)
+    if fp8:
+        rtol = max(rtol, 0.05)
+        atol = max(atol, 0.25)
+
     if actual.shape != expected.shape:
         return False, f"shape={tuple(actual.shape)} expected shape={tuple(expected.shape)}"
 
@@ -87,7 +101,7 @@ def _error_report(actual: torch.Tensor, expected: torch.Tensor, rtol: float, ato
     max_abs_err = diff.abs().max().item()
 
     passed = fro_rel_err <= rtol and max_abs_err <= atol
-    msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
+    msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g} (fp8={fp8})"
     return passed, msg
 
 
