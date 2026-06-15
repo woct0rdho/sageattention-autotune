@@ -27,8 +27,38 @@ def _autotune_seq_len_bucket(seq_len: int) -> int:
     return triton.cdiv(seq_len, _AUTOTUNE_SEQ_LEN_BUCKETS[-1]) * _AUTOTUNE_SEQ_LEN_BUCKETS[-1]
 
 
-def _tensor_shape_autotune_key(tensor: torch.Tensor, seq_dim: int) -> tuple[int, ...]:
-    return tuple(_autotune_seq_len_bucket(dim) if i == seq_dim else dim for i, dim in enumerate(tensor.shape))
+def _logical_shape_autotune_key(q: torch.Tensor, k: torch.Tensor, tensor_layout: str) -> tuple[int, ...]:
+    if tensor_layout == "NHD":
+        batch_size, qo_len, num_qo_heads, head_dim = q.shape
+        _, kv_len, num_kv_heads, _ = k.shape
+    elif tensor_layout == "HND":
+        batch_size, num_qo_heads, qo_len, head_dim = q.shape
+        _, num_kv_heads, kv_len, _ = k.shape
+    else:
+        raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
+
+    return (
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        _autotune_seq_len_bucket(qo_len),
+        _autotune_seq_len_bucket(kv_len),
+        head_dim,
+    )
+
+
+def _tensor_stride_layout_key(tensor: torch.Tensor, tensor_layout: str) -> tuple[int, ...]:
+    if tensor_layout == "NHD":
+        logical_dims = ((0, 0), (2, 1), (1, 2))
+    elif tensor_layout == "HND":
+        logical_dims = ((0, 0), (1, 1), (2, 2))
+    else:
+        raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
+
+    stride_roles = sorted(
+        ((tensor.stride(dim), role) for dim, role in logical_dims if tensor.size(dim) > 1), reverse=True
+    )
+    return tuple(role for _, role in stride_roles)
 
 
 def _tensor_autotune_cache_key(
@@ -38,19 +68,13 @@ def _tensor_autotune_cache_key(
     tensor_layout: str,
     *extra: object,
 ) -> tuple[object, ...]:
-    if tensor_layout == "NHD":
-        seq_dim = 1
-    elif tensor_layout == "HND":
-        seq_dim = 2
-    else:
-        raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
-
     return (
         q.device.index,
         q.dtype,
-        _tensor_shape_autotune_key(q, seq_dim),
-        _tensor_shape_autotune_key(k, seq_dim),
-        tensor_layout,
+        _logical_shape_autotune_key(q, k, tensor_layout),
+        _tensor_stride_layout_key(q, tensor_layout),
+        _tensor_stride_layout_key(k, tensor_layout),
+        _tensor_stride_layout_key(v, tensor_layout),
         *extra,
     )
 
