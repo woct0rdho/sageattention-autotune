@@ -116,4 +116,6 @@ def _fake_impl_fp8(
 
 if _qattn_sm89 is not None:
     torch.library.register_fake("sageattention_qattn_sm89::qk_int8_sv_f8_accum_f32_fuse_v_scale_attn")(_fake_impl_fp8)
-    torch.library.register_fake("sageattention_qattn_sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")(_fake_impl_fp8)
+    torch.library.register_fake("sageattention_qattn_sm89::qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf")(
+        _fake_impl_fp8
+    )

@@ -4,8 +4,6 @@ Skipped automatically unless the current GPU uses the fp8 backend (Ada / Blackwe
 with the _qattn_sm89 extension built).
 """
 
-from itertools import product
-
 import pytest
 import torch
 from test_sageattn import _error_report, _expected, _make_qkv
@@ -32,9 +30,7 @@ _SM89_CONFIGS = (
 def test_fp8_configured(config, pv_accum_dtype, head_dim, tensor_layout, is_causal, dtype):
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
-    actual = _sageattn_configured(
-        q, k, v, tensor_layout, is_causal, pv_accum_dtype, True, False, False, config
-    )
+    actual = _sageattn_configured(q, k, v, tensor_layout, is_causal, pv_accum_dtype, True, False, False, config)
     passed, msg = _error_report(actual, expected)
     assert passed, msg
 
@@ -51,7 +47,6 @@ def test_fp8_gqa(hq, hkv, tensor_layout):
     k = torch.randn(shape_kv, device="cuda", dtype=torch.float16)
     v = torch.randn(shape_kv, device="cuda", dtype=torch.float16)
 
-    hd_dim = 2 if tensor_layout == "HND" else 2  # head dim index after transpose
     qT = q if tensor_layout == "HND" else q.transpose(1, 2)
     kT = (k if tensor_layout == "HND" else k.transpose(1, 2)).repeat_interleave(hq // hkv, 1)
     vT = (v if tensor_layout == "HND" else v.transpose(1, 2)).repeat_interleave(hq // hkv, 1)

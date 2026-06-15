@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Literal, Optional, Union, overload
+from typing import Literal, Union, overload
 
 import torch
 
@@ -34,7 +34,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: Optional[str] = None,
+    pv_accum_dtype: str | None = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: Literal[False] = False,
@@ -49,7 +49,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: Optional[str] = None,
+    pv_accum_dtype: str | None = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: Literal[True] = True,
@@ -63,7 +63,7 @@ def sageattn_qk_int8_pv_fp16_cuda(
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
-    pv_accum_dtype: Optional[str] = None,
+    pv_accum_dtype: str | None = None,
     smooth_k: bool = True,
     smooth_v: bool = False,
     return_lse: bool = False,
@@ -208,6 +208,7 @@ def _sageattn_configured(
     output = torch.empty(q.size(), dtype=dtype, device=q.device)
 
     if use_fp8_backend(q.device):
+        assert _qattn_sm89 is not None
         # Ada (sm_89) / Blackwell (sm_120): int8-QK / fp8-PV (SageAttention2++ sv_f8).
         if smooth_v:
             warnings.warn(
@@ -218,14 +219,40 @@ def _sageattn_configured(
         if pv_accum_dtype == "fp32":
             # accurate per-block f32 accumulation
             lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn(
-                q_int8, k_int8, v_fp8, output, q_scale, k_scale, v_scale,
-                layout_i, is_causal, sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse,
+                q_int8,
+                k_int8,
+                v_fp8,
+                output,
+                q_scale,
+                k_scale,
+                v_scale,
+                layout_i,
+                is_causal,
+                sm_scale,
+                blk_q,
+                blk_k,
+                warp_q,
+                warp_k,
+                return_lse,
             )
         else:
             # "fp16" / "fp16+fp32" -> SageAttention2++ fp16-accumulation fast path
             lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
-                q_int8, k_int8, v_fp8, output, q_scale, k_scale, v_scale,
-                layout_i, is_causal, sm_scale, blk_q, blk_k, warp_q, warp_k, return_lse,
+                q_int8,
+                k_int8,
+                v_fp8,
+                output,
+                q_scale,
+                k_scale,
+                v_scale,
+                layout_i,
+                is_causal,
+                sm_scale,
+                blk_q,
+                blk_k,
+                warp_q,
+                warp_k,
+                return_lse,
             )
     elif pv_accum_dtype == "fp32":
         lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(

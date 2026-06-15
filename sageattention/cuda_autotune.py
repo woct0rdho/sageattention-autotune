@@ -70,7 +70,9 @@ def _valid_configs_for_head_dim(
     device: torch.device,
 ) -> tuple[tuple[int, int, int, int], ...]:
     if use_fp8_backend(device):
-        return autotune_utils._valid_configs_for_head_dim(_SM89_AUTOTUNE_CONFIGS, _config_is_valid_fp8, head_dim, is_causal, device)
+        return autotune_utils._valid_configs_for_head_dim(
+            _SM89_AUTOTUNE_CONFIGS, _config_is_valid_fp8, head_dim, is_causal, device
+        )
     return autotune_utils._valid_configs_for_head_dim(_AUTOTUNE_CONFIGS, _config_is_valid, head_dim, is_causal, device)
 
 
