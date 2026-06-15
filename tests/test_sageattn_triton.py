@@ -1,5 +1,4 @@
 from itertools import product
-from typing import Optional
 
 import torch
 from test_sageattn import _error_report, _expected, _make_qkv
@@ -42,7 +41,7 @@ def _representative_config(
     head_dim: int,
     is_causal: bool,
     device: torch.device,
-) -> Optional[tuple[int, int, int, int]]:
+) -> tuple[int, int, int, int] | None:
     for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
         if config[:2] == block_config:
             return config
@@ -109,7 +108,7 @@ def main() -> None:
                 )
             except Exception as e:
                 passed = False
-                msg = f"error={e!r}"
+                msg = f"error={e}"
 
             if not passed:
                 config_passed = False

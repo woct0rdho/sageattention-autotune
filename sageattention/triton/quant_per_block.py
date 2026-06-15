@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional
-
 import torch
 import triton
 import triton.language as tl
@@ -80,7 +78,7 @@ def quant_per_block_int8_kernel(
 def per_block_int8(
     q: torch.Tensor,
     k: torch.Tensor,
-    km: Optional[torch.Tensor] = None,
+    km: torch.Tensor | None = None,
     BLKQ: int = 128,
     BLKK: int = 64,
     tensor_layout: str = "HND",

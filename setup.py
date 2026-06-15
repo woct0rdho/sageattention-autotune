@@ -81,7 +81,7 @@ if os.name == "nt":
 else:
     cxx_flags = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
 
-cxx_flags += ["-DPy_LIMITED_API=0x03090000", "-DTORCH_STABLE_ONLY"]
+cxx_flags += ["-DPy_LIMITED_API=0x030A0000", "-DTORCH_STABLE_ONLY"]
 
 nvcc_flags = [
     "-O3",
@@ -92,7 +92,7 @@ nvcc_flags = [
     "-diag-suppress=174",
     "-diag-suppress=177",
     "-diag-suppress=221",
-    "-DPy_LIMITED_API=0x03090000",
+    "-DPy_LIMITED_API=0x030A0000",
     "-DTORCH_STABLE_ONLY",
     "-gencode",
     "arch=compute_80,code=sm_80",
@@ -140,8 +140,8 @@ setup(
     author="SageAttention team",
     license="Apache 2.0 License",
     packages=find_packages(),
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

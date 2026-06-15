@@ -125,7 +125,7 @@ def main() -> None:
                 )
             except Exception as e:
                 passed = False
-                msg = f"error={e!r}"
+                msg = f"error={e}"
 
             if not passed:
                 config_passed = False
