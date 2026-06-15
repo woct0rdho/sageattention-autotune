@@ -19,6 +19,7 @@
 #include "../cp_async.cuh"
 #include "../math.cuh"
 #include "../mma.cuh"
+#include "../numeric_conversion.cuh"
 #include "../permuted_smem.cuh"
 
 #include <cuda_fp16.h>
@@ -568,6 +569,240 @@ __device__ __forceinline__ void normalize_d(DTypeSVAccum RO[][num_tiles_v][8], D
         {
           RO[fq][fv][k] = __float2half_rn(__half2float(RO[fq][fv][k]) * d_rcp[fq][(k % 4) / 2]);
         }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 (sv_f8) device helpers, ported from upstream SageAttention sm89 kernels.
+// V is stored transposed as e4m3 fp8 (held in int8 smem). These mirror the
+// fp16 helpers above but consume the fp8 tensor-core path. Only the variants
+// used by the sm89 extension (f32 accum, and the f16-accum inst-buffer 2++
+// path) are ported here.
+// ---------------------------------------------------------------------------
+
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
+          uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA>
+__device__ __forceinline__ void load_fp8_V_global_to_share(const int8_t **lane_ptr, uint32_t &smem_offset,
+                                                           const uint32_t &gmem_stride,
+                                                           const smem_t<swizzle_mode, stride> &smem)
+{
+  static_assert(global_to_shared_copy_lines_per_warp_per_iter * global_to_shared_line_lanes == WARP_SIZE);
+  constexpr uint32_t pack_size_fp8 = 16;
+
+#pragma unroll
+  for (uint32_t i = 0; i < smem_iters_col; i++)
+  {
+#pragma unroll
+    for (uint32_t j = 0; j < smem_iters_row; j++)
+    {
+      smem.load_128b_async(smem_offset, *lane_ptr);
+      *lane_ptr += (global_to_shared_line_lanes * pack_size_fp8);
+      smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
+    }
+
+    smem_offset = smem.advance_offset_by_row<global_to_shared_copy_lines_per_warp_per_iter>(smem_offset - (smem_iters_row * global_to_shared_line_lanes));
+    *lane_ptr += ((global_to_shared_copy_lines_per_warp_per_iter * gmem_stride) - (smem_iters_row * global_to_shared_line_lanes * pack_size_fp8));
+  }
+  smem_offset -= (smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter * stride);
+  // V is transposed (column = head_dim), so advance differently from QK to avoid underflow
+  *lane_ptr += CTA;
+  *lane_ptr -= (smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k>
+__device__ __forceinline__ void RS_32_to_8(float RS[][num_tiles_k][8], uint32_t RS_8[][num_tiles_k / 2][4])
+{
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++)
+    {
+      floatx4_to_e4m3x4(RS_8[fq][fk], RS[fq][fk * 2 + 0], RS[fq][fk * 2 + 0] + 4);
+      floatx4_to_e4m3x4(RS_8[fq][fk] + 1, RS[fq][fk * 2 + 0] + 2, RS[fq][fk * 2 + 0] + 6);
+      floatx4_to_e4m3x4(RS_8[fq][fk] + 2, RS[fq][fk * 2 + 1], RS[fq][fk * 2 + 1] + 4);
+      floatx4_to_e4m3x4(RS_8[fq][fk] + 3, RS[fq][fk * 2 + 1] + 2, RS[fq][fk * 2 + 1] + 6);
+    }
+  }
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k>
+__device__ __forceinline__ void accumulate_d_f8(uint32_t RS[][num_tiles_k / 2][4], float d[][2])
+{
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++)
+    {
+      mma::rowsum_f8f8f32(d[fq], RS[fq][fk]);
+    }
+  }
+}
+
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
+          SwizzleMode swizzle_mode, uint32_t stride, typename DTypeSVAccum>
+__device__ __forceinline__ void compute_fp8_sv(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f8[][num_tiles_k / 2][4], DTypeSVAccum RO[][num_tiles_v][8], float d[][2])
+{
+  uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+  uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+#pragma unroll
+  for (uint32_t fk = 0; fk < num_tiles_k / 2; fk++)
+  {
+    uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      uint32_t RV[4];
+      smem_V.ldmatrix_m8n8x4(offset_V, RV);
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
+        {
+          mma::mma_sync_m16n16k32_row_col_f8f8f32(RO[fq][fv], RS_f8[fq][fk], RV);
+        }
+      }
+      offset_V = smem_V.advance_offset_by_row<16>(offset_V);
+    }
+  }
+}
+
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
+          SwizzleMode swizzle_mode, uint32_t stride, typename DTypeSVAccum>
+__device__ __forceinline__ void compute_fp8_sv_inst_buf(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f8[][num_tiles_k / 2][4], DTypeSVAccum RO[][num_tiles_v][8], float d[][2])
+{
+  uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+  uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+
+  float RO_inst_buf[num_tiles_q][num_tiles_v][8];
+
+#pragma unroll
+  for (uint32_t fk = 0; fk < 1; fk++)
+  {
+    uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      uint32_t RV[4];
+      smem_V.ldmatrix_m8n8x4(offset_V, RV);
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
+        {
+          mma::mma_sync_m16n16k32_row_col_f8f8f32<mma::MMAMode::kInit>(RO_inst_buf[fq][fv], RS_f8[fq][fk], RV);
+        }
+      }
+      offset_V = smem_V.advance_offset_by_row<16>(offset_V);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t fk = 1; fk < num_tiles_k / 2; fk++)
+  {
+    uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      uint32_t RV[4];
+      smem_V.ldmatrix_m8n8x4(offset_V, RV);
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
+        {
+          mma::mma_sync_m16n16k32_row_col_f8f8f32<mma::MMAMode::kInplaceUpdate>(RO_inst_buf[fq][fv], RS_f8[fq][fk], RV);
+        }
+      }
+      offset_V = smem_V.advance_offset_by_row<16>(offset_V);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+  {
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 8; k++)
+      {
+        RO[fq][fv][k] += RO_inst_buf[fq][fv][k];
+      }
+    }
+  }
+}
+
+template <uint32_t num_warps_q, uint32_t num_warps_k,
+          uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
+          SwizzleMode swizzle_mode, uint32_t stride, typename DTypeSVAccum>
+__device__ __forceinline__ void compute_fp8_sv_inst_buf_fp16_accu(const smem_t<swizzle_mode, stride> &smem_V, uint32_t RS_f8[][num_tiles_k / 2][4], DTypeSVAccum RO[][num_tiles_v][8], float d[][2])
+{
+  uint32_t smem_V_row_base = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+  uint32_t smem_V_col_base = (get_lane_id() / 8) % 2;
+
+  uint32_t RO_int32[num_tiles_q][num_tiles_v][4];
+
+#pragma unroll
+  for (uint32_t fk = 0; fk < 1; fk++)
+  {
+    uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      uint32_t RV[4];
+      smem_V.ldmatrix_m8n8x4(offset_V, RV);
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
+        {
+          mma::mma_sync_m16n16k32_row_col_f8f8f16<mma::MMAMode::kInit>(RO_int32[fq][fv], RS_f8[fq][fk], RV);
+        }
+      }
+      offset_V = smem_V.advance_offset_by_row<16>(offset_V);
+    }
+  }
+
+#pragma unroll
+  for (uint32_t fk = 1; fk < num_tiles_k / 2; fk++)
+  {
+    uint32_t offset_V = smem_V.get_permuted_offset(smem_V_row_base, smem_V_col_base + fk * 2);
+#pragma unroll
+    for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+    {
+      uint32_t RV[4];
+      smem_V.ldmatrix_m8n8x4(offset_V, RV);
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++)
+      {
+        if constexpr (std::is_same<DTypeSVAccum, float>::value)
+        {
+          mma::mma_sync_m16n16k32_row_col_f8f8f16<mma::MMAMode::kInplaceUpdate>(RO_int32[fq][fv], RS_f8[fq][fk], RV);
+        }
+      }
+      offset_V = smem_V.advance_offset_by_row<16>(offset_V);
+    }
+  }
+
+  float RO_tmp_float[2];
+#pragma unroll
+  for (uint32_t i = 0; i < num_tiles_q; i++)
+  {
+#pragma unroll
+    for (uint32_t j = 0; j < num_tiles_v; j++)
+    {
+#pragma unroll
+      for (uint32_t k = 0; k < 4; k++)
+      {
+        unpack_half2_from_uint32_to_float(RO_tmp_float, RO_int32[i][j][k]);
+        RO[i][j][k * 2 + 0] += RO_tmp_float[0];
+        RO[i][j][k * 2 + 1] += RO_tmp_float[1];
       }
     }
   }

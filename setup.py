@@ -94,8 +94,6 @@ nvcc_flags = [
     "-diag-suppress=221",
     "-DPy_LIMITED_API=0x030A0000",
     "-DTORCH_STABLE_ONLY",
-    "-gencode",
-    "arch=compute_80,code=sm_80",
 ]
 
 if os.name == "nt":
@@ -113,9 +111,100 @@ nvcc_append = os.getenv("NVCC_APPEND_FLAGS", "").strip()
 if nvcc_append:
     nvcc_flags += nvcc_append.split()
 
+
+def _gencode(arch: int) -> list[str]:
+    return ["-gencode", f"arch=compute_{arch},code=sm_{arch}"]
+
+
+def _cuda_toolkit_version() -> tuple[int, int]:
+    """(major, minor) of the nvcc/toolkit used to build, falling back to torch's."""
+    raw = getattr(cpp_extension, "_get_cuda_arch_flags", None)  # noqa: F841 (touch to ensure import)
+    version = None
+    if CUDA_HOME is not None:
+        nvcc = os.path.join(CUDA_HOME, "bin", "nvcc.exe" if os.name == "nt" else "nvcc")
+        try:
+            out = subprocess.check_output([nvcc, "--version"], text=True)
+            for token in out.replace(",", " ").split():
+                if token.startswith("V") and token[1:2].isdigit():
+                    parts = token[1:].split(".")
+                    version = (int(parts[0]), int(parts[1]))
+                    break
+        except Exception:
+            version = None
+    if version is None and torch.version.cuda:
+        major, minor = torch.version.cuda.split(".")[:2]
+        version = (int(major), int(minor))
+    return version or (0, 0)
+
+
+def _resolve_sm89_arches() -> list[int]:
+    """Arches for the fp8 sm89 extension: env override or auto-detect.
+
+    SAGEATTN_CUDA_ARCH may be e.g. "89", "120", or "89;120" (also accepts
+    commas / "8.9"). Otherwise we detect the installed GPU's capability.
+    Only sm_89 and sm_120 are supported by the fp8 kernels.
+    """
+    supported = {89, 120}
+    override = os.getenv("SAGEATTN_CUDA_ARCH", "").strip()
+    if override:
+        arches = []
+        for tok in override.replace(",", ";").split(";"):
+            tok = tok.strip().replace(".", "")
+            if tok:
+                arches.append(int(tok))
+    else:
+        arches = []
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                major, minor = torch.cuda.get_device_capability(i)
+                arches.append(major * 10 + minor)
+        arches = arches or [89]
+    arches = sorted({a for a in arches if a in supported})
+    if not arches:
+        raise RuntimeError(
+            "No supported fp8 arch resolved for _qattn_sm89 (need sm_89 or sm_120). "
+            "Set SAGEATTN_CUDA_ARCH=89 and/or 120."
+        )
+    # Guard against toolkits too old for the requested arch.
+    cu_major, cu_minor = _cuda_toolkit_version()
+    cu = cu_major * 100 + cu_minor
+    if 89 in arches and cu < 1204:
+        raise RuntimeError(f"sm_89 fp8 kernels need CUDA >= 12.4 (found {cu_major}.{cu_minor}).")
+    if 120 in arches and cu < 1208:
+        raise RuntimeError(f"sm_120 fp8 kernels need CUDA >= 12.8 (found {cu_major}.{cu_minor}).")
+    return arches
+
+
+def _cccl_include_flags() -> list[str]:
+    """conda/micromamba CUDA layouts put <cuda/pipeline> under a cccl subdir."""
+    if CUDA_HOME is None:
+        return []
+    candidates = [
+        os.path.join(CUDA_HOME, "include", "cccl"),
+        os.path.join(CUDA_HOME, "include", "targets", "x64", "cccl"),
+    ]
+    flags = []
+    for path in candidates:
+        if os.path.isdir(path):
+            flags += ["-I", path]
+    return flags
+
+
 if build_triton_only:
     ext_modules = []
 else:
+    sm89_arches = _resolve_sm89_arches()
+    # Build the fp16 (sm80) extension for sm_80 plus the detected arch(es) so the
+    # fp16 fallback also runs on Ada/Blackwell (sm_80 SASS is not forward
+    # compatible across compute-capability majors).
+    sm80_nvcc_flags = list(nvcc_flags) + _gencode(80)
+    for arch in sm89_arches:
+        if arch != 80:
+            sm80_nvcc_flags += _gencode(arch)
+    sm89_nvcc_flags = nvcc_flags + _cccl_include_flags()
+    for arch in sm89_arches:
+        sm89_nvcc_flags += _gencode(arch)
+
     ext_modules = [
         CUDAExtension(
             name="sageattention._qattn_sm80",
@@ -126,7 +215,17 @@ else:
                 "csrc/qattn/qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.cu",
                 "csrc/qattn/qk_int8_sv_f16_accum_f32_attn.cu",
             ],
-            extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+            extra_compile_args={"cxx": cxx_flags, "nvcc": sm80_nvcc_flags},
+            py_limited_api=True,
+        ),
+        CUDAExtension(
+            name="sageattention._qattn_sm89",
+            sources=[
+                "csrc/qattn/pybind_sm89.cpp",
+                "csrc/qattn/qk_int8_sv_f8_accum_f32_fuse_v_scale_attn.cu",
+                "csrc/qattn/qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf.cu",
+            ],
+            extra_compile_args={"cxx": cxx_flags, "nvcc": sm89_nvcc_flags},
             py_limited_api=True,
         ),
     ]

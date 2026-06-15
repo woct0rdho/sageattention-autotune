@@ -136,10 +136,10 @@ def _sageattn_triton_configured(
         raise ValueError("All tensors must have the same dtype.")
     if k.shape != v.shape:
         raise ValueError("k and v must have the same shape.")
+    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+        raise ValueError("q, k, and v must be contiguous.")
 
     head_dim, q, k, v = _pad_qkv(q, k, v)
-    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
-        raise ValueError("Last dimension of q, k, and v must be contiguous.")
 
     sm_scale = head_dim**-0.5
 
