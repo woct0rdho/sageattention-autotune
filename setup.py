@@ -77,9 +77,9 @@ if not build_triton_only:
     _enable_ccache()
 
 if os.name == "nt":
-    cxx_flags = ["/O2", "/openmp", "/std:c++17", "/permissive-", "-DENABLE_BF16"]
+    cxx_flags = ["/O2", "/permissive-", "-DENABLE_BF16"]
 else:
-    cxx_flags = ["-g", "-O3", "-fopenmp", "-lgomp", "-std=c++17", "-DENABLE_BF16"]
+    cxx_flags = ["-O3", "-DENABLE_BF16"]
 
 cxx_flags += ["-DPy_LIMITED_API=0x030A0000", "-DTORCH_STABLE_ONLY"]
 
