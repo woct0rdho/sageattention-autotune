@@ -21,3 +21,7 @@ The APIs `sageattn_qk_int8_pv_fp16_cuda` and `sageattn_qk_int8_pv_fp16_triton` a
 The official SageAttention's Triton kernel behave like `pv_accum_dtype="fp16"`. I've added `pv_accum_dtype="fp32"` to the Triton kernel. `pv_accum_dtype="fp16+fp32"` is still not supported in the Triton kernel.
 
 You can set the default `pv_accum_dtype` using the env var like `SAGEATTN_DEFAULT_PV_ACCUM_DTYPE=fp16`. As always, `pv_accum_dtype="fp16+fp32"` is faster than `pv_accum_dtype="fp32"`, and `pv_accum_dtype="fp16"` is even faster, but more likely to cause black/noise/degraded output. Maybe the time has come that we have to tune it for each model.
+
+## Development
+
+After each change, run `pre-commit` and `pytest tests/`.

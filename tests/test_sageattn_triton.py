@@ -6,6 +6,17 @@ from test_sageattn import _error_report, _expected, _make_qkv
 from sageattention.triton_attn import _sageattn_triton_configured
 from sageattention.triton_autotune import _valid_triton_configs_for_head_dim
 
+_MODES = tuple(
+    product(
+        (64, 128, 256),
+        (torch.float16, torch.bfloat16),
+        ("HND", "NHD"),
+        (False, True),
+        ("fp32", "fp16"),
+        (False, True),
+    )
+)
+
 
 def _run_case(
     config: tuple[int, int, int, int],
@@ -49,7 +60,7 @@ def _representative_config(
 
 
 def _valid_block_configs(
-    modes: list[tuple[int, torch.dtype, str, bool, str, bool]], device: torch.device
+    modes: tuple[tuple[int, torch.dtype, str, bool, str, bool], ...], device: torch.device
 ) -> tuple[tuple[int, int], ...]:
     block_configs = []
     for head_dim, _, _, is_causal, _, _ in modes:
@@ -60,33 +71,15 @@ def _valid_block_configs(
     return tuple(block_configs)
 
 
-def main() -> None:
-    print("Testing SageAttention Triton block configs")
-    print("Config format: (BLOCK_M, BLOCK_N)")
-    print("=" * 80)
-
-    modes = list(
-        product(
-            (64, 128, 256),
-            (torch.float16, torch.bfloat16),
-            ("HND", "NHD"),
-            (False, True),
-            ("fp32", "fp16"),
-            (False, True),
-        )
-    )
-
+def test_sageattn_triton_block_configs() -> None:
     failed_configs = []
-    passed_configs = []
     device = torch.device("cuda")
-    block_configs = _valid_block_configs(modes, device)
 
-    for block_config in block_configs:
-        config_passed = True
+    for block_config in _valid_block_configs(_MODES, device):
         config_errors = []
         config_tested = 0
 
-        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in modes:
+        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in _MODES:
             config = _representative_config(block_config, head_dim=head_dim, is_causal=is_causal, device=device)
             if config is None:
                 continue
@@ -111,28 +104,10 @@ def main() -> None:
                 msg = f"error={e}"
 
             if not passed:
-                config_passed = False
                 config_errors.append(f"  {name}: {msg}")
 
-        status = "PASS" if config_passed and config_tested > 0 else "FAIL"
-        print(f"[{status}] {block_config} tested_cases={config_tested}")
-        if config_passed and config_tested > 0:
-            passed_configs.append(block_config)
-        else:
-            failed_configs.append(block_config)
-            for error in config_errors:
-                print(error)
+        if config_tested == 0 or config_errors:
+            errors = "\n".join(config_errors)
+            failed_configs.append(f"{block_config} tested_cases={config_tested}\n{errors}")
 
-    print("=" * 80)
-    print(f"Summary: {len(passed_configs)}/{len(block_configs)} block configs passed")
-
-    if failed_configs:
-        print(f"\nFailed block configs ({len(failed_configs)}):")
-        for config in failed_configs:
-            print(f"  {config}")
-
-    assert not failed_configs
-
-
-if __name__ == "__main__":
-    main()
+    assert not failed_configs, "\n".join(failed_configs)

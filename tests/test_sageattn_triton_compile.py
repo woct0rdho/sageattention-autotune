@@ -1,14 +1,8 @@
 import torch
-from test_sageattn import _error_report, _expected, _make_qkv
+from test_sageattn import _expected, _make_qkv
+from test_sageattn_compile import _check
 
 from sageattention import sageattn_qk_int8_pv_fp16_triton
-
-
-def _check(actual: torch.Tensor, expected: torch.Tensor, label: str) -> None:
-    passed, msg = _error_report(actual, expected)
-    msg = f"{label}: {msg}"
-    assert passed, msg
-    print(msg)
 
 
 def test_eager_autotuned() -> None:
@@ -28,13 +22,3 @@ def test_compile_autotuned() -> None:
 
     actual = fn(q, k, v)
     _check(actual, expected, "compile Triton autotuned")
-
-
-def main() -> None:
-    test_eager_autotuned()
-    test_compile_autotuned()
-    print("All Triton compile tests passed")
-
-
-if __name__ == "__main__":
-    main()
