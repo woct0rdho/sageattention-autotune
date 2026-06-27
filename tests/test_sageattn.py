@@ -1,11 +1,22 @@
 from itertools import product
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sageattention.cuda_attn import _sageattn_configured
 from sageattention.cuda_autotune import _AUTOTUNE_CONFIGS, _valid_configs
+
+_MODES = tuple(
+    product(
+        (64, 128, 256),
+        (torch.float16, torch.bfloat16),
+        ("HND", "NHD"),
+        (False, True),
+        ("fp32", "fp16", "fp16+fp32"),
+        (False, True),
+    )
+)
 
 
 def _make_qkv(
@@ -60,10 +71,11 @@ def _run_case(
     pv_accum_dtype: str,
     smooth_k: bool,
 ) -> tuple[bool, str]:
+    cuda_attn = pytest.importorskip("sageattention.cuda_attn", reason="sageattention CUDA kernel is not installed")
     q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
     expected = _expected(q, k, v, tensor_layout, is_causal)
 
-    actual = _sageattn_configured(
+    actual = cuda_attn._sageattn_configured(
         q,
         k,
         v,
@@ -79,77 +91,37 @@ def _run_case(
     return _error_report(actual, expected)
 
 
-def main() -> None:
-    print(f"Testing SageAttention autotune configs ({len(_AUTOTUNE_CONFIGS)} compiled configs)\n")
-    print("Config format: (blk_q, blk_k, warp_q, warp_k)")
-    print("=" * 80)
+@pytest.mark.parametrize("config", _AUTOTUNE_CONFIGS, ids=str)
+def test_sageattn_cuda_autotune_config(config: tuple[int, int, int, int]) -> None:
+    config_errors = []
+    config_tested = 0
 
-    failed_configs = []
-    passed_configs = []
+    for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in _MODES:
+        q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
+        if config not in _valid_configs(q, is_causal):
+            continue
 
-    modes = list(
-        product(
-            (64, 128, 256),
-            (torch.float16, torch.bfloat16),
-            ("HND", "NHD"),
-            (False, True),
-            ("fp32", "fp16", "fp16+fp32"),
-            (False, True),
+        config_tested += 1
+        name = (
+            f"head_dim={head_dim} dtype={dtype} layout={tensor_layout} is_causal={is_causal} "
+            f"pv_accum_dtype={pv_accum_dtype} smooth_k={smooth_k}"
         )
-    )
-
-    for config in _AUTOTUNE_CONFIGS:
-        config_passed = True
-        config_errors = []
-        config_tested = 0
-
-        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in modes:
-            q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
-            if config not in _valid_configs(q, is_causal):
-                continue
-
-            config_tested += 1
-            name = (
-                f"head_dim={head_dim} dtype={dtype} layout={tensor_layout} is_causal={is_causal} "
-                f"pv_accum_dtype={pv_accum_dtype} smooth_k={smooth_k}"
+        try:
+            passed, msg = _run_case(
+                config,
+                head_dim=head_dim,
+                dtype=dtype,
+                tensor_layout=tensor_layout,
+                is_causal=is_causal,
+                pv_accum_dtype=pv_accum_dtype,
+                smooth_k=smooth_k,
             )
-            try:
-                passed, msg = _run_case(
-                    config,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    tensor_layout=tensor_layout,
-                    is_causal=is_causal,
-                    pv_accum_dtype=pv_accum_dtype,
-                    smooth_k=smooth_k,
-                )
-            except Exception as e:
-                passed = False
-                msg = f"error={e}"
+        except Exception as e:
+            passed = False
+            msg = f"error={e}"
 
-            if not passed:
-                config_passed = False
-                config_errors.append(f"  {name}: {msg}")
+        if not passed:
+            config_errors.append(f"{name}: {msg}")
 
-        status = "PASS" if config_passed and config_tested > 0 else "FAIL"
-        print(f"[{status}] {config} tested_cases={config_tested}")
-        if config_passed and config_tested > 0:
-            passed_configs.append(config)
-        else:
-            failed_configs.append(config)
-            for error in config_errors:
-                print(error)
-
-    print("=" * 80)
-    print(f"Summary: {len(passed_configs)}/{len(_AUTOTUNE_CONFIGS)} configs passed")
-
-    if failed_configs:
-        print(f"\nFailed configs ({len(failed_configs)}):")
-        for config in failed_configs:
-            print(f"  {config}")
-
-    assert not failed_configs
-
-
-if __name__ == "__main__":
-    main()
+    assert config_tested > 0
+    assert not config_errors, "\n".join(config_errors)
