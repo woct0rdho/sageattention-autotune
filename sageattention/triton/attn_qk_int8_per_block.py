@@ -18,6 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
+from ..autotune_utils import _autotune_seq_len_bucket
+from .autotune_utils import _TRITON_ATTN_CONFIGS, _prune_attn_configs
+
 LOG2_E = 1.44269504088896340736
 
 
@@ -95,6 +98,24 @@ def _attn_fwd_inner(
     return acc, l_i, m_i
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps, num_stages in _TRITON_ATTN_CONFIGS
+    ],
+    key=[
+        "H",
+        "num_kv_groups",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "RETURN_LSE",
+        "IS_CAUSAL",
+        "PV_ACCUM_FP32",
+        "Q_BUCKET",
+        "K_BUCKET",
+    ],
+    prune_configs_by={"early_config_prune": _prune_attn_configs},
+)
 @triton.jit
 def _attn_fwd(
     Q,
@@ -127,6 +148,8 @@ def _attn_fwd(
     RETURN_LSE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     PV_ACCUM_FP32: tl.constexpr,
+    Q_BUCKET: tl.constexpr,
+    K_BUCKET: tl.constexpr,
 ):
     start_m = tl.program_id(0)
 
@@ -249,8 +272,6 @@ def forward(
     pv_accum_dtype: str = "fp32",
     BLOCK_M: int = 128,
     BLOCK_N: int = 64,
-    attn_num_warps: int = 4,
-    attn_num_stages: int = 3,
     output_dtype: torch.dtype = torch.float16,
     return_lse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -322,8 +343,8 @@ def forward(
         RETURN_LSE=return_lse,
         IS_CAUSAL=is_causal,
         PV_ACCUM_FP32=(pv_accum_dtype == "fp32"),
-        num_warps=attn_num_warps,
-        num_stages=attn_num_stages,
+        Q_BUCKET=_autotune_seq_len_bucket(qo_len),
+        K_BUCKET=_autotune_seq_len_bucket(kv_len),
     )
 
     return o, lse

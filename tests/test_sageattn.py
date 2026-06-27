@@ -98,7 +98,7 @@ def test_sageattn_cuda_autotune_config(config: tuple[int, int, int, int]) -> Non
 
     for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in _MODES:
         q, _, _ = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
-        if config not in _valid_configs(q, is_causal):
+        if config not in _valid_configs(q.size(-1), is_causal, q.device.index):
             continue
 
         config_tested += 1

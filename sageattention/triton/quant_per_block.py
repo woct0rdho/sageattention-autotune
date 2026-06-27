@@ -22,7 +22,10 @@ from ..autotune_utils import _autotune_seq_len_bucket
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=4), triton.Config({}, num_warps=8)],
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
     key=["L_BUCKET", "C", "BLK", "HAS_MEAN"],
 )
 @triton.jit

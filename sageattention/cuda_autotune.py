@@ -1,3 +1,5 @@
+import functools
+
 import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
@@ -13,11 +15,12 @@ _AUTOTUNE_CONFIGS = (
 _AUTOTUNE_CACHE: dict[object, tuple[int, int, int, int]] = {}
 
 
+@functools.cache
 def _config_is_valid(
     config: tuple[int, int, int, int],
     head_dim: int,
     is_causal: bool,
-    device: torch.device,
+    device_index: int,
 ) -> bool:
     blk_q, blk_k, _, _ = config
     if is_causal and blk_q // blk_k > 2:
@@ -26,22 +29,16 @@ def _config_is_valid(
     head_dim = _padded_head_dim(head_dim)
     # See smem_max in launch_sm80_qk_kernel
     smem_bytes = head_dim * max(blk_q + 3 * blk_k, 2 * blk_q)
-    return smem_bytes <= autotune_utils._shared_memory_limit(device)
+    return smem_bytes <= autotune_utils._shared_memory_limit(device_index)
 
 
+@functools.cache
 def _valid_configs(
-    q: torch.Tensor,
-    is_causal: bool,
-) -> tuple[tuple[int, int, int, int], ...]:
-    return _valid_configs_for_head_dim(q.size(-1), is_causal, q.device)
-
-
-def _valid_configs_for_head_dim(
     head_dim: int,
     is_causal: bool,
-    device: torch.device,
+    device_index: int,
 ) -> tuple[tuple[int, int, int, int], ...]:
-    return autotune_utils._valid_configs_for_head_dim(_AUTOTUNE_CONFIGS, _config_is_valid, head_dim, is_causal, device)
+    return autotune_utils._valid_configs(_AUTOTUNE_CONFIGS, _config_is_valid, head_dim, is_causal, device_index)
 
 
 def _eager_autotune_select(
@@ -57,7 +54,7 @@ def _eager_autotune_select(
 ) -> tuple[int, int, int, int]:
     from .cuda_attn import _sageattn_configured
 
-    configs = _valid_configs(q, is_causal)
+    configs = _valid_configs(q.size(-1), is_causal, q.device.index)
     key = autotune_utils._tensor_autotune_cache_key(
         q, k, v, tensor_layout, is_causal, pv_accum_dtype, smooth_k, smooth_v, return_lse
     )
@@ -98,8 +95,9 @@ def _sageattn_autotuned(
     from .cuda_attn import _sageattn_configured
 
     qk_config = (blk_q, blk_k, warp_q, warp_k)
-    if min(qk_config) <= 0 or qk_config not in _valid_configs(q, is_causal):
-        qk_config = _valid_configs(q, is_causal)[0]
+    configs = _valid_configs(q.size(-1), is_causal, q.device.index)
+    if min(qk_config) <= 0 or qk_config not in configs:
+        qk_config = configs[0]
 
     return _sageattn_configured(
         q,
@@ -142,10 +140,10 @@ register_custom_op_autotuning(
             warp_q=cfg[2],
             warp_k=cfg[3],
         )
-        for cfg in _valid_configs_for_head_dim(
+        for cfg in _valid_configs(
             fake_tensors["q"].size(-1),
             False,  # For now we hardcode is_causal=False and we assume it allows more configs than is_causal=True
-            fake_tensors["q"].device,
+            fake_tensors["q"].device.index,
         )
     ],
 )
