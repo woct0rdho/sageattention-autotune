@@ -1,10 +1,11 @@
 from itertools import product
 
+import pytest
 import torch
 from test_sageattn import _error_report, _expected, _make_qkv
 
 from sageattention.triton_attn import _sageattn_triton_configured
-from sageattention.triton_autotune import _valid_triton_configs_for_head_dim
+from sageattention.triton_autotune import _valid_triton_block_configs
 
 _MODES = tuple(
     product(
@@ -18,8 +19,18 @@ _MODES = tuple(
 )
 
 
+def _valid_block_configs() -> tuple[tuple[int, int], ...]:
+    device_index = torch.cuda.current_device()
+    block_configs = []
+    for head_dim, _, _, is_causal, _, _ in _MODES:
+        for block_config in _valid_triton_block_configs(head_dim, is_causal, device_index):
+            if block_config not in block_configs:
+                block_configs.append(block_config)
+    return tuple(block_configs)
+
+
 def _run_case(
-    config: tuple[int, int, int, int],
+    block_config: tuple[int, int],
     *,
     head_dim: int,
     dtype: torch.dtype,
@@ -40,74 +51,43 @@ def _run_case(
         pv_accum_dtype,
         smooth_k,
         False,
-        config,
+        block_config,
     )
 
     return _error_report(actual, expected)
 
 
-def _representative_config(
-    block_config: tuple[int, int],
-    *,
-    head_dim: int,
-    is_causal: bool,
-    device: torch.device,
-) -> tuple[int, int, int, int] | None:
-    for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
-        if config[:2] == block_config:
-            return config
-    return None
+@pytest.mark.parametrize("block_config", _valid_block_configs(), ids=str)
+def test_sageattn_triton_block_config(block_config: tuple[int, int]) -> None:
+    config_errors = []
+    config_tested = 0
+    device_index = torch.cuda.current_device()
 
+    for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in _MODES:
+        if block_config not in _valid_triton_block_configs(head_dim, is_causal, device_index):
+            continue
 
-def _valid_block_configs(
-    modes: tuple[tuple[int, torch.dtype, str, bool, str, bool], ...], device: torch.device
-) -> tuple[tuple[int, int], ...]:
-    block_configs = []
-    for head_dim, _, _, is_causal, _, _ in modes:
-        for config in _valid_triton_configs_for_head_dim(head_dim, is_causal, device):
-            block_config = config[:2]
-            if block_config not in block_configs:
-                block_configs.append(block_config)
-    return tuple(block_configs)
-
-
-def test_sageattn_triton_block_configs() -> None:
-    failed_configs = []
-    device = torch.device("cuda")
-
-    for block_config in _valid_block_configs(_MODES, device):
-        config_errors = []
-        config_tested = 0
-
-        for head_dim, dtype, tensor_layout, is_causal, pv_accum_dtype, smooth_k in _MODES:
-            config = _representative_config(block_config, head_dim=head_dim, is_causal=is_causal, device=device)
-            if config is None:
-                continue
-
-            config_tested += 1
-            name = (
-                f"head_dim={head_dim} dtype={dtype} layout={tensor_layout} is_causal={is_causal} "
-                f"pv_accum_dtype={pv_accum_dtype} smooth_k={smooth_k} full_config={config}"
+        config_tested += 1
+        name = (
+            f"head_dim={head_dim} dtype={dtype} layout={tensor_layout} is_causal={is_causal} "
+            f"pv_accum_dtype={pv_accum_dtype} smooth_k={smooth_k}"
+        )
+        try:
+            passed, msg = _run_case(
+                block_config,
+                head_dim=head_dim,
+                dtype=dtype,
+                tensor_layout=tensor_layout,
+                is_causal=is_causal,
+                pv_accum_dtype=pv_accum_dtype,
+                smooth_k=smooth_k,
             )
-            try:
-                passed, msg = _run_case(
-                    config,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    tensor_layout=tensor_layout,
-                    is_causal=is_causal,
-                    pv_accum_dtype=pv_accum_dtype,
-                    smooth_k=smooth_k,
-                )
-            except Exception as e:
-                passed = False
-                msg = f"error={e}"
+        except Exception as e:
+            passed = False
+            msg = f"error={e}"
 
-            if not passed:
-                config_errors.append(f"  {name}: {msg}")
+        if not passed:
+            config_errors.append(f"{name}: {msg}")
 
-        if config_tested == 0 or config_errors:
-            errors = "\n".join(config_errors)
-            failed_configs.append(f"{block_config} tested_cases={config_tested}\n{errors}")
-
-    assert not failed_configs, "\n".join(failed_configs)
+    assert config_tested > 0
+    assert not config_errors, "\n".join(config_errors)
