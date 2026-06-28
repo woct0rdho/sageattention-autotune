@@ -15,7 +15,7 @@ from .quant_per_block import _quantize_tile_to_int8
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS", "IS_EVEN_M"],
 )
 @triton.jit
 def _zero_dq_accum_kernel(
@@ -29,6 +29,7 @@ def _zero_dq_accum_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     DQ_SPLITS: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -38,7 +39,8 @@ def _zero_dq_accum_kernel(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < SEQ_LEN
+    if not IS_EVEN_M:
+        mask_m = offs_m < SEQ_LEN
     ptrs = (
         DQAccum
         + off_s * stride_dqax
@@ -47,7 +49,10 @@ def _zero_dq_accum_kernel(
         + off_h * stride_dqah
         + offs_d[None, :]
     )
-    tl.store(ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32), mask=mask_m[:, None])
+    if IS_EVEN_M:
+        tl.store(ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32))
+    else:
+        tl.store(ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32), mask=mask_m[:, None])
 
 
 @triton.autotune(
@@ -55,7 +60,7 @@ def _zero_dq_accum_kernel(
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS", "IS_EVEN_M"],
 )
 @triton.jit
 def _convert_dq_accum_kernel(
@@ -73,6 +78,7 @@ def _convert_dq_accum_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     DQ_SPLITS: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -80,7 +86,8 @@ def _convert_dq_accum_kernel(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < SEQ_LEN
+    if not IS_EVEN_M:
+        mask_m = offs_m < SEQ_LEN
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     for split in range(0, DQ_SPLITS):
         accum_ptrs = (
@@ -91,10 +98,16 @@ def _convert_dq_accum_kernel(
             + off_h * stride_dqah
             + offs_d[None, :]
         )
-        dq += tl.load(accum_ptrs, mask=mask_m[:, None], other=0.0)
+        if IS_EVEN_M:
+            dq += tl.load(accum_ptrs)
+        else:
+            dq += tl.load(accum_ptrs, mask=mask_m[:, None], other=0.0)
 
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
-    tl.store(dq_ptrs, dq.to(DQ.type.element_ty), mask=mask_m[:, None])
+    if IS_EVEN_M:
+        tl.store(dq_ptrs, dq.to(DQ.type.element_ty))
+    else:
+        tl.store(dq_ptrs, dq.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
 @triton.autotune(
@@ -102,7 +115,17 @@ def _convert_dq_accum_kernel(
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps, num_stages in _TRITON_BWD_REUSE_CONFIGS
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN", "DQ_SPLITS", "N_BLOCKS"],
+    key=[
+        "SEQ_LEN_BUCKET",
+        "HEAD_DIM",
+        "BLOCK_M",
+        "BLOCK_N",
+        "HAS_KMEAN",
+        "DQ_SPLITS",
+        "N_BLOCKS",
+        "IS_EVEN_M",
+        "IS_EVEN_N",
+    ],
     prune_configs_by={"early_config_prune": _prune_bwd_reuse_configs},
     reset_to_zero=["DQAccum", "DK", "DV"],
 )
@@ -162,6 +185,8 @@ def _bwd_reuse_kernel(
     HAS_KMEAN: tl.constexpr,
     DQ_SPLITS: tl.constexpr,
     N_BLOCKS: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
+    IS_EVEN_N: tl.constexpr,
 ):
     start_n = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -170,15 +195,22 @@ def _bwd_reuse_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_n = offs_n < SEQ_LEN
+    if not IS_EVEN_N:
+        mask_n = offs_n < SEQ_LEN
     dq_split = (start_n % DQ_SPLITS).to(tl.int64)
 
     k_s_ptrs = K + off_b * stride_kb + offs_n[None, :] * stride_ks + off_h * stride_kh + offs_d[:, None]
-    k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
+    if IS_EVEN_N:
+        k_s = tl.load(k_s_ptrs).to(tl.int8)
+    else:
+        k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
     k_scale = tl.load(K_scale + off_b * stride_ksb + off_h * stride_ksh + start_n).to(tl.float32)
 
     v_ptrs = V + off_b * stride_vb + offs_n[:, None] * stride_vs + off_h * stride_vh + offs_d[None, :]
-    v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+    if IS_EVEN_N:
+        v = tl.load(v_ptrs)
+    else:
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
 
     acc_dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     acc_dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
@@ -189,19 +221,31 @@ def _bwd_reuse_kernel(
     for start_m in range(0, SEQ_LEN, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         q_offsets = start_m + offs_m
-        mask_m = q_offsets < SEQ_LEN
-        tile_mask = mask_m[:, None] & mask_n[None, :]
+        if not IS_EVEN_M:
+            mask_m = q_offsets < SEQ_LEN
 
         q_ptrs = Q + off_b * stride_qb + q_offsets[:, None] * stride_qs + off_h * stride_qh + offs_d[None, :]
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
+        if IS_EVEN_M:
+            q = tl.load(q_ptrs).to(tl.int8)
+        else:
+            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
         q_scale = tl.load(Q_scale + off_b * stride_qsb + off_h * stride_qsh + start_m // BLOCK_M).to(tl.float32)
 
         do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
-        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        if IS_EVEN_M:
+            do = tl.load(do_ptrs)
+        else:
+            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
 
         qk = tl.dot(q, k_s).to(tl.float32) * (q_scale * k_scale * SM_SCALE_LOG2)
-        qk = tl.where(tile_mask, qk, -float("inf"))
-        lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets, mask=mask_m, other=0.0)
+        if not IS_EVEN_M:
+            qk = tl.where(mask_m[:, None], qk, -float("inf"))
+        if not IS_EVEN_N:
+            qk = tl.where(mask_n[None, :], qk, -float("inf"))
+        if IS_EVEN_M:
+            lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets)
+        else:
+            lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets, mask=mask_m, other=0.0)
         p = tl.math.exp2(qk - lse[:, None])
 
         p_i8, p_scale = _quantize_tile_to_int8(p)
@@ -209,7 +253,10 @@ def _bwd_reuse_kernel(
         acc_dv += tl.dot(tl.trans(p_i8), do_i8).to(tl.float32) * (p_scale * do_scale)
 
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
-        delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets, mask=mask_m, other=0.0)
+        if IS_EVEN_M:
+            delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets)
+        else:
+            delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets, mask=mask_m, other=0.0)
         ds = p * (dp - delta[:, None])
         ds_i8, ds_scale = _quantize_tile_to_int8(ds)
 
@@ -228,14 +275,23 @@ def _bwd_reuse_kernel(
             + offs_d[None, :]
         )
         if DQ_SPLITS >= N_BLOCKS:
-            tl.store(dq_accum_ptrs, dq_partial, mask=mask_m[:, None])
+            if IS_EVEN_M:
+                tl.store(dq_accum_ptrs, dq_partial)
+            else:
+                tl.store(dq_accum_ptrs, dq_partial, mask=mask_m[:, None])
+        elif IS_EVEN_M:
+            tl.atomic_add(dq_accum_ptrs, dq_partial, sem="relaxed")
         else:
             tl.atomic_add(dq_accum_ptrs, dq_partial, sem="relaxed", mask=mask_m[:, None])
 
     dk_ptrs = DK + off_b * stride_dkb + offs_n[:, None] * stride_dks + off_h * stride_dkh + offs_d[None, :]
     dv_ptrs = DV + off_b * stride_dvb + offs_n[:, None] * stride_dvs + off_h * stride_dvh + offs_d[None, :]
-    tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty), mask=mask_n[:, None])
-    tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
+    if IS_EVEN_N:
+        tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty))
+        tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty))
+    else:
+        tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty), mask=mask_n[:, None])
+        tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
 
 
 def _reuse_dq_splits(n_blocks: int) -> int:
@@ -278,6 +334,8 @@ def backward_reuse(
 
     batch, seq_len, heads, head_dim = q.shape
     seq_len_bucket = _autotune_seq_len_bucket(seq_len)
+    is_even_m = seq_len % BLOCK_M == 0
+    is_even_n = seq_len % BLOCK_N == 0
 
     n_blocks = triton.cdiv(seq_len, BLOCK_N)
     dq_splits = _reuse_dq_splits(n_blocks)
@@ -301,6 +359,7 @@ def backward_reuse(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         DQ_SPLITS=dq_splits,
+        IS_EVEN_M=is_even_m,
     )
 
     _bwd_preprocess_delta[q_grid](
@@ -319,6 +378,7 @@ def backward_reuse(
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
+        IS_EVEN_M=is_even_m,
     )
 
     has_kmean = k_mean is not None
@@ -390,6 +450,8 @@ def backward_reuse(
         HAS_KMEAN=has_kmean,
         DQ_SPLITS=dq_splits,
         N_BLOCKS=n_blocks,
+        IS_EVEN_M=is_even_m,
+        IS_EVEN_N=is_even_n,
     )
 
     _convert_dq_accum_kernel[q_grid](
@@ -407,6 +469,7 @@ def backward_reuse(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         DQ_SPLITS=dq_splits,
+        IS_EVEN_M=is_even_m,
     )
 
     return dq, dk, dv

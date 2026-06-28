@@ -14,7 +14,7 @@ LOG2_E = 1.44269504088896340736
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "IS_EVEN_M"],
 )
 @triton.jit
 def _bwd_preprocess_delta(
@@ -33,6 +33,7 @@ def _bwd_preprocess_delta(
     SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -40,24 +41,32 @@ def _bwd_preprocess_delta(
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < SEQ_LEN
+    if not IS_EVEN_M:
+        mask_m = offs_m < SEQ_LEN
 
     out_ptrs = Out + off_b * stride_ob + offs_m[:, None] * stride_os + off_h * stride_oh + offs_d[None, :]
     do_ptrs = DO + off_b * stride_dob + offs_m[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
 
-    out = tl.load(out_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-    do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+    if IS_EVEN_M:
+        out = tl.load(out_ptrs).to(tl.float32)
+        do = tl.load(do_ptrs).to(tl.float32)
+    else:
+        out = tl.load(out_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
     delta = tl.sum(out * do, axis=1)
 
     delta_ptrs = Delta + off_b * stride_db + off_h * stride_dh + offs_m
-    tl.store(delta_ptrs, delta, mask=mask_m)
+    if IS_EVEN_M:
+        tl.store(delta_ptrs, delta)
+    else:
+        tl.store(delta_ptrs, delta, mask=mask_m)
 
 
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps, num_stages in _TRITON_BWD_CONFIGS
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN", "IS_EVEN_M", "IS_EVEN_N"],
     prune_configs_by={"early_config_prune": _prune_bwd_dq_configs},
 )
 @triton.jit
@@ -105,6 +114,8 @@ def _bwd_dq_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_KMEAN: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
+    IS_EVEN_N: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -113,17 +124,24 @@ def _bwd_dq_kernel(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_m = offs_m < SEQ_LEN
+    if not IS_EVEN_M:
+        mask_m = offs_m < SEQ_LEN
 
     q_ptrs = Q + off_b * stride_qb + offs_m[:, None] * stride_qs + off_h * stride_qh + offs_d[None, :]
-    q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
     q_scale = tl.load(Q_scale + off_b * stride_qsb + off_h * stride_qsh + start_m).to(tl.float32)
 
     do_ptrs = DO + off_b * stride_dob + offs_m[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
-    do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
 
-    lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + offs_m, mask=mask_m, other=0.0)
-    delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + offs_m, mask=mask_m, other=0.0)
+    if IS_EVEN_M:
+        q = tl.load(q_ptrs).to(tl.int8)
+        do = tl.load(do_ptrs)
+        lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + offs_m)
+        delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + offs_m)
+    else:
+        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
+        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + offs_m, mask=mask_m, other=0.0)
+        delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + offs_m, mask=mask_m, other=0.0)
 
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     km = tl.zeros([HEAD_DIM], dtype=tl.float32)
@@ -133,19 +151,28 @@ def _bwd_dq_kernel(
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         kv_offsets = start_n + offs_n
-        mask_n = kv_offsets < SEQ_LEN
-        tile_mask = mask_m[:, None] & mask_n[None, :]
+        if not IS_EVEN_N:
+            mask_n = kv_offsets < SEQ_LEN
 
         k_s_ptrs = K + off_b * stride_kb + kv_offsets[None, :] * stride_ks + off_h * stride_kh + offs_d[:, None]
-        k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
+        if IS_EVEN_N:
+            k_s = tl.load(k_s_ptrs).to(tl.int8)
+        else:
+            k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
         k_scale = tl.load(K_scale + off_b * stride_ksb + off_h * stride_ksh + start_n // BLOCK_N).to(tl.float32)
 
         qk = tl.dot(q, k_s).to(tl.float32) * (q_scale * k_scale * SM_SCALE_LOG2)
-        qk = tl.where(tile_mask, qk, -float("inf"))
+        if not IS_EVEN_M:
+            qk = tl.where(mask_m[:, None], qk, -float("inf"))
+        if not IS_EVEN_N:
+            qk = tl.where(mask_n[None, :], qk, -float("inf"))
         p = tl.math.exp2(qk - lse[:, None])
 
         v_ptrs = V + off_b * stride_vb + kv_offsets[:, None] * stride_vs + off_h * stride_vh + offs_d[None, :]
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        if IS_EVEN_N:
+            v = tl.load(v_ptrs)
+        else:
+            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
         ds = p * (dp - delta[:, None])
 
@@ -158,14 +185,17 @@ def _bwd_dq_kernel(
             acc += rowsum_ds[:, None] * km[None, :]
 
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
-    tl.store(dq_ptrs, acc.to(DQ.type.element_ty), mask=mask_m[:, None])
+    if IS_EVEN_M:
+        tl.store(dq_ptrs, acc.to(DQ.type.element_ty))
+    else:
+        tl.store(dq_ptrs, acc.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps, num_stages in _TRITON_BWD_CONFIGS
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "IS_EVEN_M", "IS_EVEN_N"],
     prune_configs_by={"early_config_prune": _prune_bwd_dkdv_configs},
 )
 @triton.jit
@@ -220,6 +250,8 @@ def _bwd_dkdv_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    IS_EVEN_M: tl.constexpr,
+    IS_EVEN_N: tl.constexpr,
 ):
     start_n = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -228,14 +260,21 @@ def _bwd_dkdv_kernel(
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
-    mask_n = offs_n < SEQ_LEN
+    if not IS_EVEN_N:
+        mask_n = offs_n < SEQ_LEN
 
     k_s_ptrs = K + off_b * stride_kb + offs_n[None, :] * stride_ks + off_h * stride_kh + offs_d[:, None]
-    k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
+    if IS_EVEN_N:
+        k_s = tl.load(k_s_ptrs).to(tl.int8)
+    else:
+        k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
     k_scale = tl.load(K_scale + off_b * stride_ksb + off_h * stride_ksh + start_n).to(tl.float32)
 
     v_ptrs = V + off_b * stride_vb + offs_n[:, None] * stride_vs + off_h * stride_vh + offs_d[None, :]
-    v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+    if IS_EVEN_N:
+        v = tl.load(v_ptrs)
+    else:
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
 
     acc_dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     acc_dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
@@ -243,39 +282,59 @@ def _bwd_dkdv_kernel(
     for start_m in range(0, SEQ_LEN, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         q_offsets = start_m + offs_m
-        mask_m = q_offsets < SEQ_LEN
-        tile_mask = mask_m[:, None] & mask_n[None, :]
+        if not IS_EVEN_M:
+            mask_m = q_offsets < SEQ_LEN
 
         q_ptrs = Q + off_b * stride_qb + q_offsets[:, None] * stride_qs + off_h * stride_qh + offs_d[None, :]
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
+        if IS_EVEN_M:
+            q = tl.load(q_ptrs).to(tl.int8)
+        else:
+            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
         q_scale = tl.load(Q_scale + off_b * stride_qsb + off_h * stride_qsh + start_m // BLOCK_M).to(tl.float32)
 
         qk = tl.dot(q, k_s).to(tl.float32) * (q_scale * k_scale * SM_SCALE_LOG2)
-        qk = tl.where(tile_mask, qk, -float("inf"))
-        lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets, mask=mask_m, other=0.0)
+        if not IS_EVEN_M:
+            qk = tl.where(mask_m[:, None], qk, -float("inf"))
+        if not IS_EVEN_N:
+            qk = tl.where(mask_n[None, :], qk, -float("inf"))
+        if IS_EVEN_M:
+            lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets)
+        else:
+            lse = tl.load(Lse + off_b * stride_lseb + off_h * stride_lseh + q_offsets, mask=mask_m, other=0.0)
         p = tl.math.exp2(qk - lse[:, None])
 
         do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
-        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
         do_i8_ptrs = (
             DOInt8 + off_b * stride_doib + q_offsets[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
         )
-        do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
+        if IS_EVEN_M:
+            do = tl.load(do_ptrs)
+            do_i8 = tl.load(do_i8_ptrs).to(tl.int8)
+        else:
+            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+            do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
         do_scale = tl.load(DOScale + off_b * stride_dosb + off_h * stride_dosh + start_m // BLOCK_M).to(tl.float32)
 
         p_i8, p_scale = _quantize_tile_to_int8(p)
         acc_dv += tl.dot(tl.trans(p_i8), do_i8).to(tl.float32) * (p_scale * do_scale)
 
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
-        delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets, mask=mask_m, other=0.0)
+        if IS_EVEN_M:
+            delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets)
+        else:
+            delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets, mask=mask_m, other=0.0)
         ds = p * (dp - delta[:, None])
         ds_i8, ds_scale = _quantize_tile_to_int8(ds)
         acc_dk += tl.dot(tl.trans(ds_i8), q).to(tl.float32) * (ds_scale * q_scale * SM_SCALE)
 
     dk_ptrs = DK + off_b * stride_dkb + offs_n[:, None] * stride_dks + off_h * stride_dkh + offs_d[None, :]
     dv_ptrs = DV + off_b * stride_dvb + offs_n[:, None] * stride_dvs + off_h * stride_dvh + offs_d[None, :]
-    tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty), mask=mask_n[:, None])
-    tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
+    if IS_EVEN_N:
+        tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty))
+        tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty))
+    else:
+        tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty), mask=mask_n[:, None])
+        tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
 
 
 def backward(
@@ -304,6 +363,8 @@ def backward(
 
     batch, seq_len, heads, head_dim = q.shape
     seq_len_bucket = _autotune_seq_len_bucket(seq_len)
+    is_even_m = seq_len % BLOCK_M == 0
+    is_even_n = seq_len % BLOCK_N == 0
 
     dq = torch.empty_like(v)
     dk = torch.empty_like(v)
@@ -328,6 +389,7 @@ def backward(
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
+        IS_EVEN_M=is_even_m,
     )
 
     has_kmean = k_mean is not None
@@ -388,6 +450,8 @@ def backward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HAS_KMEAN=has_kmean,
+        IS_EVEN_M=is_even_m,
+        IS_EVEN_N=is_even_n,
     )
 
     dkdv_grid = (triton.cdiv(seq_len, BLOCK_N), heads, batch)
@@ -442,6 +506,8 @@ def backward(
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        IS_EVEN_M=is_even_m,
+        IS_EVEN_N=is_even_n,
     )
 
     return dq, dk, dv
