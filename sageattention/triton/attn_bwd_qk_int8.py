@@ -4,7 +4,7 @@ import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
 from .attn_bwd_autotune import _TRITON_BWD_CONFIGS, _prune_bwd_dkdv_configs, _prune_bwd_dq_configs
-from .quant_per_block import _quantize_tile_to_int8
+from .quant_per_block import _quantize_tile_to_int8, per_block_int8_single
 
 LOG2_E = 1.44269504088896340736
 
@@ -174,6 +174,8 @@ def _bwd_dkdv_kernel(
     K,
     V,
     DO,
+    DOInt8,
+    DOScale,
     Lse,
     Delta,
     Q_scale,
@@ -192,6 +194,11 @@ def _bwd_dkdv_kernel(
     stride_dob,
     stride_dos,
     stride_doh,
+    stride_doib,
+    stride_dois,
+    stride_doih,
+    stride_dosb,
+    stride_dosh,
     stride_lseb,
     stride_lseh,
     stride_db,
@@ -250,9 +257,13 @@ def _bwd_dkdv_kernel(
 
         do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
         do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        do_i8_ptrs = (
+            DOInt8 + off_b * stride_doib + q_offsets[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
+        )
+        do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
+        do_scale = tl.load(DOScale + off_b * stride_dosb + off_h * stride_dosh + start_m // BLOCK_M).to(tl.float32)
 
         p_i8, p_scale = _quantize_tile_to_int8(p)
-        do_i8, do_scale = _quantize_tile_to_int8(do.to(tl.float32))
         acc_dv += tl.dot(tl.trans(p_i8), do_i8).to(tl.float32) * (p_scale * do_scale)
 
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
@@ -298,6 +309,7 @@ def backward(
     dk = torch.empty_like(v)
     dv = torch.empty_like(v)
     delta = torch.empty((batch, heads, seq_len), device=do.device, dtype=torch.float32)
+    do_int8, do_scale = per_block_int8_single(do, BLOCK_M, "NHD")
 
     preprocess_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch)
     _bwd_preprocess_delta[preprocess_grid](
@@ -384,6 +396,8 @@ def backward(
         k,
         v,
         do,
+        do_int8,
+        do_scale,
         lse,
         delta,
         q_scale,
@@ -402,6 +416,11 @@ def backward(
         do.stride(0),
         do.stride(1),
         do.stride(2),
+        do_int8.stride(0),
+        do_int8.stride(1),
+        do_int8.stride(2),
+        do_scale.stride(0),
+        do_scale.stride(1),
         lse.stride(0),
         lse.stride(1),
         delta.stride(0),

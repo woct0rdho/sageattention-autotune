@@ -95,6 +95,54 @@ def quant_per_block_int8_kernel(
     tl.store(scale_ptrs, scale)
 
 
+def per_block_int8_single(
+    x: torch.Tensor,
+    BLK: int,
+    tensor_layout: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_int8 = torch.empty(x.shape, device=x.device, dtype=torch.int8)
+
+    if tensor_layout == "HND":
+        b, h, seq_len, head_dim = x.shape
+        stride_bz_x, stride_h_x, stride_seq_x = x.stride(0), x.stride(1), x.stride(2)
+        stride_bz_xo, stride_h_xo, stride_seq_xo = x_int8.stride(0), x_int8.stride(1), x_int8.stride(2)
+    elif tensor_layout == "NHD":
+        b, seq_len, h, head_dim = x.shape
+        stride_bz_x, stride_h_x, stride_seq_x = x.stride(0), x.stride(2), x.stride(1)
+        stride_bz_xo, stride_h_xo, stride_seq_xo = x_int8.stride(0), x_int8.stride(2), x_int8.stride(1)
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+
+    x_blocks = triton.cdiv(seq_len, BLK)
+    x_scale = torch.empty((b, h, x_blocks), device=x.device, dtype=torch.float32)
+
+    grid = (x_blocks, h, b)
+    quant_per_block_int8_kernel[grid](
+        x,
+        x,
+        x_int8,
+        x_scale,
+        seq_len,
+        _autotune_seq_len_bucket(seq_len),
+        stride_bz_x,
+        stride_h_x,
+        stride_seq_x,
+        0,
+        0,
+        0,
+        stride_bz_xo,
+        stride_h_xo,
+        stride_seq_xo,
+        x_scale.stride(0),
+        x_scale.stride(1),
+        C=head_dim,
+        BLK=BLK,
+        HAS_MEAN=False,
+    )
+
+    return x_int8, x_scale
+
+
 def per_block_int8(
     q: torch.Tensor,
     k: torch.Tensor,

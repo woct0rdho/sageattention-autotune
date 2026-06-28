@@ -13,6 +13,7 @@ Add and tune a trainable Triton SageAttention path that follows the SageBwd desi
 - Trainable paths support `torch.float16` only.
 - Forward quantization products `q_int8`, `k_int8`, `q_scale`, `k_scale` are saved for backward.
 - The default trainable backward is split into preprocess `delta`, `dQ`, and `dK/dV` kernels.
+- The default `dK/dV` path pre-quantizes `dO` once per backward and reuses `DOInt8`/`DOScale` across KV-owned programs.
 - The reuse trainable backward uses a FlashAttention-style KV-block-owned kernel that computes `dQ`, `dK`, and `dV` from the same `P/dS` tile and accumulates `dQ` through fp32 workspace.
 - Public APIs are `sageattn_qk_int8_pv_fp16_triton_trainable` and `sageattn_qk_int8_pv_fp16_triton_trainable_reuse`; `SAGEATTN_BACKEND=triton_trainable_reuse` selects the reuse backend.
 - Trainable eager and `torch.compile(fullgraph=True, mode="max-autotune")` paths autotune shared outer `(BLOCK_M, BLOCK_N)` by forward + backward total time.
@@ -78,7 +79,7 @@ q, k -> per_block_int8 -> q_int8, q_scale, k_int8, k_scale
 q_int8, k_int8, v, scales -> Triton forward -> out, lse
 ```
 
-The forward pass saves the quantized tensors and scales for backward. Shared quantization uses symmetric int8 rounding with output clamped to `[-127, 127]`, so `-128` is not produced.
+The forward pass saves the quantized tensors and scales for backward. Shared quantization currently uses `max(abs(x)) / 127.5 + 1e-7` with PTX round-to-nearest conversion and no extra clamp, because local accuracy checks showed this gives lower practical quantization error than clamped `127.0` variants.
 
 ### Backward Preprocess
 
@@ -115,13 +116,15 @@ dQ_i += rowsum(dS_ij) * k_mean
 
 Grid over `(kv_block, head, batch)`.
 
+Before launching this kernel, `dO` is quantized once per Q block into `DOInt8` and `DOScale`.
+
 For each K/V block, loop over all Q blocks:
 
 ```text
 S_ij = int8(q_i) @ int8(k_j)^T * q_scale_i * k_scale_j * sm_scale
 P_ij = exp(S_ij - lse_i)
 quantize P_ij per block
-quantize dO_i per block
+load pre-quantized int8(dO_i), dO_scale_i
 dV_j += int8(P_ij)^T @ int8(dO_i) * p_scale * dO_scale
 
 dP_ij = dO_i @ V_j^T  # fp16/bf16 matmul, not int8
@@ -129,6 +132,8 @@ dS_ij = P_ij * (dP_ij - delta_i)
 quantize dS_ij per block
 dK_j += int8(dS_ij)^T @ int8(q_i) * dS_scale * q_scale_i
 ```
+
+Pre-quantizing `dO` avoids quantizing the same `dO_i` tile once per KV block. For `seq_len=4096` and `BLOCK_N=64`, this removes roughly 64 repeated `dO` quantizations per Q tile.
 
 This split keeps write ownership simple:
 - `dQ` kernel owns one Q block, so no atomics for `dQ`.
@@ -161,16 +166,63 @@ dQ_i partial = int8(dS_ij) @ int8(k_j) * dS_scale * k_scale_j
 - If the requested split count covers all KV blocks, the reuse kernel uses stores instead of atomics for `dQ` partials.
 - On the local sm86 validation machine, split counts greater than `1` were correct but slower for the benchmarked 2048/4096/8192 sequence lengths, so the default remains `1`.
 
+## Local Profiling Findings
+
+Latest profiling used Nsight Compute 2026.2 on the local sm86 machine with `batch=1`, `heads=16`, `head_dim=64`, `seq_len=4096`, non-causal fp16.
+
+Representative public benchmark after `dO` pre-quantization:
+
+| Method | Forward ms | Backward ms | Total ms |
+|---|---:|---:|---:|
+| FlashAttention | 1.984 | 4.667 | 6.651 |
+| Sage default | 1.303 | 6.035 | 7.338 |
+
+Kernel replay NCU summary:
+
+| Kernel | Time ms | Tensor core activity | Registers/thread | Notes |
+|---|---:|---:|---:|---|
+| FlashAttention main backward | 5.749 | HMMA ~45.7% | 255 | seq-k-parallel fused `dQ/dK/dV` kernel |
+| Sage `dQ` | 2.401 | IMMA/HMMA ~21.9% | 255 | owns Q block; no atomics |
+| Sage `dK/dV` | 4.907 | IMMA ~16.0%, HMMA ~10.7% | 235 | current dominant kernel |
+| Sage `dO` quant | 0.031 | none | 48 | extra launch from pre-quantization |
+| Sage preprocess | 0.044 | none | 36 | computes `delta` |
+
+Measured conclusions:
+- `_bwd_dkdv_kernel` is the main bottleneck for the default backend at `seq_len=4096`.
+- Pre-quantizing `dO` moved `_bwd_dkdv_kernel` from roughly `5.65 ms` to `4.91 ms` in NCU kernel replay; the extra quantization launch costs roughly `0.03 ms`.
+- Tile-shape probing showed `(64, 64)` remains best for the current Triton split kernels. FlashAttention-style `(64, 128)` was slower in this implementation, so simply copying FlashAttention's outer tile does not fix the gap.
+- The reuse backend remains slower on this sm86 shape; split `DQAccum` workspace is correct but has not beaten the default single-plane path.
+- The next performance gap is structural: raise tensor-core utilization and reduce predicate/register overhead in `dK/dV`, not scalar-ordering cleanup.
+
 ## Optimization Roadmap
 
-- Save/reuse as much forward state as practical.
-  - Already saves Q/K int8 and scales.
-  - Reuse backend avoids recomputing `P/dS` separately for `dQ` and `dK/dV`.
-  - Consider dedicated `dO` quantization if repeated quantization dominates.
-- Benchmark and tune forward+backward.
-  - `bench/bench_fwd_bwd.py` compares `sdpa`, `flash`, `sage`, and `sage_reuse` for non-causal forward+backward.
-  - It reports separate forward, backward, and total latency/TFLOP/s.
+- Specialize even dense shapes.
+  - Add `IS_EVEN_MN` and `IS_EVEN_D` constexpr paths for non-causal fixed-length shapes where `seq_len % BLOCK_M == 0`, `seq_len % BLOCK_N == 0`, and `head_dim == HEAD_DIM`.
+  - Remove boundary masks and masked loads/stores from the hot loops in those specializations, following FlashAttention's even-MN/even-K dispatch idea.
+- Fuse `dO` quantization with preprocess.
+  - Combine `per_block_int8_single(dO)` with `_bwd_preprocess_delta` so one kernel reads `dO`, writes `Delta`, `DOInt8`, and `DOScale`.
+  - This should keep the measured `dK/dV` gain while removing one launch and one extra `dO` read.
+- Reduce `dK/dV` register pressure.
+  - Prototype separate `dV-only` and `dK-only` kernels and compare against the current fused `dK/dV` kernel.
+  - The current fused kernel is still high-register and low tensor-core-active; recomputing scores twice may be worthwhile if occupancy and scheduling improve enough.
+- Retune after the structural changes.
+  - Re-enable/measure broader `num_warps`, `num_stages`, and selected `(BLOCK_M, BLOCK_N)` candidates only after even-shape specialization and fused preprocess land.
+  - Use NCU metrics for IMMA/HMMA active cycles, registers/thread, achieved occupancy, and kernel time as selection criteria.
+- Revisit the reuse backend second.
+  - Apply the same pre-quantized `dO` and fused-preprocess idea to `_bwd_reuse_kernel`.
+  - Re-profile whether lower quantization/register overhead makes reuse competitive despite `DQAccum` atomics/workspace.
+- Consider a narrow CUDA/CUTLASS path if Triton remains behind.
+  - A specialized sm80/sm86, `head_dim=64`, non-causal, even-length kernel following FlashAttention's seq-k-parallel fused layout is the most likely route to decisively beat FlashAttention backward.
+
+## Benchmark and Profiling Workflow
+
+- Use `bench/bench_fwd_bwd.py` for public latency comparisons across `sdpa`, `flash`, `sage`, and `sage_reuse`.
+  - Primary target shape: `--batch_size 1 --num_heads 16 --head_dim 64 --seq_lens 2048 4096 8192`.
   - Use `--reuse-dq-splits` to benchmark split-plane `DQAccum` choices.
+- Use Nsight Compute for kernel-level comparisons.
+  - Profile after warmup and isolate backward with `cudaProfilerStart`/`cudaProfilerStop`.
+  - Prefer kernel replay for Triton/autotuned workloads when application replay sees inconsistent kernels.
+  - Track at least kernel time, registers/thread, shared memory, achieved occupancy, DRAM/L2 throughput, HMMA activity, and IMMA activity.
 - Expand support only after the non-causal fp16 path is stable.
   - `head_dim=128` and `head_dim=256` correctness/performance sweeps beyond the current autotune validity coverage.
   - bf16.
@@ -183,6 +235,7 @@ dQ_i partial = int8(dS_ij) @ int8(k_j) * dS_scale * k_scale_j
 - int8 quantization granularity for `P` in backward currently follows the paper's Algorithm 3 per-block description. Accuracy may still require experimenting with per-row/per-token scaling.
 - `dS` is expected to be the fragile tensor. Debug tooling should expose `dS` metrics if accuracy falls below target.
 - Long sequence performance may need additional scheduling work beyond the current split-kernel and reuse implementations.
+- Local profiling shows the default backend still trails FlashAttention backward at `seq_len=4096`; the dominant gap is `_bwd_dkdv_kernel` tensor-core utilization/register pressure.
 - A single shared trainable block size is the right current design, but it means the chosen config is a compromise across quantization, forward attention, and backward kernels.
 - Reuse `dQ` accumulation can be sharded to reduce atomic contention, but current sm86 benchmarks show the extra zero/reduce workspace cost outweighs the benefit for the tested shapes.
 
@@ -191,3 +244,4 @@ dQ_i partial = int8(dS_ij) @ int8(k_j) * dS_scale * k_scale_j
 - Correctness uses FlashAttention backward as the reference and flattened cosine similarity plus Frobenius relative L2 metrics.
 - Configured reuse and forced split-plane `DQAccum` tests pass.
 - Latest full validation: `python -m pytest -n 8 tests/ -q` reported `1069 passed`; `pre-commit run --all-files` passed.
+- After `dO` pre-quantization, focused validation passed: `python -m pytest tests/test_sagebwd_triton.py tests/test_sagebwd_triton_compile.py -q` reported `8 passed`; `pre-commit run --files sageattention/triton/attn_bwd_qk_int8.py sageattention/triton/quant_per_block.py` passed.
