@@ -9,12 +9,14 @@ Add and tune a trainable Triton SageAttention path that follows the SageBwd desi
 - Non-causal attention only.
 - Fixed-length dense tensors only.
 - Canonical internal layout is `tensor_layout="NHD"`. The trainable wrapper accepts `NHD` and `HND` by converting to/from NHD.
-- Initial trainable path requires `q`, `k`, and `v` to have the same shape. GQA/MQA is not implemented.
-- Initial trainable path supports `torch.float16` only.
+- Trainable paths require `q`, `k`, and `v` to have the same shape. GQA/MQA is not implemented.
+- Trainable paths support `torch.float16` only.
 - Forward quantization products `q_int8`, `k_int8`, `q_scale`, `k_scale` are saved for backward.
-- Backward is split into preprocess `delta`, `dQ`, and `dK/dV` kernels.
+- The default trainable backward is split into preprocess `delta`, `dQ`, and `dK/dV` kernels.
+- The reuse trainable backward uses a FlashAttention-style KV-block-owned kernel that computes `dQ`, `dK`, and `dV` from the same `P/dS` tile and accumulates `dQ` through fp32 workspace.
+- Public APIs are `sageattn_qk_int8_pv_fp16_triton_trainable` and `sageattn_qk_int8_pv_fp16_triton_trainable_reuse`; `SAGEATTN_BACKEND=triton_trainable_reuse` selects the reuse backend.
 - Trainable eager and `torch.compile(fullgraph=True, mode="max-autotune")` paths autotune shared outer `(BLOCK_M, BLOCK_N)` by forward + backward total time.
-- The Triton forward, backward preprocess, `dQ`, and `dK/dV` kernels autotune their inner launch configs independently. Backward preprocess tunes `num_warps`; `dQ` and `dK/dV` tune `num_warps` and `num_stages` with separate shared-memory pruning.
+- The Triton forward, backward preprocess, default `dQ`, default `dK/dV`, and reuse kernels autotune their inner launch configs independently. Backward preprocess and reuse `DQAccum` utility kernels tune `num_warps`; default `dQ`, default `dK/dV`, and reuse tune `num_warps` and `num_stages` with shared-memory pruning.
 
 ## Paper Facts
 
@@ -76,7 +78,7 @@ q, k -> per_block_int8 -> q_int8, q_scale, k_int8, k_scale
 q_int8, k_int8, v, scales -> Triton forward -> out, lse
 ```
 
-The forward pass saves the quantized tensors and scales for backward.
+The forward pass saves the quantized tensors and scales for backward. Shared quantization uses symmetric int8 rounding with output clamped to `[-127, 127]`, so `-128` is not produced.
 
 ### Backward Preprocess
 
@@ -131,17 +133,44 @@ dK_j += int8(dS_ij)^T @ int8(q_i) * dS_scale * q_scale_i
 This split keeps write ownership simple:
 - `dQ` kernel owns one Q block, so no atomics for `dQ`.
 - `dK/dV` kernel owns one KV block, so no atomics for `dK` or `dV`.
-- `S`, `P`, `dP`, and `dS` are recomputed in both kernels. That is acceptable for the first optimized path and can be revisited after profiling.
+- `S`, `P`, `dP`, and `dS` are recomputed in both kernels. This remains the conservative default trainable backend.
+
+### Reuse Backward Kernel
+
+The reuse backend is a FlashAttention-style path with grid over `(kv_block, head, batch)`. Each KV-owned program loads one K/V tile and loops over Q blocks:
+
+```text
+S_ij = int8(q_i) @ int8(k_j)^T * q_scale_i * k_scale_j * sm_scale
+P_ij = exp(S_ij - lse_i)
+quantize P_ij per block
+quantize dO_i per block
+dV_j += int8(P_ij)^T @ int8(dO_i) * p_scale * dO_scale
+
+dP_ij = dO_i @ V_j^T  # fp16 matmul, not int8
+dS_ij = P_ij * (dP_ij - delta_i)
+quantize dS_ij per block
+dK_j += int8(dS_ij)^T @ int8(q_i) * dS_scale * q_scale_i
+dQ_i partial = int8(dS_ij) @ int8(k_j) * dS_scale * k_scale_j
+```
+
+`dK` and `dV` are owned by the KV program and stored directly. `dQ` is accumulated into fp32 `DQAccum` workspace and converted to fp16 by a final utility kernel.
+
+`SAGEATTN_REUSE_DQ_SPLITS` controls optional split-plane `DQAccum` workspace:
+- Default is `1`, matching the original single fp32 accumulation plane with `tl.atomic_add`.
+- Values greater than `1` shard KV blocks across split planes, reducing atomic contention and adding a final split reduction.
+- If the requested split count covers all KV blocks, the reuse kernel uses stores instead of atomics for `dQ` partials.
+- On the local sm86 validation machine, split counts greater than `1` were correct but slower for the benchmarked 2048/4096/8192 sequence lengths, so the default remains `1`.
 
 ## Optimization Roadmap
 
 - Save/reuse as much forward state as practical.
   - Already saves Q/K int8 and scales.
+  - Reuse backend avoids recomputing `P/dS` separately for `dQ` and `dK/dV`.
   - Consider dedicated `dO` quantization if repeated quantization dominates.
-- Add benchmark script.
-  - Backward-only.
-  - Forward+backward.
-  - FlashAttention comparison.
+- Benchmark and tune forward+backward.
+  - `bench/bench_fwd_bwd.py` compares `sdpa`, `flash`, `sage`, and `sage_reuse` for non-causal forward+backward.
+  - It reports separate forward, backward, and total latency/TFLOP/s.
+  - Use `--reuse-dq-splits` to benchmark split-plane `DQAccum` choices.
 - Expand support only after the non-causal fp16 path is stable.
   - `head_dim=128` and `head_dim=256` correctness/performance sweeps beyond the current autotune validity coverage.
   - bf16.
@@ -153,5 +182,12 @@ This split keeps write ownership simple:
 
 - int8 quantization granularity for `P` in backward currently follows the paper's Algorithm 3 per-block description. Accuracy may still require experimenting with per-row/per-token scaling.
 - `dS` is expected to be the fragile tensor. Debug tooling should expose `dS` metrics if accuracy falls below target.
-- Long sequence performance may need additional scheduling work beyond the current split-kernel implementation.
-- A single shared trainable block size is the right current design, but it means the chosen config is a compromise across quantization, forward attention, `dQ`, and `dK/dV` kernels.
+- Long sequence performance may need additional scheduling work beyond the current split-kernel and reuse implementations.
+- A single shared trainable block size is the right current design, but it means the chosen config is a compromise across quantization, forward attention, and backward kernels.
+- Reuse `dQ` accumulation can be sharded to reduce atomic contention, but current sm86 benchmarks show the extra zero/reduce workspace cost outweighs the benefit for the tested shapes.
+
+## Validation Snapshot
+
+- Correctness uses FlashAttention backward as the reference and flattened cosine similarity plus Frobenius relative L2 metrics.
+- Configured reuse and forced split-plane `DQAccum` tests pass.
+- Latest full validation: `python -m pytest -n 8 tests/ -q` reported `1069 passed`; `pre-commit run --all-files` passed.

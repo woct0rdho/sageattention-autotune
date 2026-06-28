@@ -128,7 +128,7 @@ def _bwd_dq_kernel(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     km = tl.zeros([HEAD_DIM], dtype=tl.float32)
     if HAS_KMEAN:
-        km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32)
+        km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32) * SM_SCALE
 
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -155,7 +155,7 @@ def _bwd_dq_kernel(
 
         if HAS_KMEAN:
             rowsum_ds = tl.sum(ds, axis=1)
-            acc += rowsum_ds[:, None] * km[None, :] * SM_SCALE
+            acc += rowsum_ds[:, None] * km[None, :]
 
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
     tl.store(dq_ptrs, acc.to(DQ.type.element_ty), mask=mask_m[:, None])

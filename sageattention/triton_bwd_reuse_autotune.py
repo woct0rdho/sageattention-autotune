@@ -1,4 +1,5 @@
 import functools
+import os
 
 import torch
 import torch._dynamo.config as dynamo_config
@@ -30,7 +31,15 @@ def _compile_block_config_key(
     smooth_k: bool,
 ) -> tuple[object, ...]:
     return autotune_utils._tensor_autotune_cache_key(
-        q, k, v, tensor_layout, False, pv_accum_dtype, smooth_k, "compile_reuse"
+        q,
+        k,
+        v,
+        tensor_layout,
+        False,
+        pv_accum_dtype,
+        smooth_k,
+        os.environ.get("SAGEATTN_REUSE_DQ_SPLITS", ""),
+        "compile_reuse",
     )
 
 
@@ -91,6 +100,7 @@ def _eager_autotune_select(
         False,
         pv_accum_dtype,
         smooth_k,
+        os.environ.get("SAGEATTN_REUSE_DQ_SPLITS", ""),
         "trainable_reuse",
     )
     dout = torch.randn_like(q)

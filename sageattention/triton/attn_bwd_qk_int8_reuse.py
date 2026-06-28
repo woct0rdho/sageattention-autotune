@@ -1,3 +1,5 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -13,11 +15,12 @@ from .quant_per_block import _quantize_tile_to_int8
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS"],
 )
 @triton.jit
 def _zero_dq_accum_kernel(
     DQAccum,
+    stride_dqax,
     stride_dqab,
     stride_dqas,
     stride_dqah,
@@ -25,15 +28,25 @@ def _zero_dq_accum_kernel(
     SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    DQ_SPLITS: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
-    off_b = tl.program_id(2).to(tl.int64)
+    split_batch = tl.program_id(2)
+    off_s = (split_batch % DQ_SPLITS).to(tl.int64)
+    off_b = (split_batch // DQ_SPLITS).to(tl.int64)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
     mask_m = offs_m < SEQ_LEN
-    ptrs = DQAccum + off_b * stride_dqab + offs_m[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
+    ptrs = (
+        DQAccum
+        + off_s * stride_dqax
+        + off_b * stride_dqab
+        + offs_m[:, None] * stride_dqas
+        + off_h * stride_dqah
+        + offs_d[None, :]
+    )
     tl.store(ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32), mask=mask_m[:, None])
 
 
@@ -42,12 +55,13 @@ def _zero_dq_accum_kernel(
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "DQ_SPLITS"],
 )
 @triton.jit
 def _convert_dq_accum_kernel(
     DQAccum,
     DQ,
+    stride_dqax,
     stride_dqab,
     stride_dqas,
     stride_dqah,
@@ -58,6 +72,7 @@ def _convert_dq_accum_kernel(
     SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    DQ_SPLITS: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -66,9 +81,19 @@ def _convert_dq_accum_kernel(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
     mask_m = offs_m < SEQ_LEN
-    accum_ptrs = DQAccum + off_b * stride_dqab + offs_m[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
+    dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    for split in range(0, DQ_SPLITS):
+        accum_ptrs = (
+            DQAccum
+            + split * stride_dqax
+            + off_b * stride_dqab
+            + offs_m[:, None] * stride_dqas
+            + off_h * stride_dqah
+            + offs_d[None, :]
+        )
+        dq += tl.load(accum_ptrs, mask=mask_m[:, None], other=0.0)
+
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
-    dq = tl.load(accum_ptrs, mask=mask_m[:, None])
     tl.store(dq_ptrs, dq.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
@@ -77,7 +102,7 @@ def _convert_dq_accum_kernel(
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps, num_stages in _TRITON_BWD_REUSE_CONFIGS
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN", "DQ_SPLITS", "N_BLOCKS"],
     prune_configs_by={"early_config_prune": _prune_bwd_reuse_configs},
     reset_to_zero=["DQAccum", "DK", "DV"],
 )
@@ -117,6 +142,7 @@ def _bwd_reuse_kernel(
     stride_ksh,
     stride_kmb,
     stride_kmh,
+    stride_dqax,
     stride_dqab,
     stride_dqas,
     stride_dqah,
@@ -134,6 +160,8 @@ def _bwd_reuse_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HAS_KMEAN: tl.constexpr,
+    DQ_SPLITS: tl.constexpr,
+    N_BLOCKS: tl.constexpr,
 ):
     start_n = tl.program_id(0)
     off_h = tl.program_id(1).to(tl.int64)
@@ -143,6 +171,7 @@ def _bwd_reuse_kernel(
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM)
     mask_n = offs_n < SEQ_LEN
+    dq_split = (start_n % DQ_SPLITS).to(tl.int64)
 
     k_s_ptrs = K + off_b * stride_kb + offs_n[None, :] * stride_ks + off_h * stride_kh + offs_d[:, None]
     k_s = tl.load(k_s_ptrs, mask=mask_n[None, :], other=0).to(tl.int8)
@@ -155,7 +184,7 @@ def _bwd_reuse_kernel(
     acc_dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
     km = tl.zeros([HEAD_DIM], dtype=tl.float32)
     if HAS_KMEAN:
-        km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32)
+        km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32) * SM_SCALE
 
     for start_m in range(0, SEQ_LEN, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
@@ -188,17 +217,39 @@ def _bwd_reuse_kernel(
         dq_partial = tl.dot(ds_i8, tl.trans(k_s)).to(tl.float32) * (ds_scale * k_scale * SM_SCALE)
         if HAS_KMEAN:
             rowsum_ds = tl.sum(ds, axis=1)
-            dq_partial += rowsum_ds[:, None] * km[None, :] * SM_SCALE
+            dq_partial += rowsum_ds[:, None] * km[None, :]
 
         dq_accum_ptrs = (
-            DQAccum + off_b * stride_dqab + q_offsets[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
+            DQAccum
+            + dq_split * stride_dqax
+            + off_b * stride_dqab
+            + q_offsets[:, None] * stride_dqas
+            + off_h * stride_dqah
+            + offs_d[None, :]
         )
-        tl.atomic_add(dq_accum_ptrs, dq_partial, sem="relaxed", mask=mask_m[:, None])
+        if DQ_SPLITS >= N_BLOCKS:
+            tl.store(dq_accum_ptrs, dq_partial, mask=mask_m[:, None])
+        else:
+            tl.atomic_add(dq_accum_ptrs, dq_partial, sem="relaxed", mask=mask_m[:, None])
 
     dk_ptrs = DK + off_b * stride_dkb + offs_n[:, None] * stride_dks + off_h * stride_dkh + offs_d[None, :]
     dv_ptrs = DV + off_b * stride_dvb + offs_n[:, None] * stride_dvs + off_h * stride_dvh + offs_d[None, :]
     tl.store(dk_ptrs, acc_dk.to(DK.type.element_ty), mask=mask_n[:, None])
     tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
+
+
+def _reuse_dq_splits(n_blocks: int) -> int:
+    if n_blocks <= 1:
+        return 1
+
+    override = os.environ.get("SAGEATTN_REUSE_DQ_SPLITS")
+    if override is None:
+        return 1
+
+    dq_splits = int(override)
+    if dq_splits < 1:
+        raise ValueError("SAGEATTN_REUSE_DQ_SPLITS must be a positive integer.")
+    return min(dq_splits, n_blocks)
 
 
 def backward_reuse(
@@ -228,22 +279,28 @@ def backward_reuse(
     batch, seq_len, heads, head_dim = q.shape
     seq_len_bucket = _autotune_seq_len_bucket(seq_len)
 
+    n_blocks = triton.cdiv(seq_len, BLOCK_N)
+    dq_splits = _reuse_dq_splits(n_blocks)
+
     dq = torch.empty_like(v)
     dk = torch.empty_like(v)
     dv = torch.empty_like(v)
-    dq_accum = torch.empty(q.shape, device=do.device, dtype=torch.float32)
+    dq_accum = torch.empty((dq_splits, batch, seq_len, heads, head_dim), device=do.device, dtype=torch.float32)
     delta = torch.empty((batch, heads, seq_len), device=do.device, dtype=torch.float32)
 
     q_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch)
-    _zero_dq_accum_kernel[q_grid](
+    q_split_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch * dq_splits)
+    _zero_dq_accum_kernel[q_split_grid](
         dq_accum,
         dq_accum.stride(0),
         dq_accum.stride(1),
         dq_accum.stride(2),
+        dq_accum.stride(3),
         SEQ_LEN=seq_len,
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
+        DQ_SPLITS=dq_splits,
     )
 
     _bwd_preprocess_delta[q_grid](
@@ -277,7 +334,7 @@ def backward_reuse(
     sm_scale = head_dim**-0.5
     sm_scale_log2 = sm_scale * LOG2_E
 
-    kv_grid = (triton.cdiv(seq_len, BLOCK_N), heads, batch)
+    kv_grid = (n_blocks, heads, batch)
     _bwd_reuse_kernel[kv_grid](
         q,
         k,
@@ -316,6 +373,7 @@ def backward_reuse(
         dq_accum.stride(0),
         dq_accum.stride(1),
         dq_accum.stride(2),
+        dq_accum.stride(3),
         dk.stride(0),
         dk.stride(1),
         dk.stride(2),
@@ -330,6 +388,8 @@ def backward_reuse(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HAS_KMEAN=has_kmean,
+        DQ_SPLITS=dq_splits,
+        N_BLOCKS=n_blocks,
     )
 
     _convert_dq_accum_kernel[q_grid](
@@ -338,6 +398,7 @@ def backward_reuse(
         dq_accum.stride(0),
         dq_accum.stride(1),
         dq_accum.stride(2),
+        dq_accum.stride(3),
         dq.stride(0),
         dq.stride(1),
         dq.stride(2),
@@ -345,6 +406,7 @@ def backward_reuse(
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
+        DQ_SPLITS=dq_splits,
     )
 
     return dq, dk, dv

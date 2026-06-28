@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 
 import torch
 from flash_attn import flash_attn_func
@@ -18,15 +19,25 @@ parser.add_argument("--head_dim", type=int, default=64)
 parser.add_argument("--seq_lens", nargs="+", type=int, default=[1024, 2048, 4096, 8192])
 parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--repeats", type=int, default=10)
+parser.add_argument(
+    "--reuse-dq-splits",
+    type=int,
+    default=None,
+    help="Override SAGEATTN_REUSE_DQ_SPLITS for sage_reuse backward benchmarking.",
+)
 args = parser.parse_args()
 
 num_heads = args.num_heads
 batch_size = args.batch_size
 head_dim = args.head_dim
 
+if args.reuse_dq_splits is not None:
+    os.environ["SAGEATTN_REUSE_DQ_SPLITS"] = str(args.reuse_dq_splits)
+
 print(f"method: {args.method}")
 print(f"batch_size: {batch_size}, num_heads: {num_heads}, head_dim: {head_dim}")
 print("is_causal: False")
+print(f"reuse_dq_splits: {args.reuse_dq_splits}")
 
 
 def _make_inputs(seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
