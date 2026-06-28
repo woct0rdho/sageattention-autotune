@@ -6,7 +6,7 @@ import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
 from .attn_bwd_autotune import _TRITON_BWD_REUSE_CONFIGS, _prune_bwd_reuse_configs
-from .attn_bwd_qk_int8 import LOG2_E, _bwd_preprocess_delta
+from .attn_bwd_qk_int8 import LOG2_E, _bwd_preprocess_delta_do_quant
 from .quant_per_block import _quantize_tile_to_int8
 
 
@@ -135,6 +135,8 @@ def _bwd_reuse_kernel(
     K,
     V,
     DO,
+    DOInt8,
+    DOScale,
     Lse,
     Delta,
     Q_scale,
@@ -155,6 +157,11 @@ def _bwd_reuse_kernel(
     stride_dob,
     stride_dos,
     stride_doh,
+    stride_doib,
+    stride_dois,
+    stride_doih,
+    stride_dosb,
+    stride_dosh,
     stride_lseb,
     stride_lseh,
     stride_db,
@@ -232,10 +239,15 @@ def _bwd_reuse_kernel(
         q_scale = tl.load(Q_scale + off_b * stride_qsb + off_h * stride_qsh + start_m // BLOCK_M).to(tl.float32)
 
         do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
+        do_i8_ptrs = (
+            DOInt8 + off_b * stride_doib + q_offsets[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
+        )
         if IS_EVEN_M:
             do = tl.load(do_ptrs)
+            do_i8 = tl.load(do_i8_ptrs).to(tl.int8)
         else:
             do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+            do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
 
         qk = tl.dot(q, k_s).to(tl.float32) * (q_scale * k_scale * SM_SCALE_LOG2)
         if not IS_EVEN_M:
@@ -249,7 +261,7 @@ def _bwd_reuse_kernel(
         p = tl.math.exp2(qk - lse[:, None])
 
         p_i8, p_scale = _quantize_tile_to_int8(p)
-        do_i8, do_scale = _quantize_tile_to_int8(do.to(tl.float32))
+        do_scale = tl.load(DOScale + off_b * stride_dosb + off_h * stride_dosh + start_m // BLOCK_M).to(tl.float32)
         acc_dv += tl.dot(tl.trans(p_i8), do_i8).to(tl.float32) * (p_scale * do_scale)
 
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
@@ -345,6 +357,8 @@ def backward_reuse(
     dv = torch.empty_like(v)
     dq_accum = torch.empty((dq_splits, batch, seq_len, heads, head_dim), device=do.device, dtype=torch.float32)
     delta = torch.empty((batch, heads, seq_len), device=do.device, dtype=torch.float32)
+    do_int8 = torch.empty(do.shape, device=do.device, dtype=torch.int8)
+    do_scale = torch.empty((batch, heads, triton.cdiv(seq_len, BLOCK_M)), device=do.device, dtype=torch.float32)
 
     q_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch)
     q_split_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch * dq_splits)
@@ -362,10 +376,12 @@ def backward_reuse(
         IS_EVEN_M=is_even_m,
     )
 
-    _bwd_preprocess_delta[q_grid](
+    _bwd_preprocess_delta_do_quant[q_grid](
         out,
         do,
         delta,
+        do_int8,
+        do_scale,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -374,6 +390,11 @@ def backward_reuse(
         do.stride(2),
         delta.stride(0),
         delta.stride(1),
+        do_int8.stride(0),
+        do_int8.stride(1),
+        do_int8.stride(2),
+        do_scale.stride(0),
+        do_scale.stride(1),
         SEQ_LEN=seq_len,
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
@@ -400,6 +421,8 @@ def backward_reuse(
         k,
         v,
         do,
+        do_int8,
+        do_scale,
         lse,
         delta,
         q_scale,
@@ -420,6 +443,11 @@ def backward_reuse(
         do.stride(0),
         do.stride(1),
         do.stride(2),
+        do_int8.stride(0),
+        do_int8.stride(1),
+        do_int8.stride(2),
+        do_scale.stride(0),
+        do_scale.stride(1),
         lse.stride(0),
         lse.stride(1),
         delta.stride(0),

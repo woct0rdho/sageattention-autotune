@@ -4,7 +4,7 @@ import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
 from .attn_bwd_autotune import _TRITON_BWD_CONFIGS, _prune_bwd_dkdv_configs, _prune_bwd_dq_configs
-from .quant_per_block import _quantize_tile_to_int8, per_block_int8_single
+from .quant_per_block import _quantize_tile_to_int8
 
 LOG2_E = 1.44269504088896340736
 
@@ -17,10 +17,12 @@ LOG2_E = 1.44269504088896340736
     key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "IS_EVEN_M"],
 )
 @triton.jit
-def _bwd_preprocess_delta(
+def _bwd_preprocess_delta_do_quant(
     Out,
     DO,
     Delta,
+    DOInt8,
+    DOScale,
     stride_ob,
     stride_os,
     stride_oh,
@@ -29,6 +31,11 @@ def _bwd_preprocess_delta(
     stride_doh,
     stride_db,
     stride_dh,
+    stride_doib,
+    stride_dois,
+    stride_doih,
+    stride_dosb,
+    stride_dosh,
     SEQ_LEN: tl.constexpr,
     SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -53,13 +60,20 @@ def _bwd_preprocess_delta(
     else:
         out = tl.load(out_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
         do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+
     delta = tl.sum(out * do, axis=1)
+    do_i8, do_scale = _quantize_tile_to_int8(do)
 
     delta_ptrs = Delta + off_b * stride_db + off_h * stride_dh + offs_m
+    do_i8_ptrs = DOInt8 + off_b * stride_doib + offs_m[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
+    do_scale_ptr = DOScale + off_b * stride_dosb + off_h * stride_dosh + start_m
     if IS_EVEN_M:
         tl.store(delta_ptrs, delta)
+        tl.store(do_i8_ptrs, do_i8)
     else:
         tl.store(delta_ptrs, delta, mask=mask_m)
+        tl.store(do_i8_ptrs, do_i8, mask=mask_m[:, None])
+    tl.store(do_scale_ptr, do_scale)
 
 
 @triton.autotune(
@@ -370,13 +384,16 @@ def backward(
     dk = torch.empty_like(v)
     dv = torch.empty_like(v)
     delta = torch.empty((batch, heads, seq_len), device=do.device, dtype=torch.float32)
-    do_int8, do_scale = per_block_int8_single(do, BLOCK_M, "NHD")
+    do_int8 = torch.empty(do.shape, device=do.device, dtype=torch.int8)
+    do_scale = torch.empty((batch, heads, triton.cdiv(seq_len, BLOCK_M)), device=do.device, dtype=torch.float32)
 
     preprocess_grid = (triton.cdiv(seq_len, BLOCK_M), heads, batch)
-    _bwd_preprocess_delta[preprocess_grid](
+    _bwd_preprocess_delta_do_quant[preprocess_grid](
         out,
         do,
         delta,
+        do_int8,
+        do_scale,
         out.stride(0),
         out.stride(1),
         out.stride(2),
@@ -385,6 +402,11 @@ def backward(
         do.stride(2),
         delta.stride(0),
         delta.stride(1),
+        do_int8.stride(0),
+        do_int8.stride(1),
+        do_int8.stride(2),
+        do_scale.stride(0),
+        do_scale.stride(1),
         SEQ_LEN=seq_len,
         SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
