@@ -9,8 +9,8 @@ from torch._inductor.utils import do_bench_using_profiling
 
 from . import autotune_utils
 from .torch_compile_patch import register_custom_timing_target
+from .triton.attn_bwd_autotune import _has_valid_bwd_configs
 from .triton_autotune import _valid_configs as _valid_configs_with_causal
-from .utils import _padded_head_dim
 
 _TRITON_TRAINABLE_AUTOTUNE_CACHE: dict[object, tuple[int, int]] = {}
 _TRITON_TRAINABLE_COMPILE_AUTOTUNE_NAME = "_sageattention_triton_trainable_autotuned"
@@ -35,38 +35,13 @@ def _compile_block_config_key(
     return autotune_utils._tensor_autotune_cache_key(q, k, v, tensor_layout, False, pv_accum_dtype, smooth_k, "compile")
 
 
-def _estimated_triton_bwd_smem_bytes(block_m: int, block_n: int, head_dim: int) -> int:
-    int8_bytes = 1
-    fp16_bytes = 2
-    fp32_bytes = 4
-    min_smem_bytes = 8 * 1024
-    kernel_metadata_bytes = 8
-    bwd_work_tile_buffers = 2
-
-    head_dim = _padded_head_dim(head_dim)
-
-    # The dQ and dK/dV kernels keep multiple [BLOCK_M, BLOCK_N] score/probability
-    # work tiles live. Triton's reported smem for the failing 256x64, D=64 case is
-    # exactly two FP32 work tiles plus metadata, so model that directly.
-    work_tile_bytes = block_m * block_n * fp32_bytes * bwd_work_tile_buffers
-
-    # The staged Q/K/V/dO operands are smaller for current supported head dims, but
-    # include them so the estimate scales with head_dim instead of being a tile cap.
-    operand_tile_bytes = head_dim * (block_m * int8_bytes + block_n * (int8_bytes + fp16_bytes))
-
-    return max(work_tile_bytes, operand_tile_bytes, min_smem_bytes) + kernel_metadata_bytes
-
-
 @functools.cache
 def _config_is_valid(
     block_config: tuple[int, int],
     head_dim: int,
     device_index: int,
 ) -> bool:
-    block_m, block_n = block_config
-    return _estimated_triton_bwd_smem_bytes(block_m, block_n, head_dim) <= autotune_utils._shared_memory_limit(
-        device_index
-    )
+    return _has_valid_bwd_configs(block_config, head_dim, device_index)
 
 
 @functools.cache

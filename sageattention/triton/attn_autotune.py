@@ -26,10 +26,12 @@ def _estimated_triton_smem_bytes(
 ) -> int:
     int8_bytes = 1
     fp16_bytes = 2
-    min_smem_bytes = 8 * 1024
     pipeline_prologue_stages = 1
     stage_bookkeeping_bytes = 4
+    min_smem_bytes = 8 * 1024
     causal_mask_smem_slack_bytes = 16
+
+    head_dim = _padded_head_dim(head_dim)
 
     # Triton reports shared memory as a linear function of pipeline stages for this kernel.
     # Each extra live K/V pipeline stage materializes one K int8 tile and one V fp16 tile.
@@ -56,8 +58,6 @@ def _attn_config_is_valid(
 ) -> bool:
     if is_causal and block_m % block_n != 0:
         return False
-
-    head_dim = _padded_head_dim(head_dim)
     return _estimated_triton_smem_bytes(block_m, block_n, head_dim, attn_num_stages, is_causal) <= _shared_memory_limit(
         device_index
     )

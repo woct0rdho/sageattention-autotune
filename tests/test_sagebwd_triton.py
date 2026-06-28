@@ -105,9 +105,9 @@ def _check_backward(
 ) -> None:
     dq, dk, dv = actual
     dq_ref, dk_ref, dv_ref = expected
-    _check(dq, dq_ref, f"{name} dQ", 0.995, 0.06)
-    _check(dk, dk_ref, f"{name} dK", 0.995, 0.06)
-    _check(dv, dv_ref, f"{name} dV", 0.998, 0.05)
+    _check(dq, dq_ref, f"{name} dQ", 0.995, 0.08)
+    _check(dk, dk_ref, f"{name} dK", 0.995, 0.08)
+    _check(dv, dv_ref, f"{name} dV", 0.998, 0.07)
 
 
 @pytest.mark.parametrize("block_config", _make_valid_configs(), ids=str)

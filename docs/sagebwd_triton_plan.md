@@ -13,6 +13,8 @@ Add and tune a trainable Triton SageAttention path that follows the SageBwd desi
 - Initial trainable path supports `torch.float16` only.
 - Forward quantization products `q_int8`, `k_int8`, `q_scale`, `k_scale` are saved for backward.
 - Backward is split into preprocess `delta`, `dQ`, and `dK/dV` kernels.
+- Trainable eager and `torch.compile(fullgraph=True, mode="max-autotune")` paths autotune shared outer `(BLOCK_M, BLOCK_N)` by forward + backward total time.
+- The Triton forward, backward preprocess, `dQ`, and `dK/dV` kernels autotune their inner launch configs independently. Backward preprocess tunes `num_warps`; `dQ` and `dK/dV` tune `num_warps` and `num_stages` with separate shared-memory pruning.
 
 ## Paper Facts
 
@@ -133,17 +135,6 @@ This split keeps write ownership simple:
 
 ## Optimization Roadmap
 
-- Update `sageattention/triton_bwd.py` to the current forward autotune API.
-  - Use shared block config `(BLOCK_M, BLOCK_N)`.
-  - Stop passing forward attention `num_warps` and `num_stages` if the forward kernel now autotunes them internally.
-  - Replace stale imports/helpers from older 4-tuple Triton configs.
-- Add trainable eager autotune.
-  - Candidate set: valid outer block configs.
-  - Benchmark objective: trainable forward + backward total time.
-  - Cache separately from inference forward autotune.
-- Add or verify inner Triton autotune for backward kernels.
-  - Keep block size fixed.
-  - Tune `num_warps`/`num_stages` separately for `dQ` and `dK/dV` if profiling shows sensitivity.
 - Save/reuse as much forward state as practical.
   - Already saves Q/K int8 and scales.
   - Consider dedicated `dO` quantization if repeated quantization dominates.
@@ -152,7 +143,7 @@ This split keeps write ownership simple:
   - Forward+backward.
   - FlashAttention comparison.
 - Expand support only after the non-causal fp16 path is stable.
-  - `head_dim=128` coverage.
+  - `head_dim=128` and `head_dim=256` correctness/performance sweeps beyond the current autotune validity coverage.
   - bf16.
   - GQA/MQA.
   - Causal mode.
@@ -160,8 +151,6 @@ This split keeps write ownership simple:
 
 ## Risks And Open Questions
 
-- The current repo forward is not the exact SageBwd forward, because it uses fp16 `P @ V` rather than int8 `P @ V`. Backward accuracy can still be developed and tested, but paper-level end-to-end equivalence may require a true SageBwd forward later.
-- `pv_accum_dtype` is a repo-specific option for the current fp16 PV forward. The paper does not provide a direct choice between this repo's `fp16` and `fp32` accumulation modes.
 - int8 quantization granularity for `P` in backward currently follows the paper's Algorithm 3 per-block description. Accuracy may still require experimenting with per-row/per-token scaling.
 - `dS` is expected to be the fragile tensor. Debug tooling should expose `dS` metrics if accuracy falls below target.
 - Long sequence performance may need additional scheduling work beyond the current split-kernel implementation.

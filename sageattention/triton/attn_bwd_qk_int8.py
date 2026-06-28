@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 
+from ..autotune_utils import _autotune_seq_len_bucket
+from .attn_bwd_autotune import _TRITON_BWD_CONFIGS, _prune_bwd_dkdv_configs, _prune_bwd_dq_configs
+
 LOG2_E = 1.44269504088896340736
 
 
@@ -16,6 +19,13 @@ def _quantize_tile_to_int8(x, mask):
     return x_int8, scale
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M"],
+)
 @triton.jit
 def _bwd_preprocess_delta(
     Out,
@@ -30,6 +40,7 @@ def _bwd_preprocess_delta(
     stride_db,
     stride_dh,
     SEQ_LEN: tl.constexpr,
+    SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -52,6 +63,13 @@ def _bwd_preprocess_delta(
     tl.store(delta_ptrs, delta, mask=mask_m)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps, num_stages in _TRITON_BWD_CONFIGS
+    ],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N", "HAS_KMEAN"],
+    prune_configs_by={"early_config_prune": _prune_bwd_dq_configs},
+)
 @triton.jit
 def _bwd_dq_kernel(
     Q,
@@ -92,6 +110,7 @@ def _bwd_dq_kernel(
     SM_SCALE,
     SM_SCALE_LOG2,
     SEQ_LEN: tl.constexpr,
+    SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -156,6 +175,13 @@ def _bwd_dq_kernel(
     tl.store(dq_ptrs, acc.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages) for num_warps, num_stages in _TRITON_BWD_CONFIGS
+    ],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "BLOCK_M", "BLOCK_N"],
+    prune_configs_by={"early_config_prune": _prune_bwd_dkdv_configs},
+)
 @triton.jit
 def _bwd_dkdv_kernel(
     Q,
@@ -197,6 +223,7 @@ def _bwd_dkdv_kernel(
     SM_SCALE,
     SM_SCALE_LOG2,
     SEQ_LEN: tl.constexpr,
+    SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -268,8 +295,6 @@ def backward(
     k_mean: torch.Tensor | None,
     BLOCK_M: int = 128,
     BLOCK_N: int = 64,
-    num_warps: int = 4,
-    num_stages: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if q.ndim != 4:
         raise ValueError("q must have shape [batch, seqlen, heads, head_dim].")
@@ -283,6 +308,7 @@ def backward(
         raise ValueError("q, k, v, and do must be contiguous NHD tensors.")
 
     batch, seq_len, heads, head_dim = q.shape
+    seq_len_bucket = _autotune_seq_len_bucket(seq_len)
 
     dq = torch.empty_like(v)
     dk = torch.empty_like(v)
@@ -303,9 +329,9 @@ def backward(
         delta.stride(0),
         delta.stride(1),
         SEQ_LEN=seq_len,
+        SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
-        num_warps=4,
     )
 
     has_kmean = k_mean is not None
@@ -361,12 +387,11 @@ def backward(
         sm_scale,
         sm_scale_log2,
         SEQ_LEN=seq_len,
+        SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         HAS_KMEAN=has_kmean,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     dkdv_grid = (triton.cdiv(seq_len, BLOCK_N), heads, batch)
@@ -410,11 +435,10 @@ def backward(
         sm_scale,
         sm_scale_log2,
         SEQ_LEN=seq_len,
+        SEQ_LEN_BUCKET=seq_len_bucket,
         HEAD_DIM=head_dim,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
     return dq, dk, dv
