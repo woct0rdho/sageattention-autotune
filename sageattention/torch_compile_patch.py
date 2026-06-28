@@ -19,6 +19,8 @@ class _CustomTimingPatch:
         self.original_subgraph_benchmark: Callable[..., float] | None = None
         self.original_subgraph_output_node: Callable[..., Any] | None = None
         self.original_benchmark_in_sub_process: Callable[..., dict[Any, float]] | None = None
+        self.installed = False
+        self.choice_preprocessor_installed = False
 
     def register(
         self,
@@ -33,6 +35,9 @@ class _CustomTimingPatch:
             self.selection_callbacks[name_prefix] = on_select
 
     def install(self) -> None:
+        if self.installed:
+            return
+
         self.original_subgraph_benchmark = SubgraphChoiceCaller.benchmark
         self.original_subgraph_output_node = SubgraphChoiceCaller.output_node
         self.original_benchmark_in_sub_process = AlgorithmSelectorCache.benchmark_in_sub_process
@@ -109,8 +114,12 @@ class _CustomTimingPatch:
         # This is an intentional classmethod monkey patch. The exact torch internal
         # signature is version-specific and too narrow for a reusable wrapper.
         setattr(AlgorithmSelectorCache, "benchmark_in_sub_process", benchmark_in_sub_process)
+        self.installed = True
 
     def install_choice_preprocessor(self) -> None:
+        if self.choice_preprocessor_installed:
+            return
+
         def custom_timing_choices_only(choices: list[Any]) -> list[Any]:
             custom_choices = [choice for choice in choices if self.timing_target_for(choice) is not None]
             if not custom_choices:
@@ -124,6 +133,7 @@ class _CustomTimingPatch:
             return custom_choices
 
         get_algorithm_selector_cache().add_preprocessing_fn(custom_timing_choices_only)
+        self.choice_preprocessor_installed = True
 
     def timing_target_for(self, choice: Any) -> TimingTarget | None:
         name = getattr(choice, "name", "")

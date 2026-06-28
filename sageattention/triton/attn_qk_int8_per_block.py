@@ -71,7 +71,7 @@ def _attn_fwd_inner(
         if IS_CAUSAL:
             if STAGE == 2:
                 mask &= offs_m[:, None] >= (start_n + offs_n[None, :])
-        qk += tl.where(mask, 0, float("-inf"))
+        qk = tl.where(mask, qk, float("-inf"))
 
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         qk -= m_ij[:, None]
@@ -83,7 +83,7 @@ def _attn_fwd_inner(
         l_i = l_i * alpha + l_ij
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n))
+        v = tl.load(V_ptrs, mask=offs_n[:, None] < (kv_len - start_n), other=0.0)
         p = p.to(tl.float16)
         if PV_ACCUM_FP32:
             acc += tl.dot(p, v, out_dtype=tl.float32)
@@ -267,15 +267,15 @@ def forward(
     v: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
-    tensor_layout: str = "HND",
-    is_causal: bool = False,
-    pv_accum_dtype: str = "fp32",
-    BLOCK_M: int = 128,
-    BLOCK_N: int = 64,
-    output_dtype: torch.dtype = torch.float16,
-    return_lse: bool = False,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    output_dtype: torch.dtype,
+    return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    o = torch.empty(q.shape, device=q.device, dtype=output_dtype)
 
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
@@ -307,9 +307,9 @@ def forward(
     num_kv_groups = h_qo // h_kv
 
     if return_lse:
-        lse = torch.empty([b, h_qo, qo_len], dtype=torch.float32, device=q.device)
+        lse = torch.empty([b, h_qo, qo_len], device=q.device, dtype=torch.float32)
     else:
-        lse = torch.empty([0], dtype=torch.float32, device=q.device)
+        lse = torch.empty([0], device=q.device, dtype=torch.float32)
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
     _attn_fwd[grid](

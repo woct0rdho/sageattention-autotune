@@ -105,9 +105,9 @@ def _check_backward(
 ) -> None:
     dq, dk, dv = actual
     dq_ref, dk_ref, dv_ref = expected
-    _check(dq, dq_ref, f"{name} dQ", 0.995, 0.08)
-    _check(dk, dk_ref, f"{name} dK", 0.995, 0.08)
-    _check(dv, dv_ref, f"{name} dV", 0.998, 0.07)
+    _check(dq, dq_ref, f"{name} dQ", 0.997, 0.07)
+    _check(dk, dk_ref, f"{name} dK", 0.997, 0.07)
+    _check(dv, dv_ref, f"{name} dV", 0.998, 0.06)
 
 
 @pytest.mark.parametrize("block_config", _make_valid_configs(), ids=str)
@@ -115,4 +115,4 @@ def test_sagebwd_triton_block_config(block_config: tuple[int, int]) -> None:
     q, k, v, dout = _make_qkvo()
     actual = _sage_backward(q, k, v, dout, block_config)
     expected = _flash_attn_backward(q, k, v, dout)
-    _check_backward(actual, expected, f"SageBwd Triton block_config={block_config}")
+    _check_backward(actual, expected, f"block_config={block_config}")

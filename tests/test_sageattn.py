@@ -56,7 +56,7 @@ def _error_report(actual: torch.Tensor, expected: torch.Tensor) -> tuple[bool, s
     fro_rel_err = (torch.linalg.vector_norm(diff) / torch.linalg.vector_norm(expected).clamp(min=1e-6)).item()
     max_abs_err = diff.abs().max().item()
 
-    passed = fro_rel_err <= 0.02 and max_abs_err <= 0.11
+    passed = fro_rel_err <= 0.014 and max_abs_err <= 0.1
     msg = f"fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
     return passed, msg
 
