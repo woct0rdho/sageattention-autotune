@@ -8,10 +8,14 @@ from .triton.attn_autotune import _valid_attn_configs
 
 _TRITON_BLOCK_CONFIGS = (
     (256, 64),
+    (128, 128),
     (128, 64),
     (128, 32),
+    (64, 128),
     (64, 64),
     (64, 32),
+    (32, 128),
+    (32, 64),
     (32, 32),
 )
 _TRITON_AUTOTUNE_CACHE: dict[object, tuple[int, int]] = {}

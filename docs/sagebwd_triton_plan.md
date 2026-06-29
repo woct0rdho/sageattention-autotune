@@ -4,7 +4,7 @@
 
 Add and tune a trainable Triton SageAttention path that follows the SageBwd design: use int8 tensor core matmuls for the backward matmuls that tolerate quantization, keep the numerically sensitive `dP = dO @ V^T` matmul in fp16/bf16 precision, and validate accuracy against FlashAttention backward.
 
-## Current Implementation Status
+## Current Scope and Implementation
 
 - Non-causal attention only.
 - Fixed-length dense tensors only.
@@ -16,9 +16,9 @@ Add and tune a trainable Triton SageAttention path that follows the SageBwd desi
 - The fused preprocess kernel computes `Delta` and pre-quantizes `dO` into `DOInt8`/`DOScale` once per Q block.
 - Both default `dK/dV` and fused backward consume pre-quantized `DOInt8`/`DOScale` instead of quantizing `dO` inside KV-owned loops.
 - The fused trainable backward uses a FlashAttention-style KV-block-owned kernel that computes `dQ`, `dK`, and `dV` from the same `P/dS` tile and accumulates `dQ` through fp32 workspace.
-- `SAGEATTN_FUSED_BLOCK=64,128` can force the eager fused path to use FlashAttention's sm86 hdim64 tile for fixed-tile optimization and profiling without adding broad autotune candidates.
+- `SAGEATTN_FUSED_BLOCK=32,128` forces the best backward-only fixed block for the local sm86 hdim64/seq4096 measurements. `SAGEATTN_FUSED_BLOCK=64,128` remains useful as the FlashAttention-style sm86 tile baseline.
 - Public APIs are `sageattn_qk_int8_pv_fp16_triton_trainable` and `sageattn_qk_int8_pv_fp16_triton_trainable_fused`. `SAGEATTN_BACKEND=triton_trainable_fused` selects the fused backend.
-- Trainable eager and `torch.compile(fullgraph=True, mode="max-autotune")` paths autotune shared outer `(BLOCK_M, BLOCK_N)` by forward + backward total time.
+- Trainable eager and `torch.compile(fullgraph=True, mode="max-autotune")` paths autotune one shared outer `(BLOCK_M, BLOCK_N)` by forward + backward total time. The shared candidate list includes the original forward-oriented blocks plus fused-oriented `(32,64)`, `(32,128)`, `(64,128)`, and `(128,128)`. Future work may tune forward and backward separately and decouple quantization block size from matmul tile size, but optimization is backward-only.
 - The Triton forward, backward preprocess, default `dQ`, default `dK/dV`, and fused kernels autotune their inner launch configs independently. Backward preprocess and fused `DQAccum` utility kernels tune `num_warps`. Default `dQ`, default `dK/dV`, and fused tune `num_warps` and `num_stages` with shared-memory pruning.
 
 ## Paper Facts
@@ -62,26 +62,26 @@ Reported speed goals:
 
 ## `pv_accum_dtype` Note
 
-The paper does not map SageBwd to this repo's `pv_accum_dtype` option. In the paper, SageBwd forward uses int8 quantization for `P @ V`. This repo currently has `qk_int8_pv_fp16` forward with `pv_accum_dtype="fp32"` or `"fp16"`, and does not yet implement the fp8/int8 `P @ V` path known from SageAttention2++ or SageBwd.
+The paper does not map SageBwd to this repo's `pv_accum_dtype` option. In the paper, SageBwd forward uses int8 quantization for `P @ V`. This repo has `qk_int8_pv_fp16` forward with `pv_accum_dtype="fp32"` or `"fp16"`, and does not yet implement the fp8/int8 `P @ V` path known from SageAttention2++ or SageBwd.
 
-For the current backward implementation:
+For the backward implementation:
 - Use `pv_accum_dtype="fp32"` as the default forward setting for correctness tests, because it minimizes unrelated forward accumulation error and isolates the backward kernel.
 - Keep test coverage for `pv_accum_dtype="fp16"` as a performance-relevant mode after the trainable autotune path is stable.
-- Do not block the backward work on `pv_accum_dtype="fp8"`. It is not implemented in this repo and is outside the current scope.
+- Do not block the backward work on `pv_accum_dtype="fp8"`. It is not implemented in this repo and is outside the scope.
 - Accuracy numbers may differ from the paper until the forward path also matches SageBwd's int8 `P @ V` design.
 
 ## Kernel Architecture
 
 ### Forward
 
-The trainable wrapper currently uses the Triton forward path:
+The trainable wrapper uses the Triton forward path:
 
 ```text
 q, k -> per_block_int8 -> q_int8, q_scale, k_int8, k_scale
 q_int8, k_int8, v, scales -> Triton forward -> out, lse
 ```
 
-The forward pass saves the quantized tensors and scales for backward. Shared quantization currently uses `max(abs(x)) / 127.5 + 1e-7` with PTX round-to-nearest conversion and no extra clamp, because local accuracy checks showed this gives lower practical quantization error than clamped `127.0` variants.
+The forward pass saves the quantized tensors and scales for backward. Shared quantization uses `max(abs(x)) / 127.5 + 1e-7` with PTX round-to-nearest conversion and no extra clamp, because local accuracy checks showed this gives lower practical quantization error than clamped `127.0` variants.
 
 ### Backward Preprocess
 
@@ -169,155 +169,190 @@ dQ_i partial = int8(dS_ij) @ int8(k_j) * dS_scale * k_scale_j
 - If the requested split count covers all KV blocks, the fused kernel uses stores instead of reductions for `dQ` partials.
 - On the local sm86 validation machine, split counts greater than `1` were correct but slower for the benchmarked 2048/4096/8192 sequence lengths, so the default remains `1`.
 
+### Asymptotic MMA Cost Model
+
+Assume one full attention-sized fp16 tensor-core matmul costs `G`, int8 tensor-core matmul has exactly 2x fp16 throughput, and non-MMA overheads vanish as sequence length grows. FlashAttention forward performs `QK` and `PV`, so use `2G` as the ratio baseline.
+
+| Path | Dominant MMA work | Ideal time | Ratio to FlashAttention forward |
+|---|---:|---:|---:|
+| FlashAttention forward | `QK fp16 + PV fp16` | `2G` | `1.00x` |
+| FlashAttention backward | `QK recompute + dP + dV + dQ + dK`, all fp16 | `5G` | `2.50x` |
+| SageAttention forward | `QK int8 + PV fp16` | `1.5G` | `0.75x` |
+| SageAttention fused backward | `QK int8 + dV int8 + dP fp16 + dK int8 + dQ int8` | `3G` | `1.50x` |
+
+This model predicts SageAttention fused backward should asymptotically take `3G / 5G = 0.60x` FlashAttention backward, or be about `1.67x` faster, if the implementation keeps tensor cores saturated and avoids non-MMA bottlenecks. If the repo later adds an int8/low-precision `PV` forward path, SageAttention forward's ideal ratio would drop from `0.75x` to `0.50x`.
+
 ## Local Profiling Findings
 
-Latest profiling used Nsight Compute 2026.2 on the local sm86 machine with `batch=1`, `heads=16`, `head_dim=64`, `seq_len=4096`, non-causal fp16.
+Nsight Compute 2026.2 measurements below were taken on the local sm86 machine with `batch=1`, `heads=16`, `head_dim=64`, `seq_len=4096`, non-causal fp16 unless noted.
 
-Representative public benchmark after standalone `dO` pre-quantization, before fused preprocess was added:
+Public backward-only comparison for the local target shape (`warmup=8`, `repeats=30`, `SAGEATTN_FUSED_BLOCK=32,128`, `SAGEATTN_FUSED_DQ_SPLITS=1` for Sage):
 
-| Method | Forward ms | Backward ms | Total ms |
-|---|---:|---:|---:|
-| FlashAttention | 1.984 | 4.667 | 6.651 |
-| Sage default | 1.303 | 6.035 | 7.338 |
+| Method | Forward ms | Backward ms | Total ms | Backward vs Flash |
+|---|---:|---:|---:|---:|
+| FlashAttention | 2.221 | 4.972 | 7.193 | `1.00x` |
+| Sage fused `(32,128)` | 1.967 | 5.377 | 7.344 | `1.081x` slower |
 
-Fixed-tile fused benchmark after the first fixed `(64,128)` optimization pass (`SAGEATTN_FUSED_BLOCK=64,128`, `SAGEATTN_FUSED_DQ_SPLITS=1`, `seq_len=4096`, `warmup=5`, `repeats=20`):
+Fused autotune snapshot after adding fused-oriented block candidates (`SAGEATTN_FUSED_DQ_SPLITS=1`, `warmup=8`, `repeats=20` for hdim64):
+
+| Shape | Selected block | Forward ms | Backward ms | Total ms |
+|---|---:|---:|---:|---:|
+| hdim64, seq4096 | `(32,128)` | 1.842 | 5.857 | 7.698 |
+| hdim128, seq4096 | `(32,64)` | 3.001 | 13.813 | 16.814 |
+| hdim256, seq4096 | `(32,64)` | 7.758 | 33.728 | 41.486 |
+
+Backward-only PyTorch-profiler snapshot with forward computed outside the timed region (`SAGEATTN_FUSED_BLOCK=32,128`, `SAGEATTN_FUSED_DQ_SPLITS=1`):
+
+| Method | Event-timed bwd mean | Profiler CUDA total | Main backward kernel | Utility kernels |
+|---|---:|---:|---:|---:|
+| Sage fused `(32,128)` | 5.438 ms | 4.495 ms | `_bwd_fused_kernel=4.286 ms` | zero 50 us, preprocess 73 us, convert 86 us |
+| FlashAttention | 4.673 ms | 4.462 ms | `flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel=4.262 ms` | dot-do-o 114 us, convert 86 us |
+
+NCU replay snapshot for fixed `(32,128)` Sage fused versus FlashAttention (`batch=1`, `heads=16`, `head_dim=64`, `seq_len=4096`):
+
+| Kernel | Time ms | Registers/thread | Dynamic smem | SM throughput | Active warps | DRAM throughput | RED requests | RED sectors | L2 read sectors | L2 write sectors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Sage `_bwd_fused_kernel` `(32,128)` | 6.433 | 255 | 49.412 KiB | 65.18% | 15.85% | 3.56% | 4.19M | 16.78M | 17.70M | 0.52M |
+| FlashAttention main backward | 5.748 | 255 | 73.728 KiB | 44.73% | 16.66% | 4.20% | 4.19M | 16.78M | 17.83M | 0.52M |
+| Sage zero/preprocess/convert total | 0.148 | 16-40 | <=0.128 KiB | 4.95-20.14% | 71.44-89.53% | ~90% | 0 | 0 | ~1.05M | ~0.93M |
+| Flash dot-do-o/convert total | 0.141 | 34-42 | <=8.192 KiB | 9.95-15.75% | 75.51-85.33% | ~90% | 0 | 0 | ~1.05M | ~0.80M |
+
+The exact profiler and NCU timings vary by tool/replay mode, but both show the same direction: utility kernels are small, `DQAccum` RED traffic is similar to FlashAttention at this shape, and the main Sage fused loop is the remaining bottleneck.
+
+Earlier fixed-tile fused snapshot after the first `(64,128)` optimization pass (`SAGEATTN_FUSED_BLOCK=64,128`, `SAGEATTN_FUSED_DQ_SPLITS=1`, `warmup=5`, `repeats=20`):
 
 | Method | Forward ms | Backward ms | Total ms |
 |---|---:|---:|---:|
 | FlashAttention | 2.240 | 14.720 | 16.960 |
 | Sage fused `(64,128)` | 1.275 | 7.872 | 9.147 |
 
-Default-backend kernel replay NCU summary after standalone `dO` pre-quantization, before fused preprocess was added:
+Earlier optimized fixed-tile `(64,128)` fused-kernel NCU snapshot:
 
-| Kernel | Time ms | Tensor core activity | Registers/thread | Notes |
-|---|---:|---:|---:|---|
-| FlashAttention main backward | 5.749 | HMMA ~45.7% | 255 | seq-k-parallel fused `dQ/dK/dV` kernel |
-| Sage `dQ` | 2.401 | IMMA/HMMA ~21.9% | 255 | owns Q block, no atomics |
-| Sage `dK/dV` | 4.907 | IMMA ~16.0%, HMMA ~10.7% | 235 | current dominant kernel |
-| Sage fused preprocess + `dO` quant | not re-profiled | none | not re-profiled | computes `delta`, `DOInt8`, and `DOScale` in one launch |
+| Kernel | Time ms | Registers/thread | Dynamic smem | Occupancy | SM throughput | DRAM throughput | IMMA active | HMMA active |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `_bwd_fused_kernel` `(64,128)` | 10.199 | 255 | 61,956 B | 8.36% | 39.47% | 7.15% | 10.35% | 5.17% |
 
-Matched FlashAttention-vs-fused reduction profiling used the same shape and matched Sage fused to FlashAttention's observed main backward tile `(BLOCK_M=64, BLOCK_N=128)`. Nsight Compute reports the `dQ_accum` updates as global reduction operations, not global atom operations.
+Reduction-traffic comparison for the matched FlashAttention tile `(BLOCK_M=64, BLOCK_N=128)`:
 
 | Kernel | Main Kernel Time ms | Global Reduction Bytes | Global Reduction Requests | LTS Reduction-Active Cycles | Notes |
 |---|---:|---:|---:|---:|---|
 | FlashAttention main backward | 5.745 | 536.9 MB | 4.19M | 16.78M | `flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel`, grid 512, block 256 |
-| Sage fused `(64,128)`, split 1 | 16.720 | 2.147 GB | 4.19M | 67.11M | Uses global reductions for `DQAccum` |
-| Sage fused `(64,128)`, split 32 | 15.743 | 0 | 0 | 0 | Store-only main-kernel path. Final split reduction still needed outside this kernel |
-| Sage fused optimized `(64,128)`, split 1 | 10.233 | 2.147 GB | 4.19M | 67.11M | Same `DQAccum` RED volume as the earlier split-1 path. Speedup comes from scheduling/live-range changes |
+| Sage fused `(64,128)`, split 1 baseline | 16.720 | 2.147 GB | 4.19M | 67.11M | Uses global reductions for `DQAccum` |
+| Sage fused `(64,128)`, split 32 | 15.743 | 0 | 0 | 0 | Store-only main-kernel path. Final split reduction needed outside this kernel |
+| Sage fused optimized `(64,128)`, split 1 | 10.233 | 2.147 GB | 4.19M | 67.11M | Same RED volume as baseline. Speedup came from scheduling/live-range changes |
+
+Useful historical checkpoints:
+
+| Checkpoint | Observation |
+|---|---|
+| Default split backend before fused preprocess | `_bwd_dkdv_kernel` was the main bottleneck at `seq_len=4096`. Standalone `dO` pre-quantization moved NCU replay from roughly `5.65 ms` to `4.91 ms` |
+| Standalone `dO` pre-quantization public benchmark | FlashAttention `fwd=1.984 ms`, `bwd=4.667 ms`, `total=6.651 ms`. Sage default `fwd=1.303 ms`, `bwd=6.035 ms`, `total=7.338 ms` |
+| First fixed fused baseline | FlashAttention `fwd=2.241 ms`, `bwd=14.011 ms`, `total=16.252 ms`. Sage fused `(64,128)` `fwd=1.323 ms`, `bwd=15.406 ms`, `total=16.729 ms`. NCU `_bwd_fused_kernel=16.260 ms`, `255` registers/thread, `87,564 B` dynamic smem, `8.30%` occupancy |
 
 Measured conclusions:
-- Default split-backend profiling found `_bwd_dkdv_kernel` was the main default-backend bottleneck at `seq_len=4096`, and pre-quantizing `dO` moved it from roughly `5.65 ms` to `4.91 ms` in NCU kernel replay.
-- The fused backend is now the primary optimization target because its fused KV-owned structure most closely matches FlashAttention backward: it computes `dQ`, `dK`, and `dV` from the same score/probability tiles instead of recomputing them in separate split kernels.
-- Matched `(64,128)` profiling shows Sage fused has roughly `4x` FlashAttention's global reduction bytes/sectors and LTS reduction-active cycles for `DQAccum`, but a Sage split-1 vs split-32 A/B changes main-kernel time by only about `5.8%`, so reductions are not the only bottleneck.
-- A high-level physical `DQAccum` layout-only experiment did not reduce global reduction bytes, requests, sectors, or LTS reduction-active cycles. The optimized fixed-tile fused kernel also keeps the same split-1 RED volume (`2.147 GB`, `4.19M` requests, `67.11M` sectors), so the measured speedup is from scheduling/live-range changes rather than less global reduction traffic.
-- The next performance gap is structural: raise tensor-core utilization and reduce register/scheduling pressure in the fused kernel, not split `dK` and `dV` into separate kernels.
+- Fused is the primary optimization target because its KV-owned structure matches FlashAttention backward: one score/probability tile feeds `dQ`, `dK`, and `dV` instead of recomputing tiles in split kernels.
+- Best fixed backward block on the local sm86 hdim64/seq4096 target is `(32,128)`, not the FlashAttention-style `(64,128)` tile. With this block, public backward is about `8.1%` slower than FlashAttention (`5.377 ms` vs `4.972 ms`).
+- The main fused kernel is the bottleneck. Utility kernels are roughly the same total size as FlashAttention's utility kernels, and split-1 `DQAccum` RED requests/sectors match FlashAttention for fixed `(32,128)` in the NCU run.
+- The main issue is not raw algorithmic work or DRAM bandwidth. Sage fused does 4 of 5 backward matmuls with int8 MMA but has a slower main-kernel replay than FlashAttention, pointing to register pressure, live ranges, layout conversions, tensor-core scheduling, and lack of explicit CUTE-style copy/MMA layout control.
+- Split-plane `DQAccum` and high-level physical layout changes did not improve total behavior enough on sm86. Reduction work is real, but profiler data says it is not the first bottleneck to attack.
 
 ## Low-Level Source Notes
 
 FlashAttention and Triton source review gives the following optimization constraints and opportunities:
 
 - FlashAttention's hdim64 backward uses a KV-owned sequence-parallel kernel with separate CUTE MMA layouts for `S/dP`, `dK/dV`, and `dQ`. On large-smem GPUs it prefers `(BLOCK_M=128, BLOCK_N=128, num_warps=8)`. On sm86/sm89 it uses `(64,128,8)` with `V` in registers to fit shared memory.
-- FlashAttention comments call out `(128,64)` as slow because it doubles `dQAccum` traffic, and use smaller `M` to reduce `LSE`/row-state register pressure. This matches the local observation that fused should prioritize `N >= M`, especially `(64,128)` for `HEAD_DIM=64`.
+- FlashAttention comments call out `(128,64)` as slow because it doubles `dQAccum` traffic, and use smaller `M` to reduce `LSE`/row-state register pressure. Local bwd-only measurements favor `(32,128)` for hdim64/seq4096, while `(64,128)` remains the matched FlashAttention-style tile.
 - FlashAttention explicitly double-buffers `Q/dO`, stages `K/V` with `cp.async`, writes `P/dS` through shared memory, and overlays shared-memory regions so `P`, `dS`, and `dQ` do not all occupy independent storage for the whole loop.
 - Triton's int8 dot lowering on Ampere targets `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`, so the expected 2x int8-MMA arithmetic advantage is available if the generated schedule keeps IMMA fed and avoids excess fp32 live ranges/conversions.
-- Triton exposes useful first-line scheduling controls in Python: `tl.range(num_stages=..., disallow_acc_multi_buffer=..., flatten=..., disable_licm=...)`, `num_warps`, `num_stages`, and `Config.maxnreg`. `warp_specialize` is not a near-term sm86 lever because current Triton documents it as Blackwell/simple-matmul oriented.
+- Triton exposes useful first-line scheduling controls in Python: `tl.range(num_stages=..., disallow_acc_multi_buffer=..., flatten=..., disable_licm=...)`, `num_warps`, and `num_stages`. `warp_specialize` is not a near-term sm86 lever because Triton documents it as Blackwell/simple-matmul oriented.
 - Triton does not expose CUTE-style per-MMA atom layouts or warp-contiguous global copy layouts for arbitrary attention kernels. If Triton-level tuning stalls, likely compiler work is layout/scheduler exposure around DotI8, ldmatrix/stmatrix, and loop live-range control rather than another high-level tensor layout change.
+- AITER's CK-style FMHA backward generators similarly expose explicit tile/pipeline traits for dot-do-o, convert-dQ, and dq/dk/dv paths. This reinforces that high-performance attention backward implementations tend to control per-phase tile layout and pipeline structure below the abstraction level available in this Triton kernel.
 
 ## Optimization Roadmap
 
-### Optimize Now
+### Experiments Done
 
-- Re-profile the current code first.
-  - Measure total forward+backward and isolated backward for FlashAttention, Sage default, and Sage fused after fused preprocess/`dO` quantization and even-shape specialization.
-  - Record `_bwd_fused_kernel` NCU counters for kernel time, registers/thread, spills, achieved occupancy, SM active, IMMA/HMMA active, issue-stall reasons, shared-memory load/store throughput, L2/DRAM traffic, and global reduction counters.
-  - Use shapes `seq_len=2048/4096/8192`, `batch=1`, `heads=16`, `head_dim=64` as the primary loop, then confirm trends on `head_dim=128`.
-- Use FlashAttention's sm86 hdim64 tile as the fixed optimization baseline.
-  - Completed: eager benchmarking/profiling can force `(BLOCK_M=64, BLOCK_N=128)` with `SAGEATTN_FUSED_BLOCK=64,128` or `bench/bench_fwd_bwd.py --fused-block 64,128`.
-  - Completed: focused correctness for the fixed `(64,128)` fused tile passes against FlashAttention backward.
-  - Measured after fixed-tile plumbing plus first live-range/scheduling cleanup at `seq_len=4096`: FlashAttention public benchmark `fwd=2.241 ms`, `bwd=14.011 ms`, `total=16.252 ms`. Sage fused fixed `(64,128)`, `DQ_SPLITS=1`, `fwd=1.323 ms`, `bwd=15.406 ms`, `total=16.729 ms`.
-  - Measured NCU for the current fixed `(64,128)` fused main kernel: `_bwd_fused_kernel=16.260 ms`, `registers/thread=255`, dynamic shared memory `87,564 B/block`, achieved occupancy `8.30%`, SM throughput `29.14%`, DRAM throughput `64.64%`, IMMA active `6.53%` with `16.78M` IMMA instructions, HMMA active `3.26%` with `8.39M` HMMA instructions.
-  - Optimize and profile the fused kernel at `(BLOCK_M=64, BLOCK_N=128)` before changing the block search space.
-  - Keep `DQ_SPLITS=1` for the first optimization loop so kernel-structure changes are not confounded with split-workspace utility costs.
-  - Treat `(64,128)` as the source-of-truth comparison against FlashAttention's hdim64 sequence-parallel backward kernel on sm86/sm89.
-- Reduce fused-kernel live ranges in Triton.
-  - Rewrite the inner loop so `qk`, `p`, `dp`, and `ds` share storage/lifetime as aggressively as Triton allows: compute `P`, immediately quantize `P` for `dV`, then overwrite score/probability temporaries with `dP`/`dS` before quantizing `dS`.
-  - Completed and measured: avoid one extra fp32 tile name by reusing the `dP` tile variable as `dS` instead of materializing a separate `ds` tensor. Fixed `(64,128)` correctness passes, but NCU still reports `255` registers/thread, so further structural pressure reduction is needed.
-  - Completed and measured: the fused Q-block loop now uses `tl.range(..., disable_licm=True)` to prevent hoisted loop-invariant address/scale expressions from lengthening register live ranges. Current fixed-tile NCU still shows low occupancy and low tensor-core active percentages.
-  - Completed and measured: moved `DOInt8` load to just before `dV` and fp16 `DO` load to just before `dP`, shortening `dO` live ranges. Fixed `(64,128)` correctness passes. Public benchmark initially improved from `bwd=13.791 ms`, `total=15.251 ms` to `bwd=13.417 ms`, `total=14.932 ms`. NCU `_bwd_fused_kernel=13.309 ms`, dynamic shared memory dropped from `81,920 B` to `49,152 B`, occupancy `15.95%`, SM throughput `35.85%`, DRAM throughput `87.04%`, IMMA active `7.93%`, HMMA active `3.96%`, registers remain `255/thread`.
-  - Re-measured after reverting the rejected Q-reload experiment: fixed `(64,128)` correctness still passes, NCU remains low-smem with `_bwd_fused_kernel=14.051 ms`, `255` registers/thread, `49,152 B` dynamic shared memory, `16.24%` occupancy, `34.15%` SM throughput, `7.76%` IMMA active, `3.88%` HMMA active, but public benchmark showed `bwd=15.442 ms`, `total=16.787 ms`. Treat the earlier `13.417 ms` public result as a best observed value and continue measuring repeated latency after each change.
-  - Rejected and reverted: reloading `Q` separately for `QK` and `dK` to shorten the Q tile live range passed correctness but regressed public fixed `(64,128)` benchmark to `bwd=15.164 ms`, `total=16.627 ms`. NCU `_bwd_fused_kernel=17.115 ms`, `255` registers/thread, dynamic shared memory increased to `69,632 B`, occupancy `16.67%`, SM throughput `48.50%`, IMMA active `9.30%`, HMMA active `6.20%`.
-  - Rejected and reverted: reusing the `qk` variable as the probability tile passed correctness but regressed public fixed `(64,128)` benchmark to `bwd=15.932 ms`, `total=17.261 ms`. NCU was effectively unchanged from the restored state with `_bwd_fused_kernel=14.046 ms`, `255` registers/thread, `49,152 B` dynamic shared memory, `16.23%` occupancy, `34.03%` SM throughput, `7.75%` IMMA active, `3.88%` HMMA active.
-  - Completed and measured: `tl.range(..., disallow_acc_multi_buffer=True)` passes fixed `(64,128)` correctness and improves public benchmark at `seq_len=4096`, `DQ_SPLITS=1`, fixed `(64,128)` from `bwd=14.396 ms`, `total=15.759 ms` to `bwd=13.791 ms`, `total=15.251 ms`. NCU remains effectively unchanged versus the 8-warp run: `_bwd_fused_kernel=16.694 ms`, `255` registers/thread, `81,920 B` dynamic shared memory, `16.86%` occupancy, `49.09%` SM throughput, `9.67%` IMMA active, `6.45%` HMMA active.
-  - Completed and measured: compute `rowsum(dS)` immediately after forming the fp32 `dS` tile, before the `dK` and `dQ` int8 matmuls, so `dS` does not need to stay live across both tensor-core dots solely for the K-mean correction. Fixed `(64,128)` correctness passes. Public benchmark improved to `bwd=7.728 ms`, `total=9.047 ms`. NCU `_bwd_fused_kernel=10.199 ms`, `255` registers/thread, `61,956 B` dynamic shared memory, `8.36%` occupancy, `39.47%` SM throughput, DRAM throughput `7.15%`, IMMA active `10.35%`, HMMA active `5.17%`.
-- Improve scheduling before changing algorithms.
-  - Completed and measured: fused inner autotune now includes 8-warp configs while keeping the outer fixed tile `(64,128)`. Correctness passes. Public benchmark at `seq_len=4096`, `DQ_SPLITS=1`, fixed `(64,128)` improved from `bwd=15.406 ms`, `total=16.729 ms` to `bwd=14.396 ms`, `total=15.759 ms`.
-  - 8-warp NCU kernel replay changed `_bwd_fused_kernel` from block size `128` to `256`, dynamic shared memory from `87,564 B` to `81,920 B`, occupancy from `8.30%` to `16.83%`, SM throughput from `29.14%` to `49.06%`, IMMA active from `6.53%` to `9.67%`, and HMMA active from `3.26%` to `6.45%`. Registers remain `255/thread`. Kernel-replay time was `16.723 ms` versus prior `16.260 ms`, so continue judging with public latency plus NCU resource counters.
-  - Added `SAGEATTN_FUSED_INNER=warps,stages` as a narrow experiment/profiling override for fused inner configs without changing block-size autotune.
-  - Measured forced `SAGEATTN_FUSED_INNER=8,2` at fixed `(64,128)`: correctness passes, but public benchmark regresses to `bwd=16.728 ms`, `total=18.107 ms`. NCU `_bwd_fused_kernel=18.253 ms`, `255` registers/thread, `82,436 B` dynamic shared memory, `16.61%` occupancy, `47.01%` SM throughput, `8.68%` IMMA active, `5.79%` HMMA active. Do not force `(8,2)`.
-  - Measured forced `SAGEATTN_FUSED_INNER=8,1` at fixed `(64,128)`: correctness passes, but public benchmark `bwd=14.327 ms`, `total=15.659 ms` is slower than free autotune with `disallow_acc_multi_buffer=True`. NCU `_bwd_fused_kernel=16.693 ms`, `255` registers/thread, `81,920 B` dynamic shared memory, `16.74%` occupancy, `49.10%` SM throughput, `9.65%` IMMA active, `6.43%` HMMA active. Do not force `(8,1)` as a default.
-  - Measured forced `SAGEATTN_FUSED_INNER=4,1` at fixed `(64,128)`: correctness passes, but public benchmark regresses to `bwd=18.555 ms`, `total=19.912 ms`. NCU `_bwd_fused_kernel=14.085 ms`, `255` registers/thread, `49,152 B` dynamic shared memory, `16.25%` occupancy, `33.99%` SM throughput, `7.76%` IMMA active, `3.88%` HMMA active. Do not force `(4,1)`.
-  - Measured remaining forced 4-warp stages at fixed `(64,128)`: `(4,2)` correctness passes with public `bwd=13.701 ms`, `total=15.138 ms`, NCU `_bwd_fused_kernel=15.208 ms`, `255` registers/thread, `61,956 B` dynamic shared memory, `8.33%` occupancy. `(4,3)` correctness passes with public `bwd=14.188 ms`, `total=15.534 ms`. `(4,4)` correctness passes but regresses to public `bwd=18.359 ms`, `total=19.664 ms`.
-  - Added a shape-specific preferred fused inner config `(num_warps=4, num_stages=2)` for fixed `(64,128, head_dim=64)` unless `SAGEATTN_FUSED_INNER` is set. Correctness passes. Longer public run still showed high variance/regression (`bwd=17.700 ms`, `total=19.014 ms`), with NCU confirming the expected `(4,2)` kernel: `_bwd_fused_kernel=15.236 ms`, `255` registers/thread, `61,956 B` dynamic shared memory, `8.36%` occupancy, `31.04%` SM throughput, `7.02%` IMMA active, `3.51%` HMMA active.
-  - Retune or constrain `num_stages=1/2/3/4` at fixed `(64,128)` after deeper live-range changes. High stages can improve load overlap but also increase shared-memory footprint and register pressure in this fused loop.
-  - Added `SAGEATTN_FUSED_MAXNREG` as a profiling-only hook that passes `Config.maxnreg` to fused inner configs.
-  - Rejected as default: `SAGEATTN_FUSED_MAXNREG=224` at fixed `(64,128)` passes correctness and lowers reported `_bwd_fused_kernel` registers from `255` to `224`, but public benchmark regresses to `bwd=16.831 ms`, `total=18.286 ms`. NCU `_bwd_fused_kernel=17.037 ms`, `49,152 B` dynamic shared memory, `16.26%` occupancy, `30.28%` SM throughput, `6.37%` IMMA active, `3.19%` HMMA active. Keep maxnreg as an experiment knob only.
-  - Inspect generated TTIR/PTX/SASS for the fixed `(64,128)` fused kernel to verify the int8 paths are actual IMMA instructions and to count extra `convert_layout`, local-memory spill, and fp32 conversion instructions.
-- Increase effective int8-MMA share.
-  - Keep `dP = dO @ V^T` as the only fp16/bf16 backward matmul. The four quantization-tolerant matmuls should stay on int8 MMA.
-  - Profile the fraction of tensor-core cycles spent in IMMA versus HMMA. If HMMA `dP` or pointwise/quantization work dominates, optimize the schedule and tile shape before considering new kernel splits.
-  - Check whether `tl.dot(..., acc=...)` or accumulator ordering can reduce temporary dot results for `dK`, `dV`, or `dQ`. Per-tile scale factors still require care because they vary by Q/KV block.
+- Fixed fused tile control and autotune expansion.
+  - `SAGEATTN_FUSED_BLOCK=64,128` forces the eager fused path to FlashAttention's sm86 hdim64 tile.
+  - `SAGEATTN_FUSED_BLOCK=32,128` forces the best local bwd-only hdim64/seq4096 tile.
+  - Focused correctness for `(64,128)` passes against FlashAttention backward.
+  - Added fused-oriented shared outer block candidates `(32,64)`, `(32,128)`, `(64,128)`, and `(128,128)`. Correctness passed without loosening tolerances.
+  - Sequential hdim64 fwd+bwd benchmark with the expanded list selected `(32,128)` and measured `fwd=1.842 ms`, `bwd=5.857 ms`, `total=7.698 ms`, faster than fixed `(64,128)` (`total=8.819 ms`) and fixed `(128,128)` (`total=8.772 ms`) in the same run.
+  - hdim128 and hdim256 default fused autotune selected `(32,64)`, matching the best fixed candidates tested for those head dims.
+  - Keep `SAGEATTN_FUSED_DQ_SPLITS=1` for fixed-tile optimization unless specifically measuring split-workspace behavior.
+- Fused preprocess and `dO` pre-quantization.
+  - Fused preprocess computes `Delta`, `DOInt8`, and `DOScale` once per Q block.
+  - This removed repeated `dO` quantization inside KV-owned loops and improved the default split `dK/dV` replay from roughly `5.65 ms` to `4.91 ms` at `seq_len=4096`.
+- Fused-kernel live-range/scheduling changes.
+  - `tl.range(..., disable_licm=True)` prevents hoisted loop-invariant address/scale expressions from lengthening live ranges and remains useful after the later live-range changes. Retest at forced `(4,2)` fixed `(64,128)` showed removing it regressed `bwd=8.105 ms` to `8.928 ms`.
+  - `tl.range(..., disallow_acc_multi_buffer=True)` was useful earlier (`bwd=14.396 ms` to `13.791 ms`) but was retested after later live-range changes and removed. At forced `(4,2)` fixed `(64,128)`, keeping only `disable_licm=True` measured `bwd=8.029 ms` versus `8.105 ms` with both hints.
+  - Moving `DOInt8` load to just before `dV` and fp16 `DO` load to just before `dP` shortened `dO` live ranges. Best observed public result after this change was `bwd=13.417 ms`, `total=14.932 ms`. NCU dropped dynamic smem to `49,152 B` with `_bwd_fused_kernel=13.309 ms`, but repeated public runs showed variance.
+  - Computing `rowsum(dS)` immediately after forming fp32 `dS`, before the `dK` and `dQ` int8 matmuls, was the strongest win. Public benchmark improved to `bwd=7.728 ms`, `total=9.047 ms`. NCU `_bwd_fused_kernel=10.199 ms`, `61,956 B` dynamic smem, `39.47%` SM throughput, `10.35%` IMMA active, `5.17%` HMMA active.
+- Rejected live-range experiments.
+  - Reloading `Q` separately for `QK` and `dK` passed correctness but regressed public fixed `(64,128)` to `bwd=15.164 ms`, `total=16.627 ms`. NCU `_bwd_fused_kernel=17.115 ms`, dynamic smem `69,632 B`.
+  - Reusing the `qk` variable as the probability tile passed correctness but regressed public fixed `(64,128)` to `bwd=15.932 ms`, `total=17.261 ms`. NCU was effectively unchanged from the restored state.
+- Inner-config scheduling experiments.
+  - Adding 8-warp candidates improved one early public `(64,128)` run from `bwd=15.406 ms`, `total=16.729 ms` to `bwd=14.396 ms`, `total=15.759 ms`, but NCU replay did not improve main-kernel time and free selection was noisy.
+  - `SAGEATTN_FUSED_INNER=warps,stages` is available for forced experiments. For fixed `(32,128)`, a sequential forced sweep measured `(4,2)` best (`bwd=5.238 ms`, `total=7.018 ms`), `(4,1)` close (`bwd=5.365 ms`), and all 8-warp variants slower (`bwd=8.001-8.800 ms`).
+  - No implicit fixed `(4,2)` preference is kept. By default the fused kernel exposes all valid inner configs to Triton autotune, and `SAGEATTN_FUSED_INNER` is the explicit override path.
+  - A temporary `maxnreg=224` cap lowered reported registers from `255` to `224` but regressed public runtime to `bwd=16.831 ms`, `total=18.286 ms`. No max-register runtime override is kept.
+- `DQAccum` experiments.
+  - Split-plane `DQAccum` with split count covering all KV blocks removes main-kernel RED traffic, but total behavior was slower once zero/convert/reduce utility costs are considered.
+  - A high-level physical `DQAccum` layout experiment did not reduce global RED bytes, requests, sectors, or LTS reduction-active cycles and was reverted.
+  - Optimized split-1 fused has the same `DQAccum` RED volume as the baseline, confirming the speedup came from scheduling/live-range changes.
+
+### Next Steps
+
+- Focus optimization on backward-only fixed-block measurements.
+  - Use `SAGEATTN_FUSED_BLOCK=32,128`, `SAGEATTN_FUSED_INNER=4,2`, and `SAGEATTN_FUSED_DQ_SPLITS=1` for the local hdim64/seq4096 bwd-only optimization loop unless a change specifically targets tile selection.
+  - Keep `SAGEATTN_FUSED_BLOCK=64,128` as the matched FlashAttention-style tile baseline, not as the fastest local bwd-only tile.
+  - Compare each change with public backward latency and NCU kernel replay because public benchmark, profiler, and replay can disagree under autotune/cache/driver variance.
+  - Primary shapes remain `seq_len=2048/4096/8192`, `batch=1`, `heads=16`, `head_dim=64`. Confirm promising changes on `head_dim=128`.
+- Reduce `_bwd_fused_kernel` register pressure and layout pressure.
+  - Best fixed `(32,128)` main kernel reports `255` registers/thread and about `16%` active-warps occupancy, so useful changes should shorten fp32 tile/scalar live ranges or reduce layout-conversion pressure.
+  - Inspect TTIR/PTX/SASS for local-memory spills, extra `convert_layout`, redundant fp32 conversions, and whether int8 paths are clean IMMA instructions.
+  - Revisit `tl.dot(..., acc=...)`, accumulator update ordering, and scale application placement if they reduce temporary dot results without changing per-tile scale semantics.
+- Improve tensor-core scheduling and memory staging at the same fixed tile.
+  - Try `.cg` cache modifiers on streaming global loads for Q/K/V/dO, matching FlashAttention's cache-global strategy.
+  - Retune `num_warps`/`num_stages` after structural changes using `SAGEATTN_FUSED_INNER` for forced measurements, but do not assume 8 warps helps. Fixed `(32,128)` favors `(4,2)`.
+  - Track IMMA/HMMA activity separately. `dP = dO @ V^T` should remain the only fp16/bf16 matmul. The other four backward matmuls should stay on int8 MMA unless a deliberately mixed-precision experiment such as fp16 `dV` is being tested.
+  - Prototype fp16 `dV` only as a register/scheduling experiment: it loses one int8 MMA in the theoretical model, but may reduce `P` quantization and int8 scale live ranges enough to be informative on sm86.
 - Keep the default split backend conservative.
-  - Use the default `dQ` plus `dK/dV` split backend for correctness and as a no-`DQAccum` baseline.
-  - Do not prioritize separate `dV-only` and `dK-only` kernels now. FlashAttention's fastest path is fused, and the local gap is scheduling/register/tensor-core utilization rather than lack of more split kernels.
+  - Use default `dQ` plus `dK/dV` as a correctness and no-`DQAccum` baseline.
+  - Do not prioritize separate `dV-only` and `dK-only` kernels. FlashAttention's fastest path is fused, and the gap is scheduling/register/tensor-core utilization.
 
 ### Revisit After Optimization
 
-- Revisit `DQAccum` only after fused-kernel scheduling improves.
-  - Current split-plane workspace and high-level layout experiments did not improve total behavior enough on sm86.
-  - Any future `DQAccum` work must report total backward time, including zero/convert/reduce utilities, not only `_bwd_fused_kernel` time.
-  - Matching FlashAttention's reduction behavior likely needs per-lane/write mapping or CUDA/CUTE-style global copy layout control, not just a different high-level tensor shape.
-- Consider inline asm only for specific generated-code gaps.
+- `DQAccum` reduction work.
+  - Revisit split-plane workspace, physical layout, or per-lane/write mapping only after `_bwd_fused_kernel` scheduling improves.
+  - Any future `DQAccum` experiment must report total backward time, including zero/convert/reduce utilities, not only main-kernel time.
+  - Matching FlashAttention's reduction behavior likely needs CUDA/CUTE-style global copy layout control rather than only a different high-level tensor shape.
+- Separate forward/backward and quantization/matmul tuning.
+  - The shared trainable block size is a compromise across forward matmul, q/k scale generation, and backward matmul. The best fwd+bwd autotune choice may not be the best forward-only or backward-only choice.
+  - Later work may tune forward and backward block sizes separately and decouple q/k quantization scale block size from matmul tile size. That requires extra scale/quantization plumbing or independent saved tensors.
+  - Avoid adding very large `N` candidates such as `(64,256)`, `(128,256)`, and `(256,128)` by default. `(64,256)` was valid for hdim64 but much slower in the fixed-block benchmark.
+  - Avoid adding `(128,64)` solely for fused performance. It remains in the original shared list and is useful for forward, but fixed fused hdim64 was slower than `(32,128)`, `(64,128)`, and `(128,128)`.
+- Lower-level implementation paths.
   - Keep the existing inline PTX int8 rounding helper.
-  - Add MMA or copy inline asm only if SASS proves Triton emits inefficient IMMA operand packing, extra layout conversions, or unvectorized memory operations that cannot be fixed with Triton kernel structure/configs.
-  - Treat inline `mma.sync.aligned.m16n8k32` as high-risk because it requires matching Triton's lane/register layout. Prefer compiler hooks if the issue is layout selection.
-- Consider Triton compiler patches after Triton-kernel experiments.
-  - Candidate patches are exposing/controlling DotI8 operand/result layouts, improving ldmatrix/stmatrix selection for int8 tiles, reducing loop live ranges around multiple dots plus pointwise work, and adding scheduler hints closer to FlashAttention's explicit CUTE copy/MMA choreography.
-  - Avoid compiler work for `warp_specialize` on the current sm86 target. It is not the likely near-term path for this kernel.
-- Defer autotune and larger algorithmic changes.
-  - Do not add broad fused block-size autotune candidates until the fixed `(64,128)` fused kernel has lower register pressure and better tensor-core utilization.
-  - After fixed-tile optimization, consider adding fused-specific candidates such as `(64,128)` and `(128,128)` to the autotune space. Avoid `(128,64)` unless profiling contradicts FlashAttention's `dQAccum`-traffic warning.
-  - Keep q/k quantization scale compatibility in mind: changing backward tile sizes independently from forward requires either shared block-size selection or extra q/k quantization/scales for backward.
-  - Do not revisit separate `dK`/`dV` kernels, alternative `DQAccum` split policies, or q/k re-quantization with independent backward tile sizes until the fused kernel has been retuned and re-profiled.
-  - Defer bf16, causal, GQA/MQA, varlen, and `head_dim=256` expansion until the non-causal fp16 fused path is closer to FlashAttention on hdim64/128.
+  - Consider inline MMA/copy asm only if SASS proves Triton emits inefficient IMMA operand packing, extra layout conversions, or unvectorized memory operations that kernel-structure changes cannot fix.
+  - Consider Triton compiler patches only after Triton-level experiments, likely around DotI8 operand/result layouts, ldmatrix/stmatrix selection, loop live ranges, and scheduler hints.
+- Feature expansion.
+  - Defer bf16, causal, GQA/MQA, varlen, and `head_dim=256` until the non-causal fp16 fused path is stable on hdim64/128.
 
 ## Benchmark and Profiling Workflow
 
-- Use `bench/bench_fwd_bwd.py` for public latency comparisons across `sdpa`, `flash`, `sage`, and `sage_fused`.
-  - Primary target shape: `--batch_size 1 --num_heads 16 --head_dim 64 --seq_lens 2048 4096 8192`.
-  - Use `--fused-dq-splits` to benchmark split-plane `DQAccum` choices.
-- Use Nsight Compute for kernel-level comparisons.
-  - Profile after warmup and isolate backward with `cudaProfilerStart`/`cudaProfilerStop`.
-  - Prefer kernel replay for Triton/autotuned workloads when application replay sees inconsistent kernels.
-  - Track at least kernel time, registers/thread, shared memory, achieved occupancy, DRAM/L2 throughput, HMMA activity, IMMA activity, and global reduction counters for fused/FlashAttention comparisons.
-- Expand support only after the non-causal fp16 path is stable.
-  - `head_dim=128` and `head_dim=256` correctness/performance sweeps beyond the current autotune validity coverage.
-  - bf16.
-  - GQA/MQA.
-  - Causal mode.
-  - Varlen.
+- Backward-only public latency: run FlashAttention and Sage sequentially with precomputed forward outside the timed backward region when answering bwd-only questions. For the quick end-to-end benchmark, set `SAGEATTN_FUSED_DQ_SPLITS=1`, `SAGEATTN_FUSED_BLOCK=32,128`, and `SAGEATTN_FUSED_INNER=4,2`, then run `python bench/bench_fwd_bwd.py --method sage_fused --batch_size 1 --num_heads 16 --head_dim 64 --seq_lens 4096`.
+- Fwd+bwd autotune check: unset `SAGEATTN_FUSED_BLOCK` and `SAGEATTN_FUSED_INNER`, keep `SAGEATTN_FUSED_DQ_SPLITS=1`, and run `python bench/bench_fwd_bwd.py --method sage_fused --batch_size 1 --num_heads 16 --head_dim 64 --seq_lens 2048 4096 8192` only when checking end-to-end behavior.
+- FlashAttention comparison: run the same shape with `--method flash` and compare backward time separately from total time.
+- NCU kernel replay: profile backward after warmup, isolate with `cudaProfilerStart`/`cudaProfilerStop`, and track kernel time, registers/thread, dynamic shared memory, achieved occupancy/active warps, SM throughput, DRAM/L2 throughput, IMMA/HMMA activity, spills/local memory, and global reduction counters.
+- Proton/PyTorch profiler: use when kernel-level launch grouping or eager inter-kernel gaps matter. Proton can add scoped timing around backward regions, while PyTorch profiler gives a quick CUDA-time split for utility kernels versus `_bwd_fused_kernel`.
+- Measurement rule: after each performance edit, run focused correctness first, then bwd-only public latency, then NCU if the change is kept or ambiguous. Re-run fwd+bwd autotune only when tile selection or forward-facing behavior changes.
 
 ## Risks And Open Questions
 
-- int8 quantization granularity for `P` in backward currently follows the paper's Algorithm 3 per-block description. Accuracy may still require experimenting with per-row/per-token scaling.
-- `dS` is expected to be the fragile tensor. Debug tooling should expose `dS` metrics if accuracy falls below target.
-- Long sequence performance may need additional scheduling work beyond the current split-kernel and fused implementations.
-- Fixed-tile fused now beats the local FlashAttention public benchmark at `seq_len=4096` in the latest run, but NCU still shows `_bwd_fused_kernel` at `255` registers/thread and low occupancy, so the remaining optimization target is register pressure and more efficient tensor-core scheduling.
-- A single shared trainable block size is the right current design, but it means the chosen config is a compromise across quantization, forward attention, and backward kernels.
-- Fused `dQ` accumulation can be sharded to reduce main-kernel reduction traffic/contention, but current sm86 benchmarks show the extra zero/reduce workspace cost outweighs the benefit for the tested shapes, so larger `DQAccum` work is deferred.
-
-## Validation Snapshot
-
-- Correctness uses FlashAttention backward as the reference and flattened cosine similarity plus Frobenius relative L2 metrics.
-- Configured fused and forced split-plane `DQAccum` tests pass.
-- Latest full validation: `python -m pytest -n 8 tests/ -q` reported `1069 passed`. `pre-commit run --all-files` passed.
-- After default/fused `dO` pre-quantization and even-shape specialization, focused validation passed: `python -m pytest tests/test_sagebwd_triton.py tests/test_sagebwd_triton_compile.py tests/test_sagebwd_triton_fused.py tests/test_sagebwd_triton_fused_compile.py -q` reported `17 passed`. `pre-commit run --files sageattention/triton/attn_bwd_qk_int8.py sageattention/triton/attn_bwd_qk_int8_fused.py` passed.
+- `P` and `dS` quantization follow the paper's per-block description. `dS` remains the fragile tensor for accuracy.
+- Best fixed `(32,128)` fused backward is close to FlashAttention but slower on public bwd-only latency and slower under NCU main-kernel replay despite the theoretical int8-MMA advantage.
+- `_bwd_fused_kernel` reports `255` registers/thread and low active-warps occupancy. The main risk is that Triton-level scheduling and layout controls are insufficient to close the gap without compiler work or a lower-level CUDA/CUTE implementation.
+- Public benchmark timing, PyTorch/Proton profiler timing, and NCU kernel replay can diverge because of autotune/cache/driver/replay variance. Keep all retained measurements in the log and compare directions rather than single samples.
+- A single shared trainable block size is expedient but is a compromise across quantization, forward attention, and backward kernels. Future separate fwd/bwd tuning and quantization/matmul decoupling may be needed for best end-to-end speed.
+- `DQAccum` sharding can reduce main-kernel reduction traffic, but sm86 measurements show the extra workspace utilities outweigh the benefit for tested shapes.

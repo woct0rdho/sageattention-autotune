@@ -1,6 +1,5 @@
 import argparse
 import logging
-import os
 
 import torch
 from flash_attn import flash_attn_func
@@ -19,34 +18,15 @@ parser.add_argument("--head_dim", type=int, default=64)
 parser.add_argument("--seq_lens", nargs="+", type=int, default=[1024, 2048, 4096, 8192])
 parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--repeats", type=int, default=10)
-parser.add_argument(
-    "--fused-dq-splits",
-    type=int,
-    default=None,
-    help="Override SAGEATTN_FUSED_DQ_SPLITS for sage_fused backward benchmarking.",
-)
-parser.add_argument(
-    "--fused-block",
-    type=str,
-    default=None,
-    help="Override SAGEATTN_FUSED_BLOCK for fixed-tile sage_fused benchmarking, e.g. 64,128.",
-)
 args = parser.parse_args()
 
 num_heads = args.num_heads
 batch_size = args.batch_size
 head_dim = args.head_dim
 
-if args.fused_dq_splits is not None:
-    os.environ["SAGEATTN_FUSED_DQ_SPLITS"] = str(args.fused_dq_splits)
-if args.fused_block is not None:
-    os.environ["SAGEATTN_FUSED_BLOCK"] = args.fused_block
-
 print(f"method: {args.method}")
 print(f"batch_size: {batch_size}, num_heads: {num_heads}, head_dim: {head_dim}")
 print("is_causal: False")
-print(f"fused_dq_splits: {args.fused_dq_splits}")
-print(f"fused_block: {args.fused_block}")
 
 
 def _make_inputs(seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

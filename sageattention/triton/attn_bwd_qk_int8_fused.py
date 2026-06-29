@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
-from .attn_bwd_autotune import _make_bwd_fused_triton_configs, _prune_bwd_fused_configs
+from .attn_bwd_autotune import _TRITON_BWD_FUSED_CONFIGS, _prune_bwd_fused_configs
 from .attn_bwd_qk_int8 import LOG2_E, _bwd_preprocess_delta_do_quant
 from .quant_per_block import _quantize_tile_to_int8
 
@@ -111,7 +111,10 @@ def _convert_dq_accum_kernel(
 
 
 @triton.autotune(
-    configs=_make_bwd_fused_triton_configs(),
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps, num_stages in _TRITON_BWD_FUSED_CONFIGS
+    ],
     key=[
         "SEQ_LEN_BUCKET",
         "HEAD_DIM",
@@ -222,7 +225,7 @@ def _bwd_fused_kernel(
     if HAS_KMEAN:
         km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32) * SM_SCALE
 
-    for start_m in tl.range(0, SEQ_LEN, BLOCK_M, disable_licm=True, disallow_acc_multi_buffer=True):
+    for start_m in tl.range(0, SEQ_LEN, BLOCK_M, disable_licm=True):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         q_offsets = start_m + offs_m
         if not IS_EVEN_M:
