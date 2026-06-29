@@ -18,7 +18,7 @@ _TRITON_BWD_CONFIGS = (
     # (8, 4),
 )
 
-_TRITON_BWD_REUSE_CONFIGS = (
+_TRITON_BWD_FUSED_CONFIGS = (
     # (num_warps, num_stages)
     (4, 1),
     (4, 2),
@@ -31,41 +31,41 @@ _TRITON_BWD_REUSE_CONFIGS = (
 )
 
 
-def _reuse_maxnreg() -> int | None:
-    override = os.environ.get("SAGEATTN_REUSE_MAXNREG")
+def _fused_maxnreg() -> int | None:
+    override = os.environ.get("SAGEATTN_FUSED_MAXNREG")
     if override is None:
         return None
 
     maxnreg = int(override)
     if maxnreg <= 0:
-        raise ValueError("SAGEATTN_REUSE_MAXNREG must be a positive integer.")
+        raise ValueError("SAGEATTN_FUSED_MAXNREG must be a positive integer.")
     return maxnreg
 
 
-def _make_bwd_reuse_triton_configs() -> list[triton.Config]:
+def _make_bwd_fused_triton_configs() -> list[triton.Config]:
     return [
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages, maxnreg=_reuse_maxnreg())
-        for num_warps, num_stages in _TRITON_BWD_REUSE_CONFIGS
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages, maxnreg=_fused_maxnreg())
+        for num_warps, num_stages in _TRITON_BWD_FUSED_CONFIGS
     ]
 
 
-def _forced_bwd_reuse_config() -> tuple[int, int] | None:
-    override = os.environ.get("SAGEATTN_REUSE_INNER")
+def _forced_bwd_fused_config() -> tuple[int, int] | None:
+    override = os.environ.get("SAGEATTN_FUSED_INNER")
     if override is None:
         return None
 
     parts = override.lower().replace("x", ",").split(",")
     if len(parts) != 2:
-        raise ValueError("SAGEATTN_REUSE_INNER must have the form 'num_warps,num_stages', for example '8,2'.")
+        raise ValueError("SAGEATTN_FUSED_INNER must have the form 'num_warps,num_stages', for example '8,2'.")
 
     num_warps, num_stages = (int(part.strip()) for part in parts)
     if num_warps <= 0 or num_stages <= 0:
-        raise ValueError("SAGEATTN_REUSE_INNER values must be positive integers.")
+        raise ValueError("SAGEATTN_FUSED_INNER values must be positive integers.")
     return num_warps, num_stages
 
 
-def _preferred_bwd_reuse_config(block_m: int, block_n: int, head_dim: int) -> tuple[int, int] | None:
-    forced_config = _forced_bwd_reuse_config()
+def _preferred_bwd_fused_config(block_m: int, block_n: int, head_dim: int) -> tuple[int, int] | None:
+    forced_config = _forced_bwd_fused_config()
     if forced_config is not None:
         return forced_config
     if block_m == 64 and block_n == 128 and head_dim == 64:
@@ -119,7 +119,7 @@ def _estimated_bwd_dkdv_smem_bytes(
     return max(estimated, min_smem_bytes)
 
 
-def _estimated_bwd_reuse_smem_bytes(
+def _estimated_bwd_fused_smem_bytes(
     block_m: int,
     block_n: int,
     head_dim: int,
@@ -130,7 +130,7 @@ def _estimated_bwd_reuse_smem_bytes(
 
     head_dim = _padded_head_dim(head_dim)
 
-    # The reuse prototype keeps Q, dO, K, V, P/dS, dQ partials, and dK/dV
+    # The fused prototype keeps Q, dO, K, V, P/dS, dQ partials, and dK/dV
     # accumulators live in one KV-owned kernel. Compiled SM86 kernels report a
     # base footprint of MN + 4D(M+N), then a stage-linear pipeline term. The
     # small branch terms below cover Triton's observed warp/layout slack without
@@ -175,7 +175,7 @@ def _bwd_dkdv_config_is_valid(
 
 
 @functools.cache
-def _bwd_reuse_config_is_valid(
+def _bwd_fused_config_is_valid(
     block_m: int,
     block_n: int,
     num_warps: int,
@@ -183,7 +183,7 @@ def _bwd_reuse_config_is_valid(
     head_dim: int,
     device_index: int,
 ) -> bool:
-    return _estimated_bwd_reuse_smem_bytes(block_m, block_n, head_dim, num_warps, num_stages) <= _shared_memory_limit(
+    return _estimated_bwd_fused_smem_bytes(block_m, block_n, head_dim, num_warps, num_stages) <= _shared_memory_limit(
         device_index
     )
 
@@ -224,7 +224,7 @@ def _prune_bwd_dkdv_configs(
     ]
 
 
-def _prune_bwd_reuse_configs(
+def _prune_bwd_fused_configs(
     configs: list[triton.Config], named_args: dict[str, object], **meta: object
 ) -> list[triton.Config]:
     q = named_args["Q"]
@@ -235,12 +235,12 @@ def _prune_bwd_reuse_configs(
     assert isinstance(block_m, int)
     assert isinstance(block_n, int)
     assert isinstance(head_dim, int)
-    preferred_config = _preferred_bwd_reuse_config(block_m, block_n, head_dim)
+    preferred_config = _preferred_bwd_fused_config(block_m, block_n, head_dim)
     return [
         config
         for config in configs
         if (preferred_config is None or (config.num_warps, config.num_stages) == preferred_config)
-        and _bwd_reuse_config_is_valid(block_m, block_n, config.num_warps, config.num_stages, head_dim, q.device.index)
+        and _bwd_fused_config_is_valid(block_m, block_n, config.num_warps, config.num_stages, head_dim, q.device.index)
     ]
 
 
@@ -273,18 +273,18 @@ def _valid_bwd_dkdv_configs(
 
 
 @functools.cache
-def _valid_bwd_reuse_configs(
+def _valid_bwd_fused_configs(
     block_config: tuple[int, int],
     head_dim: int,
     device_index: int,
 ) -> tuple[tuple[int, int], ...]:
     block_m, block_n = block_config
-    preferred_config = _preferred_bwd_reuse_config(block_m, block_n, head_dim)
+    preferred_config = _preferred_bwd_fused_config(block_m, block_n, head_dim)
     return tuple(
         bwd_config
-        for bwd_config in _TRITON_BWD_REUSE_CONFIGS
+        for bwd_config in _TRITON_BWD_FUSED_CONFIGS
         if (preferred_config is None or bwd_config == preferred_config)
-        and _bwd_reuse_config_is_valid(block_m, block_n, bwd_config[0], bwd_config[1], head_dim, device_index)
+        and _bwd_fused_config_is_valid(block_m, block_n, bwd_config[0], bwd_config[1], head_dim, device_index)
     )
 
 

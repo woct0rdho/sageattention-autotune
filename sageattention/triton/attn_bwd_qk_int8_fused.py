@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
-from .attn_bwd_autotune import _make_bwd_reuse_triton_configs, _prune_bwd_reuse_configs
+from .attn_bwd_autotune import _make_bwd_fused_triton_configs, _prune_bwd_fused_configs
 from .attn_bwd_qk_int8 import LOG2_E, _bwd_preprocess_delta_do_quant
 from .quant_per_block import _quantize_tile_to_int8
 
@@ -111,7 +111,7 @@ def _convert_dq_accum_kernel(
 
 
 @triton.autotune(
-    configs=_make_bwd_reuse_triton_configs(),
+    configs=_make_bwd_fused_triton_configs(),
     key=[
         "SEQ_LEN_BUCKET",
         "HEAD_DIM",
@@ -123,11 +123,11 @@ def _convert_dq_accum_kernel(
         "IS_EVEN_M",
         "IS_EVEN_N",
     ],
-    prune_configs_by={"early_config_prune": _prune_bwd_reuse_configs},
+    prune_configs_by={"early_config_prune": _prune_bwd_fused_configs},
     reset_to_zero=["DQAccum", "DK", "DV"],
 )
 @triton.jit
-def _bwd_reuse_kernel(
+def _bwd_fused_kernel(
     Q,
     K,
     V,
@@ -305,21 +305,21 @@ def _bwd_reuse_kernel(
         tl.store(dv_ptrs, acc_dv.to(DV.type.element_ty), mask=mask_n[:, None])
 
 
-def _reuse_dq_splits(n_blocks: int) -> int:
+def _fused_dq_splits(n_blocks: int) -> int:
     if n_blocks <= 1:
         return 1
 
-    override = os.environ.get("SAGEATTN_REUSE_DQ_SPLITS")
+    override = os.environ.get("SAGEATTN_FUSED_DQ_SPLITS")
     if override is None:
         return 1
 
     dq_splits = int(override)
     if dq_splits < 1:
-        raise ValueError("SAGEATTN_REUSE_DQ_SPLITS must be a positive integer.")
+        raise ValueError("SAGEATTN_FUSED_DQ_SPLITS must be a positive integer.")
     return min(dq_splits, n_blocks)
 
 
-def backward_reuse(
+def backward_fused(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -339,7 +339,7 @@ def backward_reuse(
     if q.dtype != torch.int8 or k.dtype != torch.int8:
         raise ValueError("q and k must be INT8 tensors from the forward quantization step.")
     if v.dtype != torch.float16 or do.dtype != torch.float16 or out.dtype != torch.float16:
-        raise ValueError("reuse SageBwd Triton backward only supports FP16 v, do, and out tensors.")
+        raise ValueError("fused SageBwd Triton backward only supports FP16 v, do, and out tensors.")
     if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous() or not do.is_contiguous():
         raise ValueError("q, k, v, and do must be contiguous NHD tensors.")
 
@@ -349,7 +349,7 @@ def backward_reuse(
     is_even_n = seq_len % BLOCK_N == 0
 
     n_blocks = triton.cdiv(seq_len, BLOCK_N)
-    dq_splits = _reuse_dq_splits(n_blocks)
+    dq_splits = _fused_dq_splits(n_blocks)
 
     dq = torch.empty_like(v)
     dk = torch.empty_like(v)
@@ -415,7 +415,7 @@ def backward_reuse(
     sm_scale_log2 = sm_scale * LOG2_E
 
     kv_grid = (n_blocks, heads, batch)
-    _bwd_reuse_kernel[kv_grid](
+    _bwd_fused_kernel[kv_grid](
         q,
         k,
         v,

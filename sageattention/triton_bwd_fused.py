@@ -3,28 +3,28 @@ import os
 import torch
 import torch.nn.functional as F
 
-from .triton.attn_bwd_qk_int8_reuse import backward_reuse as _attn_backward_reuse
+from .triton.attn_bwd_qk_int8_fused import backward_fused as _attn_backward_fused
 from .triton_bwd import _from_nhd, _to_nhd, _trainable_forward_state
-from .triton_bwd_reuse_autotune import _eager_autotune_select, _sageattn_triton_trainable_reuse_autotuned
+from .triton_bwd_fused_autotune import _eager_autotune_select, _sageattn_triton_trainable_fused_autotuned
 from .utils import DEFAULT_PV_ACCUM_DTYPE
 
 
-def _fixed_reuse_block_config() -> tuple[int, int] | None:
-    override = os.environ.get("SAGEATTN_REUSE_BLOCK")
+def _fixed_fused_block_config() -> tuple[int, int] | None:
+    override = os.environ.get("SAGEATTN_FUSED_BLOCK")
     if override is None:
         return None
 
     block_parts = override.lower().replace("x", ",").split(",")
     if len(block_parts) != 2:
-        raise ValueError("SAGEATTN_REUSE_BLOCK must have the form 'BLOCK_M,BLOCK_N', for example '64,128'.")
+        raise ValueError("SAGEATTN_FUSED_BLOCK must have the form 'BLOCK_M,BLOCK_N', for example '64,128'.")
 
     block_m, block_n = (int(part.strip()) for part in block_parts)
     if block_m <= 0 or block_n <= 0:
-        raise ValueError("SAGEATTN_REUSE_BLOCK values must be positive integers.")
+        raise ValueError("SAGEATTN_FUSED_BLOCK values must be positive integers.")
     return block_m, block_n
 
 
-def _trainable_reuse_backward_from_state(
+def _trainable_fused_backward_from_state(
     dout: torch.Tensor,
     saved_tensors: tuple[torch.Tensor, ...],
     has_k_mean: bool,
@@ -40,7 +40,7 @@ def _trainable_reuse_backward_from_state(
         dout_nhd = F.pad(dout_nhd, (0, v_nhd.size(-1) - dout_nhd.size(-1)))
 
     block_m, block_n = block_config
-    dq, dk, dv = _attn_backward_reuse(
+    dq, dk, dv = _attn_backward_fused(
         q_int8,
         k_int8,
         v_nhd,
@@ -60,7 +60,7 @@ def _trainable_reuse_backward_from_state(
     return dq, dk, dv
 
 
-def _trainable_reuse_backward_from_inputs(
+def _trainable_fused_backward_from_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -79,7 +79,7 @@ def _trainable_reuse_backward_from_inputs(
         smooth_k,
         block_config,
     )
-    return _trainable_reuse_backward_from_state(
+    return _trainable_fused_backward_from_state(
         dout,
         tuple(saved_tensors),
         has_k_mean,
@@ -89,7 +89,7 @@ def _trainable_reuse_backward_from_inputs(
     )
 
 
-class _SageAttnTritonTrainableReuse(torch.autograd.Function):
+class _SageAttnTritonTrainableFused(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -123,7 +123,7 @@ class _SageAttnTritonTrainableReuse(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs: torch.Tensor):
         (dout,) = grad_outputs
-        dq, dk, dv = _trainable_reuse_backward_from_state(
+        dq, dk, dv = _trainable_fused_backward_from_state(
             dout,
             ctx.saved_tensors,
             ctx.has_k_mean,
@@ -134,7 +134,7 @@ class _SageAttnTritonTrainableReuse(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None
 
 
-def _sageattn_triton_trainable_reuse_configured(
+def _sageattn_triton_trainable_fused_configured(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -148,13 +148,13 @@ def _sageattn_triton_trainable_reuse_configured(
     if not q.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
     if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
-        raise ValueError("reuse SageBwd Triton trainable path supports torch.float16 only.")
+        raise ValueError("fused SageBwd Triton trainable path supports torch.float16 only.")
     if q.device != k.device or q.device != v.device:
         raise ValueError("All tensors must be on the same device.")
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise ValueError("All tensors must have the same dtype.")
 
-    return _SageAttnTritonTrainableReuse.apply(
+    return _SageAttnTritonTrainableFused.apply(
         q,
         k,
         v,
@@ -166,7 +166,7 @@ def _sageattn_triton_trainable_reuse_configured(
     )
 
 
-def sageattn_qk_int8_pv_fp16_triton_trainable_reuse(
+def sageattn_qk_int8_pv_fp16_triton_trainable_fused(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -177,11 +177,11 @@ def sageattn_qk_int8_pv_fp16_triton_trainable_reuse(
     return_lse: bool = False,
 ) -> torch.Tensor:
     if is_causal:
-        raise NotImplementedError("SageBwd Triton reuse trainable path currently supports non-causal attention only.")
+        raise NotImplementedError("SageBwd Triton fused trainable path currently supports non-causal attention only.")
     if return_lse:
-        raise NotImplementedError("return_lse is not exposed by the reuse trainable SageBwd path.")
+        raise NotImplementedError("return_lse is not exposed by the fused trainable SageBwd path.")
     if torch.compiler.is_compiling():
-        return _sageattn_triton_trainable_reuse_autotuned(
+        return _sageattn_triton_trainable_fused_autotuned(
             q,
             k,
             v,
@@ -190,11 +190,11 @@ def sageattn_qk_int8_pv_fp16_triton_trainable_reuse(
             smooth_k,
         )
 
-    block_config = _fixed_reuse_block_config()
+    block_config = _fixed_fused_block_config()
     if block_config is None:
         block_config = _eager_autotune_select(q, k, v, tensor_layout, pv_accum_dtype, smooth_k)
 
-    return _sageattn_triton_trainable_reuse_configured(
+    return _sageattn_triton_trainable_fused_configured(
         q,
         k,
         v,

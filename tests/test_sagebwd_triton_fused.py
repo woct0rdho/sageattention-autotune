@@ -2,15 +2,15 @@ import pytest
 import torch
 from test_sagebwd_triton import _check_backward, _flash_attn_backward, _make_qkvo
 
-from sageattention.triton_bwd_reuse import _sageattn_triton_trainable_reuse_configured
-from sageattention.triton_bwd_reuse_autotune import _valid_configs
+from sageattention.triton_bwd_fused import _sageattn_triton_trainable_fused_configured
+from sageattention.triton_bwd_fused_autotune import _valid_configs
 
 
 def _make_valid_configs() -> tuple[tuple[int, int], ...]:
     return _valid_configs(head_dim=64, device_index=torch.cuda.current_device())
 
 
-def _sage_reuse_backward(
+def _sage_fused_backward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -20,7 +20,7 @@ def _sage_reuse_backward(
     q = q.detach().clone().requires_grad_(True)
     k = k.detach().clone().requires_grad_(True)
     v = v.detach().clone().requires_grad_(True)
-    out = _sageattn_triton_trainable_reuse_configured(
+    out = _sageattn_triton_trainable_fused_configured(
         q,
         k,
         v,
@@ -38,25 +38,25 @@ def _sage_reuse_backward(
 
 
 @pytest.mark.parametrize("block_config", _make_valid_configs(), ids=str)
-def test_sagebwd_triton_reuse_block_config(block_config: tuple[int, int]) -> None:
+def test_sagebwd_triton_fused_block_config(block_config: tuple[int, int]) -> None:
     q, k, v, dout = _make_qkvo()
-    actual = _sage_reuse_backward(q, k, v, dout, block_config)
+    actual = _sage_fused_backward(q, k, v, dout, block_config)
     expected = _flash_attn_backward(q, k, v, dout)
     _check_backward(actual, expected, f"block_config={block_config}")
 
 
-def test_sagebwd_triton_reuse_flashattn_tile() -> None:
+def test_sagebwd_triton_fused_flashattn_tile() -> None:
     block_config = (64, 128)
     q, k, v, dout = _make_qkvo()
-    actual = _sage_reuse_backward(q, k, v, dout, block_config)
+    actual = _sage_fused_backward(q, k, v, dout, block_config)
     expected = _flash_attn_backward(q, k, v, dout)
     _check_backward(actual, expected, f"block_config={block_config}")
 
 
-def test_sagebwd_triton_reuse_split_dq_accum(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sagebwd_triton_fused_split_dq_accum(monkeypatch: pytest.MonkeyPatch) -> None:
     block_config = _make_valid_configs()[0]
-    monkeypatch.setenv("SAGEATTN_REUSE_DQ_SPLITS", "1024")
+    monkeypatch.setenv("SAGEATTN_FUSED_DQ_SPLITS", "1024")
     q, k, v, dout = _make_qkvo()
-    actual = _sage_reuse_backward(q, k, v, dout, block_config)
+    actual = _sage_fused_backward(q, k, v, dout, block_config)
     expected = _flash_attn_backward(q, k, v, dout)
     _check_backward(actual, expected, f"block_config={block_config} split_dq_accum")

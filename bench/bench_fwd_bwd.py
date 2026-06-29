@@ -7,12 +7,12 @@ from flash_attn import flash_attn_func
 from flash_attn.utils.benchmark import benchmark_fwd_bwd
 from torch.nn.functional import scaled_dot_product_attention as sdpa
 
-from sageattention import sageattn_qk_int8_pv_fp16_triton_trainable, sageattn_qk_int8_pv_fp16_triton_trainable_reuse
+from sageattention import sageattn_qk_int8_pv_fp16_triton_trainable, sageattn_qk_int8_pv_fp16_triton_trainable_fused
 
 logging.basicConfig(level=logging.INFO)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", type=str, default="sage", choices=["sdpa", "flash", "sage", "sage_reuse"])
+parser.add_argument("--method", type=str, default="sage", choices=["sdpa", "flash", "sage", "sage_fused"])
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--num_heads", type=int, default=16)
 parser.add_argument("--head_dim", type=int, default=64)
@@ -20,16 +20,16 @@ parser.add_argument("--seq_lens", nargs="+", type=int, default=[1024, 2048, 4096
 parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--repeats", type=int, default=10)
 parser.add_argument(
-    "--reuse-dq-splits",
+    "--fused-dq-splits",
     type=int,
     default=None,
-    help="Override SAGEATTN_REUSE_DQ_SPLITS for sage_reuse backward benchmarking.",
+    help="Override SAGEATTN_FUSED_DQ_SPLITS for sage_fused backward benchmarking.",
 )
 parser.add_argument(
-    "--reuse-block",
+    "--fused-block",
     type=str,
     default=None,
-    help="Override SAGEATTN_REUSE_BLOCK for fixed-tile sage_reuse benchmarking, e.g. 64,128.",
+    help="Override SAGEATTN_FUSED_BLOCK for fixed-tile sage_fused benchmarking, e.g. 64,128.",
 )
 args = parser.parse_args()
 
@@ -37,16 +37,16 @@ num_heads = args.num_heads
 batch_size = args.batch_size
 head_dim = args.head_dim
 
-if args.reuse_dq_splits is not None:
-    os.environ["SAGEATTN_REUSE_DQ_SPLITS"] = str(args.reuse_dq_splits)
-if args.reuse_block is not None:
-    os.environ["SAGEATTN_REUSE_BLOCK"] = args.reuse_block
+if args.fused_dq_splits is not None:
+    os.environ["SAGEATTN_FUSED_DQ_SPLITS"] = str(args.fused_dq_splits)
+if args.fused_block is not None:
+    os.environ["SAGEATTN_FUSED_BLOCK"] = args.fused_block
 
 print(f"method: {args.method}")
 print(f"batch_size: {batch_size}, num_heads: {num_heads}, head_dim: {head_dim}")
 print("is_causal: False")
-print(f"reuse_dq_splits: {args.reuse_dq_splits}")
-print(f"reuse_block: {args.reuse_block}")
+print(f"fused_dq_splits: {args.fused_dq_splits}")
+print(f"fused_block: {args.fused_block}")
 
 
 def _make_inputs(seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -67,8 +67,8 @@ def _fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return flash_attn_func(q, k, v, causal=False)
     if args.method == "sage":
         return sageattn_qk_int8_pv_fp16_triton_trainable(q, k, v, tensor_layout="NHD", is_causal=False)
-    if args.method == "sage_reuse":
-        return sageattn_qk_int8_pv_fp16_triton_trainable_reuse(q, k, v, tensor_layout="NHD", is_causal=False)
+    if args.method == "sage_fused":
+        return sageattn_qk_int8_pv_fp16_triton_trainable_fused(q, k, v, tensor_layout="NHD", is_causal=False)
 
     return sdpa(q, k, v, is_causal=False)
 
