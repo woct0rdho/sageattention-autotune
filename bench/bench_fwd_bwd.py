@@ -25,6 +25,12 @@ parser.add_argument(
     default=None,
     help="Override SAGEATTN_REUSE_DQ_SPLITS for sage_reuse backward benchmarking.",
 )
+parser.add_argument(
+    "--reuse-block",
+    type=str,
+    default=None,
+    help="Override SAGEATTN_REUSE_BLOCK for fixed-tile sage_reuse benchmarking, e.g. 64,128.",
+)
 args = parser.parse_args()
 
 num_heads = args.num_heads
@@ -33,11 +39,14 @@ head_dim = args.head_dim
 
 if args.reuse_dq_splits is not None:
     os.environ["SAGEATTN_REUSE_DQ_SPLITS"] = str(args.reuse_dq_splits)
+if args.reuse_block is not None:
+    os.environ["SAGEATTN_REUSE_BLOCK"] = args.reuse_block
 
 print(f"method: {args.method}")
 print(f"batch_size: {batch_size}, num_heads: {num_heads}, head_dim: {head_dim}")
 print("is_causal: False")
 print(f"reuse_dq_splits: {args.reuse_dq_splits}")
+print(f"reuse_block: {args.reuse_block}")
 
 
 def _make_inputs(seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

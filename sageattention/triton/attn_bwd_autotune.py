@@ -1,4 +1,5 @@
 import functools
+import os
 
 import torch
 import triton
@@ -23,12 +24,53 @@ _TRITON_BWD_REUSE_CONFIGS = (
     (4, 2),
     (4, 3),
     (4, 4),
-    # num_warps = 8 is currently disabled because it does not help much
-    # (8, 1),
-    # (8, 2),
-    # (8, 3),
-    # (8, 4),
+    (8, 1),
+    (8, 2),
+    (8, 3),
+    (8, 4),
 )
+
+
+def _reuse_maxnreg() -> int | None:
+    override = os.environ.get("SAGEATTN_REUSE_MAXNREG")
+    if override is None:
+        return None
+
+    maxnreg = int(override)
+    if maxnreg <= 0:
+        raise ValueError("SAGEATTN_REUSE_MAXNREG must be a positive integer.")
+    return maxnreg
+
+
+def _make_bwd_reuse_triton_configs() -> list[triton.Config]:
+    return [
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages, maxnreg=_reuse_maxnreg())
+        for num_warps, num_stages in _TRITON_BWD_REUSE_CONFIGS
+    ]
+
+
+def _forced_bwd_reuse_config() -> tuple[int, int] | None:
+    override = os.environ.get("SAGEATTN_REUSE_INNER")
+    if override is None:
+        return None
+
+    parts = override.lower().replace("x", ",").split(",")
+    if len(parts) != 2:
+        raise ValueError("SAGEATTN_REUSE_INNER must have the form 'num_warps,num_stages', for example '8,2'.")
+
+    num_warps, num_stages = (int(part.strip()) for part in parts)
+    if num_warps <= 0 or num_stages <= 0:
+        raise ValueError("SAGEATTN_REUSE_INNER values must be positive integers.")
+    return num_warps, num_stages
+
+
+def _preferred_bwd_reuse_config(block_m: int, block_n: int, head_dim: int) -> tuple[int, int] | None:
+    forced_config = _forced_bwd_reuse_config()
+    if forced_config is not None:
+        return forced_config
+    if block_m == 64 and block_n == 128 and head_dim == 64:
+        return (4, 2)
+    return None
 
 
 def _estimated_bwd_dq_smem_bytes(
@@ -193,10 +235,12 @@ def _prune_bwd_reuse_configs(
     assert isinstance(block_m, int)
     assert isinstance(block_n, int)
     assert isinstance(head_dim, int)
+    preferred_config = _preferred_bwd_reuse_config(block_m, block_n, head_dim)
     return [
         config
         for config in configs
-        if _bwd_reuse_config_is_valid(block_m, block_n, config.num_warps, config.num_stages, head_dim, q.device.index)
+        if (preferred_config is None or (config.num_warps, config.num_stages) == preferred_config)
+        and _bwd_reuse_config_is_valid(block_m, block_n, config.num_warps, config.num_stages, head_dim, q.device.index)
     ]
 
 
@@ -235,10 +279,12 @@ def _valid_bwd_reuse_configs(
     device_index: int,
 ) -> tuple[tuple[int, int], ...]:
     block_m, block_n = block_config
+    preferred_config = _preferred_bwd_reuse_config(block_m, block_n, head_dim)
     return tuple(
         bwd_config
         for bwd_config in _TRITON_BWD_REUSE_CONFIGS
-        if _bwd_reuse_config_is_valid(block_m, block_n, bwd_config[0], bwd_config[1], head_dim, device_index)
+        if (preferred_config is None or bwd_config == preferred_config)
+        and _bwd_reuse_config_is_valid(block_m, block_n, bwd_config[0], bwd_config[1], head_dim, device_index)
     )
 
 

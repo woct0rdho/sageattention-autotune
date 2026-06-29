@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from ..autotune_utils import _autotune_seq_len_bucket
-from .attn_bwd_autotune import _TRITON_BWD_REUSE_CONFIGS, _prune_bwd_reuse_configs
+from .attn_bwd_autotune import _make_bwd_reuse_triton_configs, _prune_bwd_reuse_configs
 from .attn_bwd_qk_int8 import LOG2_E, _bwd_preprocess_delta_do_quant
 from .quant_per_block import _quantize_tile_to_int8
 
@@ -111,10 +111,7 @@ def _convert_dq_accum_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps, num_stages in _TRITON_BWD_REUSE_CONFIGS
-    ],
+    configs=_make_bwd_reuse_triton_configs(),
     key=[
         "SEQ_LEN_BUCKET",
         "HEAD_DIM",
@@ -225,7 +222,7 @@ def _bwd_reuse_kernel(
     if HAS_KMEAN:
         km = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32) * SM_SCALE
 
-    for start_m in range(0, SEQ_LEN, BLOCK_M):
+    for start_m in tl.range(0, SEQ_LEN, BLOCK_M, disable_licm=True, disallow_acc_multi_buffer=True):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         q_offsets = start_m + offs_m
         if not IS_EVEN_M:
@@ -237,17 +234,6 @@ def _bwd_reuse_kernel(
         else:
             q = tl.load(q_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
         q_scale = tl.load(Q_scale + off_b * stride_qsb + off_h * stride_qsh + start_m // BLOCK_M).to(tl.float32)
-
-        do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
-        do_i8_ptrs = (
-            DOInt8 + off_b * stride_doib + q_offsets[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
-        )
-        if IS_EVEN_M:
-            do = tl.load(do_ptrs)
-            do_i8 = tl.load(do_i8_ptrs).to(tl.int8)
-        else:
-            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
-            do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
 
         qk = tl.dot(q, k_s).to(tl.float32) * (q_scale * k_scale * SM_SCALE_LOG2)
         if not IS_EVEN_M:
@@ -261,21 +247,34 @@ def _bwd_reuse_kernel(
         p = tl.math.exp2(qk - lse[:, None])
 
         p_i8, p_scale = _quantize_tile_to_int8(p)
+        do_i8_ptrs = (
+            DOInt8 + off_b * stride_doib + q_offsets[:, None] * stride_dois + off_h * stride_doih + offs_d[None, :]
+        )
+        if IS_EVEN_M:
+            do_i8 = tl.load(do_i8_ptrs).to(tl.int8)
+        else:
+            do_i8 = tl.load(do_i8_ptrs, mask=mask_m[:, None], other=0).to(tl.int8)
         do_scale = tl.load(DOScale + off_b * stride_dosb + off_h * stride_dosh + start_m // BLOCK_M).to(tl.float32)
         acc_dv += tl.dot(tl.trans(p_i8), do_i8).to(tl.float32) * (p_scale * do_scale)
 
+        do_ptrs = DO + off_b * stride_dob + q_offsets[:, None] * stride_dos + off_h * stride_doh + offs_d[None, :]
+        if IS_EVEN_M:
+            do = tl.load(do_ptrs)
+        else:
+            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
         dp = tl.dot(do, tl.trans(v), out_dtype=tl.float32)
         if IS_EVEN_M:
             delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets)
         else:
             delta = tl.load(Delta + off_b * stride_db + off_h * stride_dh + q_offsets, mask=mask_m, other=0.0)
-        ds = p * (dp - delta[:, None])
-        ds_i8, ds_scale = _quantize_tile_to_int8(ds)
+        dp = p * (dp - delta[:, None])
+        if HAS_KMEAN:
+            rowsum_ds = tl.sum(dp, axis=1)
+        ds_i8, ds_scale = _quantize_tile_to_int8(dp)
 
         acc_dk += tl.dot(tl.trans(ds_i8), q).to(tl.float32) * (ds_scale * q_scale * SM_SCALE)
         dq_partial = tl.dot(ds_i8, tl.trans(k_s)).to(tl.float32) * (ds_scale * k_scale * SM_SCALE)
         if HAS_KMEAN:
-            rowsum_ds = tl.sum(ds, axis=1)
             dq_partial += rowsum_ds[:, None] * km[None, :]
 
         dq_accum_ptrs = (

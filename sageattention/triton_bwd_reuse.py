@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -5,6 +7,21 @@ from .triton.attn_bwd_qk_int8_reuse import backward_reuse as _attn_backward_reus
 from .triton_bwd import _from_nhd, _to_nhd, _trainable_forward_state
 from .triton_bwd_reuse_autotune import _eager_autotune_select, _sageattn_triton_trainable_reuse_autotuned
 from .utils import DEFAULT_PV_ACCUM_DTYPE
+
+
+def _fixed_reuse_block_config() -> tuple[int, int] | None:
+    override = os.environ.get("SAGEATTN_REUSE_BLOCK")
+    if override is None:
+        return None
+
+    block_parts = override.lower().replace("x", ",").split(",")
+    if len(block_parts) != 2:
+        raise ValueError("SAGEATTN_REUSE_BLOCK must have the form 'BLOCK_M,BLOCK_N', for example '64,128'.")
+
+    block_m, block_n = (int(part.strip()) for part in block_parts)
+    if block_m <= 0 or block_n <= 0:
+        raise ValueError("SAGEATTN_REUSE_BLOCK values must be positive integers.")
+    return block_m, block_n
 
 
 def _trainable_reuse_backward_from_state(
@@ -173,7 +190,9 @@ def sageattn_qk_int8_pv_fp16_triton_trainable_reuse(
             smooth_k,
         )
 
-    block_config = _eager_autotune_select(q, k, v, tensor_layout, pv_accum_dtype, smooth_k)
+    block_config = _fixed_reuse_block_config()
+    if block_config is None:
+        block_config = _eager_autotune_select(q, k, v, tensor_layout, pv_accum_dtype, smooth_k)
 
     return _sageattn_triton_trainable_reuse_configured(
         q,
