@@ -7,12 +7,15 @@ from flash_attn.utils.benchmark import benchmark_forward
 from torch.nn.functional import scaled_dot_product_attention as sdpa
 
 from sageattention.cuda_attn import sageattn_qk_int8_pv_fp16_cuda
+from sageattention.cutlass_attn import sageattn_qk_int8_pv_fp16_cutlass
 from sageattention.triton_attn import sageattn_qk_int8_pv_fp16_triton
 
 logging.basicConfig(level=logging.INFO)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--method", type=str, default="sage_triton", choices=["sdpa", "flash", "sage_cuda", "sage_triton"])
+parser.add_argument(
+    "--method", type=str, default="sage_triton", choices=["sdpa", "flash", "sage_cuda", "sage_cutlass", "sage_triton"]
+)
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--num_heads", type=int, default=16)
 parser.add_argument("--head_dim", type=int, default=64)
@@ -39,7 +42,7 @@ def run_benchmark(is_causal: bool) -> None:
         k = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
         v = torch.randn(batch_size, num_heads, seq_len, head_dim, device="cuda", dtype=torch.float16)
 
-        if args.method in ("flash", "sage_cuda", "sage_triton"):
+        if args.method in ("flash", "sage_cuda", "sage_cutlass", "sage_triton"):
             # flash_attn_func and SageAttention NHD expect (Batch, Seq, Head, Dim)
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
@@ -53,6 +56,13 @@ def run_benchmark(is_causal: bool) -> None:
 
             def fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
                 return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout="NHD", is_causal=is_causal)
+        elif args.method == "sage_cutlass":
+            if is_causal:
+                print(f"{seq_len} skipped: CUTLASS forward does not support causal attention")
+                continue
+
+            def fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+                return sageattn_qk_int8_pv_fp16_cutlass(q, k, v, tensor_layout="NHD", is_causal=False)
         elif args.method == "sage_triton":
 
             def fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
