@@ -69,6 +69,8 @@ def _env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 build_triton_only = _env_flag_enabled("SAGEATTN_BUILD_TRITON_ONLY")
 
 if not build_triton_only:
@@ -125,6 +127,16 @@ else:
                 "csrc/qattn/qk_int8_sv_f16_accum_f16_fuse_v_mean_attn.cu",
                 "csrc/qattn/qk_int8_sv_f16_accum_f32_attn.cu",
             ],
+            extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
+            py_limited_api=True,
+        ),
+        CUDAExtension(
+            name="sageattention._qattn_cutlass_sm80",
+            sources=[
+                "csrc/qattn_cutlass/pybind_sm80.cpp",
+                "csrc/qattn_cutlass/qk_int8_sv_f16_accum_f32_attn_cutlass.cu",
+            ],
+            include_dirs=[os.path.join(ROOT_DIR, "third_party", "cutlass", "include")],
             extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
             py_limited_api=True,
         ),
