@@ -1,4 +1,4 @@
-from typing import Literal, Union, overload
+from typing import Literal, overload
 
 import torch
 
@@ -7,7 +7,7 @@ from .cutlass_compile import _qattn_cutlass_sm80
 from .triton.quant_per_thread import per_thread_int8
 from .utils import LOG2_E, _lse_correction, _pad_qkv
 
-CutlassSageAttnResult = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+CutlassSageAttnResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 @overload

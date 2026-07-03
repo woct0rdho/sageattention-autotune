@@ -1,4 +1,5 @@
 import functools
+from typing import Any, cast
 
 import torch
 import torch._dynamo.config as dynamo_config
@@ -21,7 +22,7 @@ _SELECTED_COMPILE_BLOCK_CONFIGS: dict[object, tuple[int, int]] = {}
 # bytecode. A local config.patch inside SageAttention exits too early, so this
 # intentionally enables the process-wide flag when the trainable autotune module is imported.
 def _enable_dynamo_backward_tracing() -> None:
-    setattr(dynamo_config, "trace_autograd_ops", True)
+    cast(Any, dynamo_config).trace_autograd_ops = True
 
 
 def _compile_block_config_key(

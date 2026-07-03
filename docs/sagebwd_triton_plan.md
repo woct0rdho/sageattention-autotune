@@ -259,7 +259,6 @@ Measured conclusions:
 ## Low-Level Source Notes
 
 FlashAttention and Triton source review gives the following optimization constraints and opportunities:
-
 - FlashAttention's hdim64 backward uses a KV-owned sequence-parallel kernel with separate CUTE MMA layouts for `S/dP`, `dK/dV`, and `dQ`. On large-smem GPUs it prefers `(BLOCK_M=128, BLOCK_N=128, num_warps=8)`. On sm86/sm89 it uses `(64,128,8)` with `V` in registers to fit shared memory.
 - FlashAttention comments call out `(128,64)` as slow because it doubles `dQAccum` traffic, and use smaller `M` to reduce `LSE`/row-state register pressure. Local bwd-only measurements favor `(32,128)` for hdim64/seq4096, while `(64,128)` remains the matched FlashAttention-style tile.
 - FlashAttention explicitly double-buffers `Q/dO`, stages `K/V` with `cp.async`, writes `P/dS` through shared memory, and overlays shared-memory regions so `P`, `dS`, and `dQ` do not all occupy independent storage for the whole loop.

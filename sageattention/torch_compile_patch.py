@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch._inductor.codegen.subgraph import SubgraphChoiceCaller
@@ -113,7 +113,7 @@ class _CustomTimingPatch:
         SubgraphChoiceCaller.output_node = output_node
         # This is an intentional classmethod monkey patch. The exact torch internal
         # signature is version-specific and too narrow for a reusable wrapper.
-        setattr(AlgorithmSelectorCache, "benchmark_in_sub_process", benchmark_in_sub_process)
+        cast(Any, AlgorithmSelectorCache).benchmark_in_sub_process = benchmark_in_sub_process
         self.installed = True
 
     def install_choice_preprocessor(self) -> None:

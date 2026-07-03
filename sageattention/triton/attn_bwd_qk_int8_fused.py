@@ -89,7 +89,7 @@ def _convert_dq_accum_kernel(
     if not IS_EVEN_M:
         mask_m = offs_m < SEQ_LEN
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    for split in range(0, DQ_SPLITS):
+    for split in range(DQ_SPLITS):
         accum_ptrs = (
             DQAccum
             + split * stride_dqax
