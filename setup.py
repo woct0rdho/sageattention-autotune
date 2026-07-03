@@ -1,7 +1,9 @@
+import importlib.util
 import os
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -69,7 +71,26 @@ def _env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_PATH = Path(__file__).resolve().parent
+
+
+def _generated_sources(generator_name: str) -> list[str]:
+    generator_path = ROOT_PATH / "scripts" / f"{generator_name}.py"
+    spec = importlib.util.spec_from_file_location(generator_name, generator_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return [str(path.relative_to(ROOT_PATH)) for path in module.generate(ROOT_PATH)]
+
+
+def _cutlass_fwd_generated_sources() -> list[str]:
+    return _generated_sources("generate_cutlass_fwd_instantiations")
+
+
+def _cutlass_bwd_generated_sources() -> list[str]:
+    return _generated_sources("generate_cutlass_bwd_instantiations")
+
 
 build_triton_only = _env_flag_enabled("SAGEATTN_BUILD_TRITON_ONLY")
 
@@ -134,9 +155,12 @@ else:
             name="sageattention._qattn_cutlass_sm80",
             sources=[
                 "csrc/qattn_cutlass/pybind_sm80.cpp",
+                "csrc/qattn_cutlass/qk_int8_sv_f16_accum_f32_attn_bwd_cutlass.cu",
                 "csrc/qattn_cutlass/qk_int8_sv_f16_accum_f32_attn_cutlass.cu",
+                *_cutlass_fwd_generated_sources(),
+                *_cutlass_bwd_generated_sources(),
             ],
-            include_dirs=[os.path.join(ROOT_DIR, "third_party", "cutlass", "include")],
+            include_dirs=[ROOT_PATH / "third_party" / "cutlass" / "include"],
             extra_compile_args={"cxx": cxx_flags, "nvcc": nvcc_flags},
             py_limited_api=True,
         ),
