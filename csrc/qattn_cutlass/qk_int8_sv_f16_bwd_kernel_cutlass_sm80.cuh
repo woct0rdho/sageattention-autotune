@@ -618,6 +618,7 @@ __global__ void fused_mma_kernel(const int8_t *__restrict__ const Q,
                                  const float sm_scale)
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
+  constexpr bool kDirectDskPairQuantization = HeadDim == 64 && CtaM == 64 && CtaN == 64 && NumWarps == 4;
   static_assert(Traits::kCtaMMicroTiles % 2 == 0, "Backward CTA M microtiles must pair cleanly for dV/dK k32");
   static_assert(Traits::kNumWarps % 2 == 0 && Traits::kCtaNMicroTiles % 2 == 0, "Backward dQ ownership requires adjacent N-warp pairs");
   const int32_t n_block = blockIdx.x;
@@ -921,16 +922,21 @@ __global__ void fused_mma_kernel(const int8_t *__restrict__ const Q,
             if (row < params.seq_len && col < params.seq_len)
             {
               const float q_scale = sQScale(m_local);
-              const float k_scale = sKScale(n_local);
               const float p = rPFloat(idx);
               const float ds = acc_dp(idx);
               p_i8 = round_to_int8(p * inv_p_scale);
               dsq_i8 = round_to_int8(ds * q_scale * inv_dsq_scale);
-              dsk_i8 = round_to_int8(ds * k_scale * inv_dsk_scale);
+              if constexpr (!kDirectDskPairQuantization)
+              {
+                dsk_i8 = round_to_int8(ds * sKScale(n_local) * inv_dsk_scale);
+              }
             }
             rP(idx) = p_i8;
             rdSq(idx) = dsq_i8;
-            rdSk(idx) = dsk_i8;
+            if constexpr (!kDirectDskPairQuantization)
+            {
+              rdSk(idx) = dsk_i8;
+            }
           }
           auto tCrP = thr_copy_score_c.retile_S(rP);
           auto tCrdSq = thr_copy_score_c.retile_S(rdSq);
@@ -1004,38 +1010,74 @@ __global__ void fused_mma_kernel(const int8_t *__restrict__ const Q,
             }
           }
         }
-        auto tCrdSk = thr_copy_score_c.retile_S(rdSk);
-        auto tCsdSk = thr_copy_score_c.partition_D(sdSkTile);
-        cute::copy(tiled_copy_score_c, tCrdSk, tCsdSk);
-        if (lane_id == 0)
+        if constexpr (kDirectDskPairQuantization)
         {
-          shared.dsk_scale[n_smem_slot] = dsk_scale;
-        }
-        __syncthreads();
-
-        if (dq_pair_owner)
-        {
-          dsk_scale = fmaxf(shared.dsk_scale[dq_pair_smem_slot], shared.dsk_scale[dq_pair_smem_slot + 1]);
-#pragma unroll
-          for (int32_t pair_half = 0; pair_half < 2; ++pair_half)
+          if (lane_id == 0)
           {
-            auto sdSkHalf = cute::local_tile(sdSk, score_store_shape, cute::make_coord(cute::_0{}, pair_half));
-            auto rdSkRescale = cute::make_fragment_like<int8_t>(acc_score);
-            auto tCsdSkHalf = thr_copy_score_c.partition_S(sdSkHalf);
-            auto tCrdSkRescale = thr_copy_score_c.retile_D(rdSkRescale);
-            cute::copy(tiled_copy_score_c, tCsdSkHalf, tCrdSkRescale);
-            const float scale = shared.dsk_scale[dq_pair_smem_slot + pair_half] / dsk_scale;
-#pragma unroll
-            for (int32_t idx = 0; idx < cute::size(rdSkRescale); ++idx)
-            {
-              rdSkRescale(idx) = round_to_int8(static_cast<float>(rdSkRescale(idx)) * scale);
-            }
-            auto tCrdSkStore = thr_copy_score_c.retile_S(rdSkRescale);
-            auto tCsdSkStore = thr_copy_score_c.partition_D(sdSkHalf);
-            cute::copy(tiled_copy_score_c, tCrdSkStore, tCsdSkStore);
+            shared.dsk_scale[n_smem_slot] = dsk_scale;
           }
+          __syncthreads();
+
+          if (n_valid)
+          {
+            dsk_scale = fmaxf(shared.dsk_scale[dq_pair_smem_slot], shared.dsk_scale[dq_pair_smem_slot + 1]);
+            const float inv_dsk_pair_scale = 1.0f / dsk_scale;
+#pragma unroll
+            for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
+            {
+              const auto coord = acc_coord(idx);
+              const int32_t m_local = static_cast<int32_t>(cute::get<0>(coord));
+              const int32_t n_local = static_cast<int32_t>(cute::get<1>(coord));
+              const int32_t row = m_base + m_local;
+              const int32_t col = n_base + n_local;
+              int8_t dsk_i8 = 0;
+              if (row < params.seq_len && col < params.seq_len)
+              {
+                dsk_i8 = round_to_int8(acc_dp(idx) * sKScale(n_local) * inv_dsk_pair_scale);
+              }
+              rdSk(idx) = dsk_i8;
+            }
+            auto tCrdSk = thr_copy_score_c.retile_S(rdSk);
+            auto tCsdSk = thr_copy_score_c.partition_D(sdSkTile);
+            cute::copy(tiled_copy_score_c, tCrdSk, tCsdSk);
+          }
+          __syncthreads();
         }
-        __syncwarp();
+        else
+        {
+          auto tCrdSk = thr_copy_score_c.retile_S(rdSk);
+          auto tCsdSk = thr_copy_score_c.partition_D(sdSkTile);
+          cute::copy(tiled_copy_score_c, tCrdSk, tCsdSk);
+          if (lane_id == 0)
+          {
+            shared.dsk_scale[n_smem_slot] = dsk_scale;
+          }
+          __syncthreads();
+
+          if (dq_pair_owner)
+          {
+            dsk_scale = fmaxf(shared.dsk_scale[dq_pair_smem_slot], shared.dsk_scale[dq_pair_smem_slot + 1]);
+#pragma unroll
+            for (int32_t pair_half = 0; pair_half < 2; ++pair_half)
+            {
+              auto sdSkHalf = cute::local_tile(sdSk, score_store_shape, cute::make_coord(cute::_0{}, pair_half));
+              auto rdSkRescale = cute::make_fragment_like<int8_t>(acc_score);
+              auto tCsdSkHalf = thr_copy_score_c.partition_S(sdSkHalf);
+              auto tCrdSkRescale = thr_copy_score_c.retile_D(rdSkRescale);
+              cute::copy(tiled_copy_score_c, tCsdSkHalf, tCrdSkRescale);
+              const float scale = shared.dsk_scale[dq_pair_smem_slot + pair_half] / dsk_scale;
+#pragma unroll
+              for (int32_t idx = 0; idx < cute::size(rdSkRescale); ++idx)
+              {
+                rdSkRescale(idx) = round_to_int8(static_cast<float>(rdSkRescale(idx)) * scale);
+              }
+              auto tCrdSkStore = thr_copy_score_c.retile_S(rdSkRescale);
+              auto tCsdSkStore = thr_copy_score_c.partition_D(sdSkHalf);
+              cute::copy(tiled_copy_score_c, tCrdSkStore, tCsdSkStore);
+            }
+          }
+          __syncwarp();
+        }
 
         if (dv_ready)
         {
