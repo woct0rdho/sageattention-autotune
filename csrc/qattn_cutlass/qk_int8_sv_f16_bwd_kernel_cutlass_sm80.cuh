@@ -188,8 +188,11 @@ struct SharedStorage
 template <typename Traits>
 struct SharedStorage2DWarp
 {
-  static_assert(Traits::kNumWarps == 8 && Traits::kCtaM == 64 && Traits::kCtaN == 64,
-                "2D warp storage is specialized for the 64x64 eight-warp CTA");
+  static_assert(
+    Traits::kCtaM == 64 &&
+      ((Traits::kNumWarps == 8 && Traits::kCtaN == 64) ||
+       (Traits::kNumWarps == 16 && Traits::kCtaN == 128)),
+    "2D warp storage is specialized for the 64-row, two-M-half schedule");
   using SmemLayoutdOFp16Pair = decltype(make_smem_matrix_layout<2 * Traits::kBlockM, Traits::kHalfLoadVecCols>());
   using SmemLayoutMPair = decltype(cute::make_layout(
     cute::make_shape(cute::Int<2 * Traits::kBlockM>{}), cute::make_stride(cute::_1{})));
@@ -202,20 +205,15 @@ struct SharedStorage2DWarp
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutQ>> q_i8;
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutdO>> do_i8;
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutK>> k_i8;
-  union
-  {
-    alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<SmemLayoutdOFp16Pair>> do_fp16_pair;
-    WarpScratchStorage warp_scratch;
-  };
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutK>> k_i8_mma_b;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<SmemLayoutdOFp16Pair>> do_fp16_pair;
+  WarpScratchStorage warp_scratch;
   alignas(16) cute::ArrayEngine<cute::uint128_t, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutScorePair>> score_pair_i8;
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
-  cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> q_scale;
-  cute::ArrayEngine<float, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutN>> k_scale;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> lse;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
   float p_scale[Traits::kNumWarps];
-  float dsq_scale[Traits::kNumWarps];
-  float dsk_scale[Traits::kNumWarps];
+  float ds_scale[Traits::kNumWarps];
 };
 
 template <typename Storage, typename Layout>
@@ -332,12 +330,8 @@ __device__ __forceinline__ auto make_head_strided_vector_view(T *const base_ptr,
 
 __device__ __forceinline__ float warp_reduce_max(float value)
 {
-#pragma unroll
-  for (int32_t offset = warpSize / 2; offset > 0; offset >>= 1)
-  {
-    value = fmaxf(value, __shfl_down_sync(0xffffffff, value, offset));
-  }
-  return value;
+  const uint32_t max_bits = __reduce_max_sync(0xffffffffu, __float_as_uint(value));
+  return __uint_as_float(max_bits);
 }
 
 __device__ __forceinline__ int8_t round_to_int8(const float value)
@@ -582,6 +576,97 @@ __device__ __forceinline__ void load_do_fp16_tile(const Gmem gmem, Smem smem, co
     tiled_copy, cute::recast<cute::uint128_t>(gmem), smem, row_base, lane_id);
 }
 
+template <typename Traits,
+          typename GQ,
+          typename GDOInt8,
+          typename GDO,
+          typename SQStorage,
+          typename SDOInt8Storage,
+          typename SDOFp16Storage>
+__device__ __forceinline__ void load_q_do_pair(const GQ gQ,
+                                                const GDOInt8 gDOInt8,
+                                                const GDO gDO,
+                                                SQStorage sQStorage,
+                                                SDOInt8Storage sdOInt8Storage,
+                                                SDOFp16Storage sdOFp16Storage,
+                                                const int32_t m_pair_base,
+                                                const int32_t loader_warp,
+                                                const int32_t lane_id)
+{
+  constexpr auto int8_pair_load_shape = cute::make_shape(
+    cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
+  constexpr auto half_pair_load_shape = cute::make_shape(
+    cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
+  const int32_t m_load_base = m_pair_base + loader_warp * Traits::kMStageLoadRows;
+#pragma unroll
+  for (int32_t pair_half = 0; pair_half < 2; ++pair_half)
+  {
+    const int32_t load_warp = loader_warp + pair_half * Traits::kMStageLoadWarps;
+    auto sQLoad = cute::local_tile(sQStorage, int8_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
+    auto sdOInt8Load = cute::local_tile(sdOInt8Storage, int8_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
+    auto sdOFp16Load = cute::local_tile(sdOFp16Storage, half_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
+    const int32_t row_base = m_load_base + pair_half * Traits::kBlockM;
+    load_q_tile<Traits>(gQ, sQLoad, row_base, lane_id);
+    load_do_int8_tile<Traits>(gDOInt8, sdOInt8Load, row_base, lane_id);
+    load_do_fp16_tile<Traits>(gDO, sdOFp16Load, row_base, lane_id);
+  }
+  cute::cp_async_fence();
+}
+
+template <typename GLse, typename GDelta, typename SLse, typename SDelta>
+__device__ __forceinline__ void load_row_state_pair(const GLse gLse,
+                                                     const GDelta gDelta,
+                                                     SLse sLse,
+                                                     SDelta sDelta,
+                                                     const int32_t m_pair_base,
+                                                     const int32_t seq_len,
+                                                     const int32_t lane_id)
+{
+  const int32_t row = m_pair_base + lane_id;
+  if (row < seq_len)
+  {
+    sLse(lane_id) = gLse(row);
+    sDelta(lane_id) = gDelta(row);
+  }
+  else
+  {
+    sLse(lane_id) = 0.0f;
+    sDelta(lane_id) = 0.0f;
+  }
+}
+
+template <typename Storage, typename Fragment>
+__device__ __forceinline__ void store_packed_mma_b_fragment(Storage &storage,
+                                                            const Fragment &fragment,
+                                                            const int32_t tile,
+                                                            const int32_t lane_id)
+{
+  auto words = cute::recast<uint32_t>(fragment);
+  static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
+  auto *const packed = reinterpret_cast<uint32_t *>(storage.begin());
+#pragma unroll
+  for (int32_t word = 0; word < 4; ++word)
+  {
+    packed[(tile * 4 + word) * warpSize + lane_id] = words(word);
+  }
+}
+
+template <typename Storage, typename Fragment>
+__device__ __forceinline__ void load_packed_mma_b_fragment(const Storage &storage,
+                                                           Fragment &fragment,
+                                                           const int32_t tile,
+                                                           const int32_t lane_id)
+{
+  auto words = cute::recast<uint32_t>(fragment);
+  static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
+  const auto *const packed = reinterpret_cast<const uint32_t *>(storage.begin());
+#pragma unroll
+  for (int32_t word = 0; word < 4; ++word)
+  {
+    words(word) = packed[(tile * 4 + word) * warpSize + lane_id];
+  }
+}
+
 template <typename Tensor>
 __device__ __forceinline__ auto make_transposed_tensor(Tensor tensor)
 {
@@ -696,8 +781,13 @@ __device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle_contiguous(c
   }
 }
 
-template <int32_t HeadDim, int32_t CtaM, int32_t CtaN, int32_t NumWarps>
-__global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t *__restrict__ const Q,
+template <int32_t HeadDim,
+          int32_t CtaM,
+          int32_t CtaN,
+          int32_t NumWarps,
+          int32_t QuantBlockQ,
+          int32_t QuantBlockK>
+__global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mma_kernel_2d_warp(const int8_t *__restrict__ const Q,
                                         const int8_t *__restrict__ const K,
                                         const float *__restrict__ const QScale,
                                         const float *__restrict__ const KScale,
@@ -715,10 +805,19 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
   using Storage = SharedStorage2DWarp<Traits>;
-  static_assert(HeadDim == 64 && CtaM == 64 && CtaN == 64 && NumWarps == 8,
-                "2D warp kernel is specialized for head64 64x64x8");
-  static_assert(Traits::kCtaNMicroTiles == 4 && Traits::kCtaMMicroTiles == 4,
-                "2D warp ownership assumes four M and four N microtiles");
+  static_assert(
+    HeadDim == 64 && CtaM == 64 &&
+      ((CtaN == 64 && NumWarps == 8) || (CtaN == 128 && NumWarps == 16)),
+    "2D warp kernel is specialized for the head64 two-M-half schedule");
+  static_assert(
+    Traits::kCtaNMicroTiles == NumWarps / 2 && Traits::kCtaMMicroTiles == 4,
+    "2D warp ownership requires one warp per (M-half, N-microtile)");
+  static_assert(
+    QuantBlockQ >= 2 * Traits::kBlockM && QuantBlockQ % (2 * Traits::kBlockM) == 0,
+    "Q quantization blocks must contain complete 32-row mainloop pairs");
+  static_assert(
+    QuantBlockK >= Traits::kCtaN && QuantBlockK % Traits::kCtaN == 0,
+    "K quantization blocks must contain complete resident CTA tiles");
 
   const int32_t n_block = blockIdx.x;
   const int32_t head = blockIdx.y;
@@ -748,10 +847,13 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   const auto gLse = make_head_vector_view(Lse, params, batch, head);
   const auto gDelta = make_head_vector_view(Delta, params, batch, head);
   constexpr int32_t kDimBlocks = HeadDim / Traits::kBlockK;
+  constexpr int32_t kDqNPairs = Traits::kCtaN / (2 * Traits::kBlockN);
+  static_assert(kDimBlocks % kDqNPairs == 0, "dQ dimension blocks must divide N-pair owners");
+  constexpr int32_t kDqDimBlocksPerOwner = kDimBlocks / kDqNPairs;
   const int32_t pair_blocks = (params.seq_len + 2 * Traits::kBlockM - 1) / (2 * Traits::kBlockM);
   const float *const gDOScale = DOScale + (batch * params.num_heads + head) * pair_blocks * kDimBlocks;
-  const int32_t q_scale_extent = ((params.seq_len + params.warp_q - 1) / params.warp_q) * 8;
-  const int32_t k_scale_extent = ((params.seq_len + params.warp_k - 1) / params.warp_k) * 4;
+  const int32_t q_scale_extent = (params.seq_len + QuantBlockQ - 1) / QuantBlockQ;
+  const int32_t k_scale_extent = (params.seq_len + QuantBlockK - 1) / QuantBlockK;
   const auto gQScale = make_head_strided_vector_view(QScale, batch, head, params.stride_bz_q_scale, params.stride_h_q_scale, q_scale_extent);
   const auto gKScale = make_head_strided_vector_view(KScale, batch, head, params.stride_bz_k_scale, params.stride_h_k_scale, k_scale_extent);
 
@@ -760,7 +862,6 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
 
   constexpr int32_t score_pair_offset = cute::cosize_v<typename Traits::SmemLayoutScorePair>;
   constexpr int32_t warp_scratch_offset = cute::cosize_v<typename Traits::SmemLayoutdSkdKV>;
-  constexpr int32_t k_scale_offset = cute::cosize_v<typename Traits::SmemLayoutN>;
   constexpr int32_t kBlockMLoadRows = Traits::kMStageLoadRows;
   constexpr int32_t kBlockMLoadWarps = Traits::kMStageLoadWarps;
   constexpr int32_t kCtaNLoadRows = Traits::kCtaNLoadRows;
@@ -775,8 +876,6 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   auto sK = cute::recast<int8_t>(sKStorage);
   auto sV = cute::recast<half>(sVStorage);
   auto sdOFp16Pair = cute::recast<half>(sdOFp16PairStorage);
-  auto sQScale = make_smem_tensor(shared.q_scale, typename Storage::SmemLayoutMPair{});
-  auto sKScale = make_smem_tensor(shared.k_scale, typename Traits::SmemLayoutN{}, n_tile * k_scale_offset);
   auto sLse = make_smem_tensor(shared.lse, typename Storage::SmemLayoutMPair{});
   auto sDelta = make_smem_tensor(shared.delta, typename Storage::SmemLayoutMPair{});
 
@@ -786,15 +885,15 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   constexpr auto score_pair_tile_shape = cute::make_shape(
     cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kScoreAtomK>{});
   auto sPPair = cute::local_tile(sScorePair, score_pair_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
-  auto sdSqPair = cute::local_tile(sScorePair, score_pair_tile_shape, cute::make_coord(cute::_0{}, cute::_1{}));
+  auto sdSPair = cute::local_tile(sScorePair, score_pair_tile_shape, cute::make_coord(cute::_0{}, cute::_1{}));
 
-  const int32_t dsk_slot = 2 * n_pair + m_half;
+  const int32_t ds_slot = 2 * n_pair + m_half;
   auto sWarpScratchStorage = make_smem_tensor(
-    shared.warp_scratch.dsk_dkv, typename Traits::SmemLayoutdSkdKV{}, dsk_slot * warp_scratch_offset);
+    shared.warp_scratch.dsk_dkv, typename Traits::SmemLayoutdSkdKV{}, ds_slot * warp_scratch_offset);
   auto sWarpScratch = cute::recast<int8_t>(sWarpScratchStorage);
-  constexpr auto dsk_tile_shape = cute::make_shape(
+  constexpr auto ds_tile_shape = cute::make_shape(
     cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
-  auto sdSk = cute::local_tile(sWarpScratch, dsk_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
+  auto sdSMirror = cute::local_tile(sWarpScratch, ds_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
 
   using BlockMNShape = typename Traits::BlockMNShape;
   typename Traits::ScoreMMA score_mma;
@@ -824,68 +923,75 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   const int32_t n_load_base = n_cta_base + warp_id * kCtaNLoadRows;
   load_k_tile<Traits>(gK, sKLoad, n_load_base, lane_id);
   load_v_tile<Traits>(gV, sVLoad, n_load_base, lane_id);
+  constexpr int32_t kKPairRows = 2 * Traits::kBlockN;
+  constexpr int32_t kKPairCount = Traits::kCtaN / kKPairRows;
   cute::cp_async_fence();
   cute::cp_async_wait<0>();
-  __syncthreads();
-
-  if (m_half == 0 && lane_id < Traits::kBlockN)
+  if (warp_id < kKPairCount)
   {
-    const int32_t col = n_base + lane_id;
-    sKScale(lane_id) = col < params.seq_len ? key_scale_for_row(gKScale, params, col) : 0.0f;
+#pragma unroll
+    for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
+    {
+      constexpr auto k_pair_shape = cute::make_shape(
+        cute::Int<kKPairRows>{}, cute::Int<Traits::kBlockK>{});
+      const int32_t dim_block = dim_base / Traits::kBlockK;
+      const auto gKPair = cute::local_tile(
+        gK,
+        k_pair_shape,
+        cute::make_coord(n_cta_base / kKPairRows + warp_id, dim_block));
+      const auto gKdQ = qattn_cutlass::make_int8_transposed_b_view(gKPair);
+      auto fragment = thr_mma_score.partition_fragment_B(gKdQ);
+      const auto gKCoordPair = cute::local_tile(
+        cute::make_identity_tensor(cute::shape(gK)),
+        k_pair_shape,
+        cute::make_coord(n_cta_base / kKPairRows + warp_id, dim_block));
+      const auto gKCoordDq = qattn_cutlass::make_int8_transposed_b_view(gKCoordPair);
+      const auto predicate = cute::lazy::transform(
+        thr_mma_score.partition_B(gKCoordDq),
+        [&](auto coord) { return cute::get<0>(coord) < params.seq_len; });
+      cute::clear(fragment);
+      cute::copy_if(predicate, thr_mma_score.partition_B(gKdQ), fragment);
+      store_packed_mma_b_fragment(
+        shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
+    }
   }
   __syncthreads();
+  const float k_block_scale = gKScale(n_cta_base / QuantBlockK);
 
   auto dkv_accum_frag = cute::make_tensor<float>(
     cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
   cute::clear(dkv_accum_frag);
 
-  constexpr auto int8_pair_load_shape = cute::make_shape(
-    cute::Int<kBlockMLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
-  constexpr auto half_pair_load_shape = cute::make_shape(
-    cute::Int<kBlockMLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
+  constexpr int32_t kTailLoaderWarpBase = 2;
+  constexpr int32_t kRowStateLoaderWarp = 6;
+  const bool is_tail_loader =
+    warp_id >= kTailLoaderWarpBase && warp_id < kTailLoaderWarpBase + kBlockMLoadWarps;
+  if (is_tail_loader)
+  {
+    load_q_do_pair<Traits>(
+      gQ,
+      gDOInt8,
+      gDO,
+      sQStorage,
+      sdOInt8Storage,
+      sdOFp16PairStorage,
+      0,
+      warp_id - kTailLoaderWarpBase,
+      lane_id);
+  }
+  if (warp_id == kRowStateLoaderWarp)
+  {
+    load_row_state_pair(gLse, gDelta, sLse, sDelta, 0, params.seq_len, lane_id);
+  }
+  if (is_tail_loader)
+  {
+    cute::cp_async_wait<0>();
+  }
+  __syncthreads();
 
   for (int32_t m_pair_base = 0; m_pair_base < params.seq_len; m_pair_base += 2 * Traits::kBlockM)
   {
-    if (warp_id < kBlockMLoadWarps)
-    {
-      const int32_t m_load_base = m_pair_base + warp_id * kBlockMLoadRows;
-#pragma unroll
-      for (int32_t pair_half = 0; pair_half < 2; ++pair_half)
-      {
-        const int32_t load_warp = warp_id + pair_half * kBlockMLoadWarps;
-        auto sQLoad = cute::local_tile(sQStorage, int8_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
-        auto sdOInt8Load = cute::local_tile(sdOInt8Storage, int8_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
-        auto sdOFp16Load = cute::local_tile(sdOFp16PairStorage, half_pair_load_shape, cute::make_coord(load_warp, cute::_0{}));
-        const int32_t row_base = m_load_base + pair_half * Traits::kBlockM;
-        load_q_tile<Traits>(gQ, sQLoad, row_base, lane_id);
-        load_do_int8_tile<Traits>(gDOInt8, sdOInt8Load, row_base, lane_id);
-        load_do_fp16_tile<Traits>(gDO, sdOFp16Load, row_base, lane_id);
-      }
-      cute::cp_async_fence();
-    }
-
-    if (warp_id == 0)
-    {
-      const int32_t row = m_pair_base + lane_id;
-      if (row < params.seq_len)
-      {
-        sQScale(lane_id) = query_scale_for_row(gQScale, params, row);
-        sLse(lane_id) = gLse(row);
-        sDelta(lane_id) = gDelta(row);
-      }
-      else
-      {
-        sQScale(lane_id) = 0.0f;
-        sLse(lane_id) = 0.0f;
-        sDelta(lane_id) = 0.0f;
-      }
-    }
-    if (warp_id < kBlockMLoadWarps)
-    {
-      cute::cp_async_wait<0>();
-    }
-    __syncthreads();
-
+    const float q_block_scale = gQScale(m_pair_base / QuantBlockQ);
     const int32_t m_base = m_pair_base + m_half * Traits::kBlockM;
     auto acc_score = cute::partition_fragment_C(score_mma, BlockMNShape{});
     auto acc_dp = cute::partition_fragment_C(half_mma, BlockMNShape{});
@@ -935,15 +1041,12 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
 
     auto rPFloat = cute::recast<float>(acc_score);
     float p_max_abs = 0.0f;
-    float dsq_max_abs = 0.0f;
-    float dsk_max_abs = 0.0f;
+    float ds_max_abs = 0.0f;
+    const float score_scale = q_block_scale * k_block_scale;
     // BwdTileTraits<64,64,64,8> maps lane bits and fragment bits to the eight C coordinates.
     {
-
       const int32_t row_state_0 = m_half * Traits::kBlockM + lane_id / 4;
       const int32_t row_state_1 = row_state_0 + 8;
-      const float q_scale_0 = sQScale(row_state_0);
-      const float q_scale_1 = sQScale(row_state_1);
       const float lse_0 = sLse(row_state_0);
       const float lse_1 = sLse(row_state_1);
       const float delta_0 = sDelta(row_state_0);
@@ -960,47 +1063,43 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
         if (row < params.seq_len && col < params.seq_len)
         {
           const bool upper_row = (idx & 2) != 0;
-          const float q_scale = upper_row ? q_scale_1 : q_scale_0;
-          const float k_scale = sKScale(n_local);
-          const float score = static_cast<float>(acc_score(idx)) * q_scale * k_scale;
+          const float score = static_cast<float>(acc_score(idx)) * score_scale;
           p = expf(score * sm_scale - (upper_row ? lse_1 : lse_0));
           ds = p * (acc_dp(idx) - (upper_row ? delta_1 : delta_0)) * sm_scale;
           p_max_abs = fmaxf(p_max_abs, fabsf(p));
-          dsq_max_abs = fmaxf(dsq_max_abs, fabsf(ds * q_scale));
-          dsk_max_abs = fmaxf(dsk_max_abs, fabsf(ds * k_scale));
+          ds_max_abs = fmaxf(ds_max_abs, fabsf(ds));
         }
         rPFloat(idx) = p;
         acc_dp(idx) = ds;
       }
     }
     p_max_abs = warp_reduce_max(p_max_abs);
-    dsq_max_abs = warp_reduce_max(dsq_max_abs);
-    dsk_max_abs = warp_reduce_max(dsk_max_abs);
+    ds_max_abs = warp_reduce_max(ds_max_abs);
     if (lane_id == 0)
     {
       shared.p_scale[warp_id] = p_max_abs / 127.5f + 1.0e-7f;
-      shared.dsq_scale[warp_id] = dsq_max_abs / 127.5f + 1.0e-7f;
-      shared.dsk_scale[warp_id] = dsk_max_abs / 127.5f + 1.0e-7f;
+      shared.ds_scale[warp_id] = ds_max_abs / 127.5f + 1.0e-7f;
     }
     __syncthreads();
 
     const float p_scale = fmaxf(shared.p_scale[warp_id], shared.p_scale[warp_id ^ 1]);
-    const float dsq_scale = fmaxf(shared.dsq_scale[warp_id], shared.dsq_scale[warp_id ^ 1]);
-    const float dsk_scale = fmaxf(shared.dsk_scale[warp_id], shared.dsk_scale[warp_id ^ 2]);
+    float ds_scale = shared.ds_scale[0];
+#pragma unroll
+    for (int32_t scale_warp = 1; scale_warp < Traits::kNumWarps; ++scale_warp)
+    {
+      ds_scale = fmaxf(ds_scale, shared.ds_scale[scale_warp]);
+    }
     const float inv_p_scale = 1.0f / p_scale;
-    const float inv_dsq_scale = 1.0f / dsq_scale;
+    const float inv_ds_scale = 1.0f / ds_scale;
     constexpr auto transposed_store_shape = cute::make_shape(
       cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockM>{});
     auto sPTile = cute::local_tile(sPPair, transposed_store_shape, cute::make_coord(cute::_0{}, m_half));
-    auto sdSqTile = cute::local_tile(sdSqPair, transposed_store_shape, cute::make_coord(cute::_0{}, m_half));
+    auto sdSTile = cute::local_tile(sdSPair, transposed_store_shape, cute::make_coord(cute::_0{}, m_half));
     const auto sP = make_transposed_tensor(sPTile);
-    const auto sdSq = make_transposed_tensor(sdSqTile);
+    const auto sdS = make_transposed_tensor(sdSTile);
     {
       auto rP = cute::make_fragment_like<int8_t>(acc_score);
-      auto rdSq = cute::make_fragment_like<int8_t>(acc_score);
-      const int32_t row_state_0 = m_half * Traits::kBlockM + lane_id / 4;
-      const float q_scale_0 = sQScale(row_state_0);
-      const float q_scale_1 = sQScale(row_state_0 + 8);
+      auto rdS = cute::make_fragment_like<int8_t>(acc_score);
 #pragma unroll
       for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
       {
@@ -1009,47 +1108,26 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
         const int32_t row = m_base + m_local;
         const int32_t col = n_base + n_local;
         int8_t p_i8 = 0;
-        int8_t dsq_i8 = 0;
+        int8_t ds_i8 = 0;
         if (row < params.seq_len && col < params.seq_len)
         {
-          const float ds = acc_dp(idx);
-          const float q_scale = (idx & 2) != 0 ? q_scale_1 : q_scale_0;
           p_i8 = round_to_int8(rPFloat(idx) * inv_p_scale);
-          dsq_i8 = round_to_int8(ds * q_scale * inv_dsq_scale);
+          ds_i8 = round_to_int8(acc_dp(idx) * inv_ds_scale);
         }
         rP(idx) = p_i8;
-        rdSq(idx) = dsq_i8;
+        rdS(idx) = ds_i8;
       }
       auto tCrP = thr_copy_score_c.retile_S(rP);
-      auto tCrdSq = thr_copy_score_c.retile_S(rdSq);
+      auto tCrdS = thr_copy_score_c.retile_S(rdS);
       auto tCsP = thr_copy_score_c.partition_D(sP);
-      auto tCsdSq = thr_copy_score_c.partition_D(sdSq);
+      auto tCsdS = thr_copy_score_c.partition_D(sdS);
       cute::copy(tiled_copy_score_c, tCrP, tCsP);
-      cute::copy(tiled_copy_score_c, tCrdSq, tCsdSq);
-    }
-    {
-      auto rdSk = cute::make_fragment_like<int8_t>(acc_score);
-      const float inv_dsk_scale = 1.0f / dsk_scale;
-#pragma unroll
-      for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
-      {
-        const int32_t m_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
-        const int32_t n_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
-        const int32_t row = m_base + m_local;
-        const int32_t col = n_base + n_local;
-        int8_t dsk_i8 = 0;
-        if (row < params.seq_len && col < params.seq_len)
-        {
-          dsk_i8 = round_to_int8(acc_dp(idx) * sKScale(n_local) * inv_dsk_scale);
-        }
-        rdSk(idx) = dsk_i8;
-      }
+      cute::copy(tiled_copy_score_c, tCrdS, tCsdS);
       constexpr auto score_store_shape = cute::make_shape(
         cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockN>{});
-      auto sdSkHalf = cute::local_tile(sdSk, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
-      auto tCrdSk = thr_copy_score_c.retile_S(rdSk);
-      auto tCsdSk = thr_copy_score_c.partition_D(sdSkHalf);
-      cute::copy(tiled_copy_score_c, tCrdSk, tCsdSk);
+      auto sdSMirrorHalf = cute::local_tile(sdSMirror, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
+      auto tCsdSMirror = thr_copy_score_c.partition_D(sdSMirrorHalf);
+      cute::copy(tiled_copy_score_c, tCrdS, tCsdSMirror);
     }
     __syncthreads();
 
@@ -1095,41 +1173,82 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
         const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
         auto dkv_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dkv_acc);
-        auto tDkdS = thr_mma_score.partition_fragment_A(sdSqPair);
+        auto tDkdS = thr_mma_score.partition_fragment_A(sdSPair);
         auto tDkQ = thr_mma_score.partition_fragment_B(sQdK);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSqPair), thr_copy_score_a.retile_D(tDkdS));
+        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tDkdS));
         cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(tDkQ));
         cute::gemm(thr_mma_score, tDkdS, tDkQ, dkv_acc);
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dkv_acc); ++idx)
         {
           const int32_t dim_block = dim_base / Traits::kBlockK;
-          const float contribution = static_cast<float>(dkv_acc(idx)) * dsq_scale;
+          const float contribution = static_cast<float>(dkv_acc(idx)) * (ds_scale * q_block_scale);
           dkv_accum_frag(dim_block, idx) += contribution;
         }
       }
     }
 
-    if (n_valid && (n_tile & 1) == 0)
+    __syncthreads();
+    const int32_t next_m_pair_base = m_pair_base + 2 * Traits::kBlockM;
+    const bool has_next_m_pair = next_m_pair_base < params.seq_len;
+    if (has_next_m_pair && is_tail_loader)
     {
+      load_q_do_pair<Traits>(
+        gQ,
+        gDOInt8,
+        gDO,
+        sQStorage,
+        sdOInt8Storage,
+        sdOFp16PairStorage,
+        next_m_pair_base,
+        warp_id - kTailLoaderWarpBase,
+        lane_id);
+    }
+    if (has_next_m_pair && warp_id == kRowStateLoaderWarp)
+    {
+      load_row_state_pair(
+        gLse, gDelta, sLse, sDelta, next_m_pair_base, params.seq_len, lane_id);
+    }
+
+    if ((n_tile & 1) == 0)
+    {
+      const int32_t dq_dim_begin = n_pair * kDqDimBlocksPerOwner * Traits::kBlockK;
 #pragma unroll
-      for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
+      for (int32_t dim_offset = 0;
+           dim_offset < kDqDimBlocksPerOwner * Traits::kBlockK;
+           dim_offset += Traits::kBlockK)
       {
-        constexpr auto k_pair_shape = cute::make_shape(
-          cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
-        const auto sKPair = cute::local_tile(
-          sK, k_pair_shape, cute::make_coord(n_pair, dim_base / Traits::kBlockK));
-        const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
+        const int32_t dim_base = dq_dim_begin + dim_offset;
         auto dq_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dq_acc);
-        auto tDqdS = thr_mma_score.partition_fragment_A(sdSk);
-        auto tDqK = thr_mma_score.partition_fragment_B(sKdQ);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSk), thr_copy_score_a.retile_D(tDqdS));
-        cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sKdQ), thr_copy_transposed_b.retile_D(tDqK));
-        cute::gemm(thr_mma_score, tDqdS, tDqK, dq_acc);
+#pragma unroll
+        for (int32_t dq_pair = 0; dq_pair < kDqNPairs; ++dq_pair)
+        {
+          const int32_t dq_ds_slot = 2 * dq_pair + m_half;
+          auto sDSScratchStorage = make_smem_tensor(
+            shared.warp_scratch.dsk_dkv,
+            typename Traits::SmemLayoutdSkdKV{},
+            dq_ds_slot * warp_scratch_offset);
+          auto sDSScratch = cute::recast<int8_t>(sDSScratchStorage);
+          auto sdSDQ = cute::local_tile(sDSScratch, ds_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
+          constexpr auto k_pair_shape = cute::make_shape(
+            cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
+          const auto sKPair = cute::local_tile(
+            sK, k_pair_shape, cute::make_coord(dq_pair, dim_base / Traits::kBlockK));
+          const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
+          auto tDqdS = thr_mma_score.partition_fragment_A(sdSDQ);
+          auto tDqK = thr_mma_score.partition_fragment_B(sKdQ);
+          cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSDQ), thr_copy_score_a.retile_D(tDqdS));
+          load_packed_mma_b_fragment(
+            shared.k_i8_mma_b,
+            tDqK,
+            dq_pair * kDimBlocks + dim_base / Traits::kBlockK,
+            lane_id);
+          cute::gemm(thr_mma_score, tDqdS, tDqK, dq_acc);
+        }
         accumulate_dq_fragment_warp_shuffle_contiguous<Traits>(
           dq_acc,
-          dsk_scale,
+          ds_scale * k_block_scale,
           DQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim,
           m_base,
           dim_base,
@@ -1138,6 +1257,10 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
       }
     }
 
+    if (has_next_m_pair && is_tail_loader)
+    {
+      cute::cp_async_wait<0>();
+    }
     __syncthreads();
   }
 
@@ -1213,8 +1336,8 @@ __global__ void fused_mma_kernel(const int8_t *__restrict__ const Q,
   constexpr int32_t kDimBlocks = HeadDim / Traits::kBlockK;
   const int32_t pair_blocks = (params.seq_len + 2 * Traits::kBlockM - 1) / (2 * Traits::kBlockM);
   const float *const gDOScale = DOScale + (batch * params.num_heads + head) * pair_blocks * kDimBlocks;
-  const int32_t q_scale_extent = ((params.seq_len + params.warp_q - 1) / params.warp_q) * 8;
-  const int32_t k_scale_extent = ((params.seq_len + params.warp_k - 1) / params.warp_k) * 4;
+  const int32_t q_scale_extent = (params.seq_len + params.blk_q - 1) / params.blk_q;
+  const int32_t k_scale_extent = (params.seq_len + params.blk_k - 1) / params.blk_k;
   const auto gQScale = make_head_strided_vector_view(QScale, batch, head, params.stride_bz_q_scale, params.stride_h_q_scale, q_scale_extent);
   const auto gKScale = make_head_strided_vector_view(KScale, batch, head, params.stride_bz_k_scale, params.stride_h_k_scale, k_scale_extent);
 
