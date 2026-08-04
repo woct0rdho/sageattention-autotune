@@ -814,8 +814,7 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   const auto tiled_copy_half_b = cute::make_tiled_copy_B(typename Traits::SmemCopyAtomdPB{}, half_mma);
   const auto thr_copy_half_a = tiled_copy_half_a.get_thread_slice(lane_id);
   const auto thr_copy_half_b = tiled_copy_half_b.get_thread_slice(lane_id);
-  const auto acc_coord = thr_mma_score.partition_C(cute::make_identity_tensor(BlockMNShape{}));
-
+  constexpr int32_t kAccumulatorElements = 8;
   constexpr auto cta_k_load_shape = cute::make_shape(
     cute::Int<kCtaNLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
   constexpr auto cta_v_load_shape = cute::make_shape(
@@ -837,7 +836,7 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   __syncthreads();
 
   auto dkv_accum_frag = cute::make_tensor<float>(
-    cute::make_shape(cute::Int<kDimBlocks>{}, cute::size(acc_coord)), cute::LayoutRight{});
+    cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
   cute::clear(dkv_accum_frag);
 
   constexpr auto int8_pair_load_shape = cute::make_shape(
@@ -938,29 +937,41 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
     float p_max_abs = 0.0f;
     float dsq_max_abs = 0.0f;
     float dsk_max_abs = 0.0f;
-#pragma unroll
-    for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
+    // BwdTileTraits<64,64,64,8> maps lane bits and fragment bits to the eight C coordinates.
     {
-      const auto coord = acc_coord(idx);
-      const int32_t m_local = static_cast<int32_t>(cute::get<0>(coord));
-      const int32_t n_local = static_cast<int32_t>(cute::get<1>(coord));
-      const int32_t row = m_base + m_local;
-      const int32_t col = n_base + n_local;
-      float p = 0.0f;
-      float ds = 0.0f;
-      if (row < params.seq_len && col < params.seq_len)
+
+      const int32_t row_state_0 = m_half * Traits::kBlockM + lane_id / 4;
+      const int32_t row_state_1 = row_state_0 + 8;
+      const float q_scale_0 = sQScale(row_state_0);
+      const float q_scale_1 = sQScale(row_state_1);
+      const float lse_0 = sLse(row_state_0);
+      const float lse_1 = sLse(row_state_1);
+      const float delta_0 = sDelta(row_state_0);
+      const float delta_1 = sDelta(row_state_1);
+#pragma unroll
+      for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
       {
-        const float q_scale = sQScale(m_half * Traits::kBlockM + m_local);
-        const float k_scale = sKScale(n_local);
-        const float score = static_cast<float>(acc_score(idx)) * q_scale * k_scale;
-        p = expf(score * sm_scale - sLse(m_half * Traits::kBlockM + m_local));
-        ds = p * (acc_dp(idx) - sDelta(m_half * Traits::kBlockM + m_local)) * sm_scale;
-        p_max_abs = fmaxf(p_max_abs, fabsf(p));
-        dsq_max_abs = fmaxf(dsq_max_abs, fabsf(ds * q_scale));
-        dsk_max_abs = fmaxf(dsk_max_abs, fabsf(ds * k_scale));
+        const int32_t m_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
+        const int32_t n_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
+        const int32_t row = m_base + m_local;
+        const int32_t col = n_base + n_local;
+        float p = 0.0f;
+        float ds = 0.0f;
+        if (row < params.seq_len && col < params.seq_len)
+        {
+          const bool upper_row = (idx & 2) != 0;
+          const float q_scale = upper_row ? q_scale_1 : q_scale_0;
+          const float k_scale = sKScale(n_local);
+          const float score = static_cast<float>(acc_score(idx)) * q_scale * k_scale;
+          p = expf(score * sm_scale - (upper_row ? lse_1 : lse_0));
+          ds = p * (acc_dp(idx) - (upper_row ? delta_1 : delta_0)) * sm_scale;
+          p_max_abs = fmaxf(p_max_abs, fabsf(p));
+          dsq_max_abs = fmaxf(dsq_max_abs, fabsf(ds * q_scale));
+          dsk_max_abs = fmaxf(dsk_max_abs, fabsf(ds * k_scale));
+        }
+        rPFloat(idx) = p;
+        acc_dp(idx) = ds;
       }
-      rPFloat(idx) = p;
-      acc_dp(idx) = ds;
     }
     p_max_abs = warp_reduce_max(p_max_abs);
     dsq_max_abs = warp_reduce_max(dsq_max_abs);
@@ -987,12 +998,14 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
     {
       auto rP = cute::make_fragment_like<int8_t>(acc_score);
       auto rdSq = cute::make_fragment_like<int8_t>(acc_score);
+      const int32_t row_state_0 = m_half * Traits::kBlockM + lane_id / 4;
+      const float q_scale_0 = sQScale(row_state_0);
+      const float q_scale_1 = sQScale(row_state_0 + 8);
 #pragma unroll
       for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
       {
-        const auto coord = acc_coord(idx);
-        const int32_t m_local = static_cast<int32_t>(cute::get<0>(coord));
-        const int32_t n_local = static_cast<int32_t>(cute::get<1>(coord));
+        const int32_t m_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
+        const int32_t n_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
         const int32_t row = m_base + m_local;
         const int32_t col = n_base + n_local;
         int8_t p_i8 = 0;
@@ -1000,9 +1013,9 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
         if (row < params.seq_len && col < params.seq_len)
         {
           const float ds = acc_dp(idx);
+          const float q_scale = (idx & 2) != 0 ? q_scale_1 : q_scale_0;
           p_i8 = round_to_int8(rPFloat(idx) * inv_p_scale);
-          dsq_i8 = round_to_int8(
-            ds * sQScale(m_half * Traits::kBlockM + m_local) * inv_dsq_scale);
+          dsq_i8 = round_to_int8(ds * q_scale * inv_dsq_scale);
         }
         rP(idx) = p_i8;
         rdSq(idx) = dsq_i8;
@@ -1020,9 +1033,8 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
 #pragma unroll
       for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
       {
-        const auto coord = acc_coord(idx);
-        const int32_t m_local = static_cast<int32_t>(cute::get<0>(coord));
-        const int32_t n_local = static_cast<int32_t>(cute::get<1>(coord));
+        const int32_t m_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
+        const int32_t n_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
         const int32_t row = m_base + m_local;
         const int32_t col = n_base + n_local;
         int8_t dsk_i8 = 0;
@@ -1125,6 +1137,7 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
           lane_id);
       }
     }
+
     __syncthreads();
   }
 
