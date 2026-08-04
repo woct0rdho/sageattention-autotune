@@ -661,6 +661,41 @@ __device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle(const Accum 
   }
 }
 
+template <typename Traits, typename Accum>
+__device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle_contiguous(const Accum &accum_frag,
+                                                                                const float scale,
+                                                                                float *const dst,
+                                                                                const int32_t row_base,
+                                                                                const int32_t dim_base,
+                                                                                const int32_t seq_len,
+                                                                                const int32_t lane_id)
+{
+  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
+  const int32_t lane_row = row_base + lane_id / 8;
+  float *const lane_dst = dst + lane_row * Traits::kHeadDim + dim_base + lane_id % 8;
+#pragma unroll
+  for (int32_t target_idx = 0; target_idx < 8; ++target_idx)
+  {
+    constexpr int32_t kRowsPerTargetPair = 4;
+    const int32_t target_pair = target_idx / 2;
+    const int32_t source_group = (target_idx >= 4 ? 2 : 0) + ((target_idx & 1) != 0 ? 4 : 0);
+    const int32_t row_local = target_pair * kRowsPerTargetPair + lane_id / 8;
+    const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
+    const int32_t source_lane = (row_local & 7) * 4 + (dim_local & 7) / 2;
+    const float source_even = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group)), source_lane);
+    const float source_odd = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group + 1)), source_lane);
+    const float value = (dim_local & 1) == 0 ? source_even : source_odd;
+    const int32_t row = lane_row + target_pair * kRowsPerTargetPair;
+    if (row < seq_len)
+    {
+      constexpr int32_t kPairColumnOffset = 8;
+      atomicAdd(
+        lane_dst + target_pair * kRowsPerTargetPair * Traits::kHeadDim + (target_idx & 1) * kPairColumnOffset,
+        value * scale);
+    }
+  }
+}
+
 template <int32_t HeadDim, int32_t CtaM, int32_t CtaN, int32_t NumWarps>
 __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t *__restrict__ const Q,
                                         const int8_t *__restrict__ const K,
@@ -708,7 +743,6 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
   const auto gV = make_head_matrix_view<HeadDim>(V, params, batch, head, params.stride_bz_v, params.stride_seq_v, params.stride_h_v);
   const auto gDO = make_head_matrix_view<HeadDim>(DO, params, batch, head, params.stride_bz_do, params.stride_seq_do, params.stride_h_do);
   const auto gDOInt8 = make_workspace_matrix_view<HeadDim>(DOInt8, params, batch, head);
-  const auto gDQAccum = make_workspace_matrix_view<HeadDim>(DQAccum, params, batch, head);
   const auto gDK = make_head_matrix_view<HeadDim>(DK, params, batch, head, params.stride_bz_dk, params.stride_seq_dk, params.stride_h_dk);
   const auto gDV = make_head_matrix_view<HeadDim>(DV, params, batch, head, params.stride_bz_dv, params.stride_seq_dv, params.stride_h_dv);
   const auto gLse = make_head_vector_view(Lse, params, batch, head);
@@ -1081,8 +1115,14 @@ __global__ __launch_bounds__(256, 2) void fused_mma_kernel_2d_warp(const int8_t 
         cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSk), thr_copy_score_a.retile_D(tDqdS));
         cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sKdQ), thr_copy_transposed_b.retile_D(tDqK));
         cute::gemm(thr_mma_score, tDqdS, tDqK, dq_acc);
-        accumulate_dq_fragment_warp_shuffle<Traits>(
-          dq_acc, dsk_scale, gDQAccum, m_base, dim_base, params.seq_len, lane_id);
+        accumulate_dq_fragment_warp_shuffle_contiguous<Traits>(
+          dq_acc,
+          dsk_scale,
+          DQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim,
+          m_base,
+          dim_base,
+          params.seq_len,
+          lane_id);
       }
     }
     __syncthreads();
