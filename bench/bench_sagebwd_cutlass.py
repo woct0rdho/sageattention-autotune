@@ -12,9 +12,10 @@ from flash_attn import flash_attn_func
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
 from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
-from sageattention.triton.quant_per_thread import per_thread_int8
+from sageattention.triton.quant_per_block import per_block_int8
 
 BlockConfig = tuple[int, int, int, int]
+_FORWARD_QK_CONFIG: BlockConfig = (64, 64, 32, 64)
 
 
 def _parse_block_config(value: str) -> BlockConfig:
@@ -122,7 +123,6 @@ def _prepare_sage_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     layout: str,
-    block_config: BlockConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.inference_mode():
         result = _sageattn_cutlass_configured(
@@ -132,7 +132,7 @@ def _prepare_sage_forward(
             layout,
             False,
             True,
-            block_config,
+            _FORWARD_QK_CONFIG,
         )
     output, lse = result
     return output, lse
@@ -169,16 +169,14 @@ def _prepare_prequantized_inputs(
     int,
     float,
 ]:
-    blk_q, blk_k, warp_q, warp_k = block_config
+    blk_q, blk_k, _, _ = block_config
     with torch.inference_mode():
-        q_int8, q_scale, k_int8, k_scale = per_thread_int8(
+        q_int8, q_scale, k_int8, k_scale = per_block_int8(
             q,
             k,
             km=None,
             BLKQ=blk_q,
-            WARPQ=warp_q,
             BLKK=blk_k,
-            WARPK=warp_k,
             tensor_layout=layout,
         )
     return (
@@ -315,7 +313,7 @@ def _benchmark_case(
 
     rows: list[dict[str, object]] = []
     for block_config in block_configs:
-        output, lse = _prepare_sage_forward(q, k, v, layout, block_config)
+        output, lse = _prepare_sage_forward(q, k, v, layout)
 
         if include_end_to_end:
             sage_stats = _bench(

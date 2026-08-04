@@ -6,7 +6,7 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
-extern template void launch_mma<64, 32, 128, 4>(
+extern template void launch_mma<64, 64, 64, 4, 32, 64>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
@@ -21,7 +21,7 @@ extern template void launch_mma<64, 32, 128, 4>(
   const Params &params,
   double sm_scale);
 
-extern template void launch_mma<64, 64, 128, 8>(
+extern template void launch_mma<64, 64, 64, 4, 128, 64>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
@@ -36,82 +36,7 @@ extern template void launch_mma<64, 64, 128, 8>(
   const Params &params,
   double sm_scale);
 
-extern template void launch_mma<64, 32, 64, 4>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<64, 64, 64, 4>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<128, 32, 128, 4>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<128, 64, 128, 8>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<128, 32, 64, 4>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<128, 64, 64, 4>(
+extern template void launch_mma<64, 64, 128, 8, 128, 128>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
@@ -142,47 +67,19 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
 {
   if (params.head_dim == 64)
   {
-      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
+      if (params.blk_q == 32 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
       {
-        launch_mma<64, 32, 128, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 64, 4, 32, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
-      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 16 && params.warp_k == 64)
+      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 128 && params.warp_k == 64)
       {
-        launch_mma<64, 64, 128, 8>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 64, 4, 128, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
-      if (params.blk_q == 128 && params.blk_k == 32 && params.warp_q == 32 && params.warp_k == 32)
+      if (params.blk_q == 128 && params.blk_k == 128 && params.warp_q == 128 && params.warp_k == 128)
       {
-        launch_mma<64, 32, 64, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 64 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
-      {
-        launch_mma<64, 64, 64, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-  }
-  if (params.head_dim == 128)
-  {
-      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
-      {
-        launch_mma<128, 32, 128, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 16 && params.warp_k == 64)
-      {
-        launch_mma<128, 64, 128, 8>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 128 && params.blk_k == 32 && params.warp_q == 32 && params.warp_k == 32)
-      {
-        launch_mma<128, 32, 64, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 64 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
-      {
-        launch_mma<128, 64, 64, 4>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 128, 8, 128, 128>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
   }

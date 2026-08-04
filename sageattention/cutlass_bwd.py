@@ -3,16 +3,11 @@ import importlib
 import torch
 import torch.nn.functional as F
 
-from .triton.quant_per_thread import per_thread_int8
+from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
-_BWD_QK_CONFIG = (128, 64, 32, 64)
-_BWD_CONFIGS = (
-    (128, 64, 32, 64),
-    (128, 64, 16, 64),
-    (128, 32, 32, 32),
-    (64, 64, 32, 64),
-)
+_BWD_QK_CONFIG = (32, 64, 32, 64)
+_BWD_CONFIGS = (_BWD_QK_CONFIG, (128, 64, 128, 64), (128, 128, 128, 128))
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -69,8 +64,8 @@ def _sageattn_cutlass_bwd_configured(
         output = F.pad(output, (0, q.size(-1) - output.size(-1)))
     if grad_output.size(-1) != q.size(-1):
         grad_output = F.pad(grad_output, (0, q.size(-1) - grad_output.size(-1)))
-    if q.size(-1) not in (64, 128):
-        raise ValueError("CUTLASS qattn backward currently supports padded head_dim 64 or 128.")
+    if q.size(-1) != 64:
+        raise ValueError("Focused CUTLASS qattn backward currently supports padded head_dim 64 only.")
     if any(tensor.stride(-1) != 1 for tensor in (q, k, v, output, grad_output)):
         raise ValueError("Last dimension of q, k, v, output, and grad_output must be contiguous.")
 
@@ -94,14 +89,12 @@ def _sageattn_cutlass_bwd_configured(
     grad_output = grad_output.contiguous()
     lse = lse.contiguous()
     blk_q, blk_k, warp_q, warp_k = config
-    q_int8, q_scale, k_int8, k_scale = per_thread_int8(
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
         km=None,
         BLKQ=blk_q,
-        WARPQ=warp_q,
         BLKK=blk_k,
-        WARPK=warp_k,
         tensor_layout=tensor_layout,
     )
     grad_query = torch.empty_like(q)

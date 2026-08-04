@@ -86,7 +86,7 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str) -> Non
 
 @pytest.mark.parametrize("config", _BWD_CONFIGS)
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
-@pytest.mark.parametrize("head_dim", (64, 128))
+@pytest.mark.parametrize("head_dim", (64,))
 @pytest.mark.parametrize("seq_len", (64, 65))
 def test_sagebwd_cutlass_config_matches_flashattention(
     config: tuple[int, int, int, int],

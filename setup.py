@@ -82,12 +82,6 @@ def _generated_sources(generator_name: str) -> list[str]:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     dynamic_module = cast(Any, module)
-    if generator_name == "generate_cutlass_bwd_instantiations" and _env_flag_enabled(
-        "SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD"
-    ):
-        dynamic_module.HEAD_DIMS = (64,)
-        dynamic_module.CONFIGS = ((64, 64, 4, 64, 64, 32, 64),)
-        dynamic_module._remove_stale_sources = lambda root, generated: None
     return [str(path.relative_to(ROOT_PATH)) for path in dynamic_module.generate(ROOT_PATH)]
 
 
