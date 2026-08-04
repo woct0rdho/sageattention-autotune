@@ -4,15 +4,15 @@
 
 The correctness-first CuTe migration is complete. Optimization is currently limited to the public head-64 `64x64x32x64` configuration. That public four-warp instantiation selects an internal eight-warp `2 M-halves x 4 N-microtiles` kernel. All other generated configurations keep the validated generic schedule.
 
-The latest accepted focused kernel adds a lane-base contiguous dQ atomic helper to the launch-bounded eight-warp schedule. On the SM86 test GPU it:
+The latest accepted focused kernel adds lane-base contiguous dQ atomics, a lane-local row-state cache, and exact accumulator-coordinate mapping to the launch-bounded eight-warp schedule. On the SM86 test GPU it:
 - passes the four focused head-64 NHD/HND and tail cases.
 - passes Compute Sanitizer Racecheck with `0 hazards` (`0 errors`, `0 warnings`).
 - uses `128` registers/thread and `25,312` bytes of dynamic shared memory.
-- executes `14.428M` instructions at the 512-token profile shape.
-- reports `675,840` local-load sectors, `69,632` local-store sectors, and `1,048,576` global-reduction sectors.
-- measures `0.3267 ms` at 512 tokens and `8.92-9.01 ms` at 4096 tokens in serial 30-warmup/100-repeat runs.
+- executes `14.127M` instructions at the 512-token profile shape.
+- reports `327,680` local-load sectors, `40,960` local-store sectors, and `1,048,576` global-reduction sectors.
+- measures `0.3123 ms` at 512 tokens and `8.43-8.54 ms` at 4096 tokens in serial 30-warmup/100-repeat runs.
 
-FlashAttention measured `0.4372 ms` and `4.62-4.69 ms` in those runs. Sage wins the short shape but remains approximately `1.92-1.95x` slower at 4096 tokens. The fused main kernel, not preprocessing or allocation, remains the performance blocker.
+FlashAttention measured `0.4690 ms` at 512 and `4.58-4.61 ms` at 4096 in those runs. Sage remains approximately `1.83-1.86x` slower at 4096 tokens. The fused main kernel, not preprocessing or allocation, remains the performance blocker.
 
 Normal source generation is restored to exactly eight backward instantiations in the worktree. A normal eight-object rebuild and the full 32-case suite have not yet been rerun after the latest focused optimizations. They remain a retention gate once the focused configuration beats FlashAttention or focused work is otherwise concluded.
 
@@ -152,9 +152,9 @@ SM86 laptop RTX 3080 Ti, batch 1, 16 heads, NHD, head dimension 64, public `64x6
 
 | Sequence | Sage median | Flash median | Sage/Flash |
 |---:|---:|---:|---:|
-| 512 | 0.3267 ms | 0.4372 ms | 1.338x |
-| 4096, run 1 | 8.9221 ms | 4.6162 ms | 0.517x |
-| 4096, run 2 | 9.0071 ms | 4.6853 ms | 0.520x |
+| 512 | 0.3123 ms | 0.4690 ms | 1.502x |
+| 4096, run 1 | 8.4315 ms | 4.6075 ms | 0.546x |
+| 4096, run 2 | 8.5417 ms | 4.5798 ms | 0.536x |
 
 A previous serial thermal diagnostic showed approximately 2.3% timing drift as GPU temperature, power, and clocks varied. Treat sub-2% differences as directional unless supported by profile counters or a controlled A/B rebuild.
 
@@ -164,19 +164,19 @@ The earlier full requested matrix predates the exact eight-warp path. It showed 
 
 Profile shape: sequence 512, batch 1, 16 heads, NHD, ten warmups.
 
-| Metric | Launch-bounded checkpoint | Current lane-base dQ |
+| Metric | Launch-bounded checkpoint | Current coordinate-mapped row state |
 |---|---:|---:|
-| Duration | about 280 us | 273.568 us |
-| Instructions | 15.112M | 14.428M |
+| Duration | about 280 us | 260.800 us |
+| Instructions | 15.112M | 14.127M |
 | Registers/thread | 128 | 128 |
 | Dynamic shared memory | 25,312 B | 25,312 B |
-| Local-load sectors | 802,816 | 675,840 |
-| Local-store sectors | 61,440 | 69,632 |
+| Local-load sectors | 802,816 | 327,680 |
+| Local-store sectors | 61,440 | 40,960 |
 | Global-reduction sectors | 1,048,576 | 1,048,576 |
-| Active warps/scheduler | 3.58 | 3.60 |
-| Eligible warps/scheduler | 0.44 | 0.42 |
+| Active warps/scheduler | 3.58 | 3.62 |
+| Eligible warps/scheduler | 0.44 | 0.45 |
 
-The last full stall profile, before the lane-base dQ refinement, reported `32.81%` barrier stalls. Refresh barrier, tensor-pipe, bank-conflict, and scoreboard metrics on the current kernel before choosing a barrier or layout experiment.
+The current coordinate-mapped profile reports `32.83%` barrier stalls, `15.75%` short-scoreboard stalls, `3.89%` long-scoreboard stalls, `6.16%` INT8 tensor activity, and `3.08%` FP16 tensor activity. Refresh bank-conflict and source-attribution metrics after each further retained change.
 
 Preprocessing and dQ conversion contribute roughly 0-2% of end-to-end time. Their CUTLASS-vs-Triton results vary by shape and do not justify separate optimization while the fused kernel is nearly 2x behind FlashAttention.
 
@@ -204,6 +204,8 @@ Preprocessing and dQ conversion contribute roughly 0-2% of end-to-end time. Thei
 | Eight-warp `(M-half, N-tile)` ownership | removes all pair requantization. Unbounded resources `146` registers and `14.654M` instructions |
 | `__launch_bounds__(256,2)` | two resident CTAs. 4096 timing improved from about `11.69` to `9.02-9.22 ms` despite local traffic |
 | Lane-base contiguous dQ atomics, exact path only | `15.112M -> 14.428M` instructions, `802,816 -> 675,840` local-load sectors, `8.92-9.01 ms` at 4096. Correctness and Racecheck clean |
+| Exact-path row-state cache | Caches the two lane-owned Q-scale/LSE/Delta rows per materialization phase; `14.428M -> 14.169M` instructions, `8.586-8.604 ms` at 4096, correctness and Racecheck clean |
+| Exact-path accumulator-coordinate mapping | Replaces identity-view coordinate extraction in the three scalar materialization loops with the verified lane/fragment mapping; `720,896 -> 327,680` local-load sectors, `65,536 -> 40,960` local-store sectors, `8.43-8.54 ms` at 4096, correctness and Racecheck clean |
 
 ## Rejected Experiment Ledger
 
@@ -219,6 +221,11 @@ Preprocessing and dQ conversion contribute roughly 0-2% of end-to-end time. Thei
 | Two dKV fragments in explicit shared memory | local traffic fell, but shared traffic raised 4096 timing to about `9.31 ms` |
 | Split retained dKV tensor into fixed 1D fragments | no resource or code-generation change |
 | Broad phase-scoped global view reconstruction | instructions/local loads fell, but 4096 was neutral at `9.25 ms` and 512 regressed to `0.350 ms` |
+| Four-warp named barriers for scale and operand exchange | profile duration stayed neutral (`273.28 -> 272.51 us`), barrier stalls remained `32.27%`, and local loads regressed to `802,816` |
+| Asymmetric loop-tail arrive/wait barrier | barrier stalls fell to `29.98%` and local loads to `458,752`, but short-scoreboard stalls rose to `20.91%`, instructions to `14.735M`, and duration to `280.83 us` |
+| Flash-style `exp2f` softmax rewrite | saved `121K` profile instructions but raised local loads to `868,352`; 4096 timing was neutral at `8.583 ms`, so the spill tradeoff is rejected |
+| Four-value K-scale cache in both scalar phases | reduced instructions to `13.935M` and profile duration to `261.7 us`, but raised local loads to `933,888`; 4096 timing was neutral at `8.569 ms` |
+| Four-value K-scale cache only for dS·K quantization | reduced instructions to `14.032M` and local loads to `671,744`, but two 4096 runs regressed to `8.681-8.710 ms` |
 | Naive raw dQ pointer per atomic | local loads fell to `393,216`, but address arithmetic raised instructions to `16.676M` and timing to `9.57 ms` |
 | Shared-memory padding and several isolated swizzle/copy-width changes | neutral or worse conflict-per-wavefront, resources, or timing |
 | Register-fed dQ operand and packed dS stores | reduced some raw conflicts but worsened conflict rates or store traffic |
@@ -227,19 +234,20 @@ Do not repeat rejected paths without a new attribution result that changes the t
 
 ## Remaining Bottlenecks
 
-- Long-sequence gap: current Sage is still approximately 1.92-1.95x slower than FlashAttention at 4096.
-- Synchronization: the last full profile attributed about 32.81% of stalls to barriers. The exact loop still has CTA synchronization after staging, scale exchange, quantized-operand materialization, and gradient consumption.
-- Launch-bound local traffic: lane-base dQ reduces loads, but `675,840` local-load and `69,632` local-store sectors remain. Line-info showed repeated scalar/shared-view state rather than the persistent dKV fragment.
-- Instruction overhead: current Sage executes `14.428M` instructions at the 512 profile shape. Scalar quantization, max reductions, address/view setup, and atomics dominate around the five MMA paths.
+- Long-sequence gap: current Sage is still approximately 1.83-1.86x slower than FlashAttention at 4096.
+- Synchronization: the current full profile attributes `32.79%` of stalls to barriers. The exact loop still has CTA synchronization after staging, scale exchange, quantized-operand materialization, and gradient consumption.
+- Launch-bound local traffic: exact coordinate mapping reduces the profile to `327,680` local-load and `40,960` local-store sectors. Remaining traffic is concentrated in address/view state and dQ atomic address state.
+- Instruction overhead: current Sage executes `14.127M` instructions at the 512 profile shape. Scalar quantization, max reductions, address/view setup, and atomics dominate around the five MMA paths.
 - dQ reduction traffic: 4x8 ownership halves sectors, but `1,048,576` reduction sectors remain and still serialize global accumulation.
 - Mainloop pipeline depth: Q/dO is single-buffered. FlashAttention overlaps more staging and has mature head-specific phase layouts.
 - Head-128: it remains on the generic high-register path and is intentionally not being optimized until head-64 wins.
 
 ## Ordered Next Work
 
-- Collect a current full NCU set for the lane-base kernel: barrier reasons, tensor-pipe activity, shared conflicts per wavefront, local source attribution, scoreboard stalls, and instruction mix.
+- Use the refreshed coordinate-mapped profile (`32.83%` barrier stalls, `15.75%` short-scoreboard stalls, `6.16%` INT8 and `3.08%` FP16 tensor activity) as the current scheduler baseline.
+- Compare the current mainloop and dQ ownership with FlashAttention's head-64 SM80 schedule, then select a schedule-level change with enough upside to justify focused implementation.
 - Use fresh line-info to isolate the remaining repeated local values. Change one address/view lifetime at a time. Broad view reconstruction is already rejected.
-- Reduce synchronization without changing arithmetic. Evaluate subgroup/named barriers where dependencies are confined to one N pair, and evaluate Q/fp16-dO/int8-dO double buffering only if two-CTA occupancy remains possible.
+- Reduce synchronization without changing arithmetic. Four-warp named exchange barriers are rejected; evaluate Q/fp16-dO/int8-dO double buffering only if two-CTA occupancy remains possible.
 - Reduce scalar quantization and reduction instructions. A custom packed conversion/copy atom is justified only if SASS attribution shows existing CuTe operations cannot express the required packed flow.
 - Revisit dQ accumulation only with an end-to-end workspace/launch accounting: split planes, a separate reduction, or different ownership must beat the retained 4x8 atomic path in total time.
 - Continue serial 512/4096 timing after resource/profile gates. Do not run concurrent benchmarks or profiles.
@@ -269,8 +277,8 @@ Also check the following, while using the overall speed as the optimization targ
 
 - Benchmark harness: `bench/bench_sagebwd_cutlass.py`
 - Focused profile harness: `build/profile_sagebwd_once.py`
-- Latest benchmark CSVs: `build/bench_sagebwd_dq_lane_base_ptr.csv`, `build/bench_sagebwd_dq_lane_base_ptr_isolated_repeat.csv`
-- Latest profile CSV: `build/ncu_sage_hd64_dq_lane_base_ptr_isolated.csv`
+- Latest benchmark CSVs: `build/bench_sagebwd_coord_mapping.csv`, `build/bench_sagebwd_coord_mapping_repeat.csv`, `build/bench_sagebwd_coord_mapping_512.csv`
+- Latest profile CSVs: `build/ncu_sage_hd64_coord_mapping.csv`, `build/ncu_sage_hd64_coord_mapping_final.csv`
 - Previous launch-bound profile: `build/ncu_sage_hd64_2dwarp8_lb2.csv`
 - Runtime tests: `tests/test_sagebwd_cutlass.py`
 - Transposed-copy test: `tests/cuda/test_qattn_cutlass_bwd_int8_transposed_copy.cu`
