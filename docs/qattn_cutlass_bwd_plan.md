@@ -1,202 +1,276 @@
 # QAttn CUTLASS Backward Kernel Plan
 
-## Scope
+## Status Snapshot
 
-- SM80-family only, matching the CUTLASS forward extension.
+The correctness-first CuTe migration is complete. Optimization is currently limited to the public head-64 `64x64x32x64` configuration. That public four-warp instantiation selects an internal eight-warp `2 M-halves x 4 N-microtiles` kernel. All other generated configurations keep the validated generic schedule.
+
+The latest accepted focused kernel adds a lane-base contiguous dQ atomic helper to the launch-bounded eight-warp schedule. On the SM86 test GPU it:
+- passes the four focused head-64 NHD/HND and tail cases.
+- passes Compute Sanitizer Racecheck with `0 hazards` (`0 errors`, `0 warnings`).
+- uses `128` registers/thread and `25,312` bytes of dynamic shared memory.
+- executes `14.428M` instructions at the 512-token profile shape.
+- reports `675,840` local-load sectors, `69,632` local-store sectors, and `1,048,576` global-reduction sectors.
+- measures `0.3267 ms` at 512 tokens and `8.92-9.01 ms` at 4096 tokens in serial 30-warmup/100-repeat runs.
+
+FlashAttention measured `0.4372 ms` and `4.62-4.69 ms` in those runs. Sage wins the short shape but remains approximately `1.92-1.95x` slower at 4096 tokens. The fused main kernel, not preprocessing or allocation, remains the performance blocker.
+
+Normal source generation is restored to exactly eight backward instantiations in the worktree. A normal eight-object rebuild and the full 32-case suite have not yet been rerun after the latest focused optimizations. They remain a retention gate once the focused configuration beats FlashAttention or focused work is otherwise concluded.
+
+## Scope And Contracts
+
+- SM80/SM86, matching the CUTLASS forward extension.
 - fp16 `q`, `k`, `v`, `out`, and `dout`.
-- Non-causal fixed-length dense tensors only.
-- `HND` and `NHD` layouts.
-- No GQA/MQA initially: `q`, `k`, and `v` must have matching shape.
-- Head dimensions `64` and `128`.
-- Standalone API only. No trainable wrapper, no compile custom op, and no backward autotune.
-- A small static set of CUTLASS backward block/warp variants is allowed, chosen from FlashAttention backward heuristics and the documented SageBwd Triton fixed-block results.
+- Non-causal, fixed-length, dense attention.
+- HND and NHD layouts.
+- Head dimensions 64 and 128.
+- No GQA/MQA: Q, K, and V must have matching head counts.
+- Standalone backward API only. Trainable wrapper and autotuning remain deferred.
 - Correctness reference is FlashAttention backward.
+- Kernel code remains torch-free in `qk_int8_sv_f16_bwd_kernel_cutlass_sm80.cuh`. Stable-torch validation, allocation, and launch code remain in `qk_int8_sv_f16_bwd_launch_cutlass_sm80.cuh`.
+
+The arithmetic contract is fixed:
+
+| Path | MMA precision |
+|---|---|
+| QK recompute | INT8 `m16n8k32` |
+| dV | INT8 `m16n8k32` |
+| dK | INT8 `m16n8k32` |
+| dQ | INT8 `m16n8k32` |
+| `dP = dO @ V.T` | FP16 `m16n8k16`, FP32 accumulator |
+
+Do not replace dV, dK, or dQ with FP16 MMA. The intended advantage is SM80 INT8 tensor-core throughput and the smaller INT8 operand/register/shared-memory footprint. A custom hardware atom such as `int8_transposed_ldsm_cute.cuh` is allowed only when existing CuTe atoms cannot express the required operation.
 
 ## Current Implementation
 
-The fused loop follows the SageBwd split:
+The launch sequence has three kernels:
 
 ```text
 preprocess:
   Delta_i = sum(out_i * dout_i)
-  zero dQ accumulation workspace
-for each KV tile:
-  for each Q/dO tile:
-    recompute QK with int8 MMA from saved q_int8/k_int8
+  zero the float dQ accumulation workspace
+  reduce dO pair scales and emit packed int8 dO
+
+fused KV-owned main kernel:
+  keep one K/V CTA tile resident
+  for each adjacent 32-row Q/dO pair:
+    recompute QK with int8 MMA
     compute dP = dO @ V.T with fp16 MMA
-    compute P and dS from QK, LSE, dP, and Delta
-    quantize P, dS*q_scale, and dS*k_scale tiles
-    use preprocess-saved dO int8/scales for dV
-    accumulate dV = P.T @ dO with int8 MMA
-    accumulate dK = (dS*q_scale).T @ q_int8 with int8 MMA
-    accumulate dQ = (dS*k_scale) @ k_int8.T with int8 MMA
+    form P and dS from QK, LSE, dP, and Delta
+    quantize P, dS*q_scale, and dS*k_scale
+    accumulate dV, dK, and dQ with int8 MMA
+  write owned dK/dV directly, and atomically reduce dQ
+
 postprocess:
-  convert accumulated dQ workspace to fp16
+  convert the float dQ workspace to fp16
 ```
 
-The CUDA source is split like the forward CUTLASS path: `qk_int8_sv_f16_bwd_kernel_cutlass_sm80.cuh` is torch-free and owns kernel params/helpers/kernels, while `qk_int8_sv_f16_bwd_launch_cutlass_sm80.cuh` owns stable-torch validation, temporary allocations, dispatch, and the public wrapper.
+### Storage And Lifetimes
 
-The kernel uses CuTe/CUTLASS MMA instead of `<mma.h>` / `nvcuda::wmma`. QK recompute, dV, dK, and dQ use the SM80 `m16n8k32` int8 atom. Normal generation retains exactly eight static public CTA instantiations. Seven use the generic `threadIdx.y` N-warp schedule; the `head_dim=64`, public `64x64x32x64` instantiation selects an internal eight-warp `2 M-halves x 4 N-microtiles` specialization while head-128 keeps the generic four-warp path. Canonical 32-row Q, fp16 dO, and preprocess-produced int8-dO pairs are staged once per adjacent M pair. K/V are full CTA-resident shared tensors loaded through `GmemTiledCopyK` / `GmemTiledCopyV` before warps select microtile views.
+- K and V are CTA-resident across the complete M loop.
+- Q, fp16 dO, and preprocess-produced int8 dO use one canonical 32-row resident pair each.
+- The dead int32 score fragment is recast in place for P. The dP fragment is overwritten by dS.
+- `score_pair_i8` has four slots, one P/`dS*q_scale` pair for each N microtile.
+- `WarpScratchStorage` has four slots for paired `dS*k_scale`. The same allocation aliases fp16 dO before dS materialization and the half dKV epilogue after the M loop.
+- Each exact-schedule warp owns one persistent 32-float dV or dK fragment. Source-correlated SASS keeps it in `R5` through `R36`. It is not the source of the launch-bound local traffic.
+- Q/int8-dO, K/V, P/`dS*q_scale`, and persistent dKV state overlap in the schedule and cannot be blindly aliased.
 
-The arithmetic contract is fixed at four int8 MMA paths (`QK`, dV, dK, and dQ) plus one fp16 MMA path (`dO @ V.T`). The dP path stays fp16 because its accuracy is insufficient with int8; converting dV/dK/dQ to fp16 is also out of scope because it discards the intended 2x SM80 tensor-core throughput and the 0.5x int8 operand footprint. Performance work must expose that int8 advantage by reducing quantization, ownership, and staging overhead without changing the five-MMA precision contract validated by the tests.
+The score, dV, dK, and dQ paths use CuTe MMA/copy contracts. Resident Q/K/int8-dO transposed-B reads use the custom CuTe-facing LDSM atom rather than explicit shared transposes. The dKV epilogue uses `SmemCopyAtomdKVC` and `GmemTiledCopydKV` for row-contiguous vector stores.
 
-Pair `cp.async` staging overlaps the per-row Q-scale/LSE/Delta loads before the shared-read barrier. K scales stay resident while iterating over M. In the active eight-warp specialization, each `(M-half, N-tile)` owner keeps one 32-float dV or dK fragment across the M loop; the final epilogue uses `SmemCopyAtomdKVC` and `GmemTiledCopydKV` for row-contiguous vector stores. Half-precision dO staging aliases `WarpScratchStorage` behind an explicit lifetime barrier. Four score-pair slots retain one complete P/`dS*q_scale` pair per N tile, and four scratch slots retain both `dS*k_scale` M-halves for each adjacent N pair.
+### Exact Head-64 Schedule
 
-One 32-row preprocessing CTA computes coalesced Delta reductions, clears dQ accumulation through `GmemTiledCopyDQZero`, computes each dO pair scale once, and emits packed int8 dO. The standalone dQ conversion uses `GmemTiledCopyDQAccum` / `GmemTiledCopyDQ`. During score materialization, the dead int32 score fragment is recast in place to retain P and the dP fragment is overwritten by dS, so each logical score executes one `expf`.
+For public `64x64x32x64`, eight warps cover `(M-half, N-tile)` ownership:
+- the two M-half owners of an N tile exchange maxima and directly quantize P and `dS*q_scale` at final pair scales.
+- adjacent N-tile owners exchange maxima and directly quantize paired `dS*k_scale`.
+- all old pair store/reload/re-round rescale passes are eliminated.
+- one M-half owner accumulates dV and the other dK.
+- only the even N-tile owner executes dQ for its adjacent N pair.
 
-The active head-64 specialization exchanges P and `dS*q_scale` maxima between the two M-half owners of each N tile, and exchanges `dS*k_scale` maxima between adjacent N-tile owners. It therefore quantizes all three operands directly at their final pair scales and eliminates every pair store/reload/re-round rescale pass. dV reads resident int8 dO, while dK and dQ read resident Q and K through the custom CuTe transposed-B atom. Only the even N-tile owner executes dQ; its 4x8 shuffle ownership halves global reduction sectors to `1,048,576` at the 512-token profile shape. Generic variants retain the validated two-stage path. Predicate-zeroed resident rows cover all tail cases with no explicit K, Q, or int8-dO shared transpose.
+The kernel has `__launch_bounds__(256, 2)`. The 128-register limit permits two 256-thread CTAs on SM86. Unbounded compilation uses 146 registers and permits only one CTA, which is slower despite having no local traffic.
 
-## Comparison With FlashAttention Backward
+The dQ epilogue uses a 4x8 destination permutation. Two scalar shuffles per output iteration give each atomic instruction four rows by eight contiguous columns, reducing global-reduction sectors from `2,097,152` to `1,048,576`. The exact specialization computes one contiguous lane-specific workspace base per dQ MMA fragment. Its eight atomics then use compile-time offsets. Generic kernels retain the CuTe workspace view.
 
-Ignoring unsupported user-facing features, the main performance-relevant difference is that FlashAttention backward is a mature tuned multi-warp CTA schedule, while the current SageAttention CUTLASS backward has only the first static multi-warp CTA variants and still lacks tuned mainloop buffering, epilogue layouts, and several operand staging layouts.
+## Generated Configurations
 
-FlashAttention's SM80 backward uses a sequence-K-parallel, KV-owned main kernel with head-dim-specific traits. For the target `head_dim=64/128` cases it launches 8-warp CTAs, uses `BlockM/BlockN` choices such as `64x128`, `128x128`, or `64x64` depending on head dimension and available shared memory, and gives the `S/dP`, `dKV`, and `dQ` matmuls separate `TiledMMA` layouts. It keeps a K/V tile resident while iterating over Q/dO tiles, double-buffers Q/dO when profitable, accumulates `dK`/`dV` in register fragments across the M loop, and only uses the `dQAccum` workspace for the sequence-parallel reduction.
+Normal generation produces the cross product of head dimensions `{64,128}` and these four public configurations:
 
-The current CUTLASS backward still uses `16x16` warp-owned microtiles, but generated launch variants now group them into CTA shapes such as `32x128`, `64x128`, `32x64`, and `64x64` with four or eight warps. This reduces the original scaffolding overhead, but the kernel still lacks FlashAttention's tuned per-phase layouts and deeper Q/dO double buffering.
+| Public config | CTA M | CTA N | Generated warps | Current implementation |
+|---|---:|---:|---:|---|
+| `128x64x32x64` | 32 | 128 | 4 | generic |
+| `128x64x16x64` | 64 | 128 | 8 | generic |
+| `128x32x32x32` | 32 | 64 | 4 | generic |
+| `64x64x32x64` | 64 | 64 | 4 | exact internal 8-warp kernel for head-64. Generic for head-128 |
 
-Other structural differences that matter for performance:
-- Both kernels now keep K/V resident across the KV-owned M loop, but FlashAttention still has deeper Q/dO mainloop buffering; the current CUTLASS backward only overlaps Q/dO `cp.async` with row-state scalar loads.
-- Both kernels now keep `dK` and `dV` partials in register fragments across the M loop and use shared-memory staging for the final stores; FlashAttention still has more mature tuned epilogue layouts.
-- FlashAttention exposes `Is_V_in_regs` / `No_double_buffer` traits and tuned mainloop buffering; the current CUTLASS backward has no Q/dO double-buffered mainloop pipeline.
-- FlashAttention's low bank-conflict rate comes from an end-to-end shared-memory contract, not from isolated store ordering. Q/dO, K/V, P/dS, dQ, and dKV are physically stored in swizzled layouts; transposed operands are usually alternate views over that same storage, often with `get_nonswizzle_portion(...)`, rather than separate plain transposed scratch copies. P/dS is especially important: FlashAttention stores score fragments with `make_tiled_copy_C_warpcontiguousN(...)` into a dedicated `Swizzle<3,3,3>` `SmemLayoutPdS`, then reuses swizzled or transposed views for dQ/dK/dV. The current CUTLASS backward now gives K, Q, and int8 dO one-allocation phase views and materializes P/dS through a warp-contiguous CuTe C-copy contract; physical-layout tuning and bank-conflict attribution remain post-migration work.
-- FlashAttention specializes common even-M/N and even-K cases. Our target shapes are padded to 256 with `head_dim in {64,128}`, so an optimized SageAttention path can assume far less boundary work than the current generic predicated kernel.
-- SageAttention has an algorithmic advantage only if the implementation exposes it: `QK`, `dV`, `dK`, and `dQ` should run on fast int8 MMA and use smaller operands. All four CUTLASS backward int8 paths now use `SM80_16x8x32_S32S8S8S32_TN`.
+Current explicit shared-memory/resource figures are:
 
-## Benchmark And Profiling Results
-
-`bench/bench_sagebwd_cutlass.py` now benchmarks the requested `num_heads={16,32}`, `head_dim={64,128}`, and `seq_len={4096,8192}` grid, all four generated backward configurations, and both `kernel_only` and `end_to_end` modes. It reports median, mean, standard deviation, effective backward TFLOPS, Sage speedup versus FlashAttention, and per-shape configuration rank. `kernel_only` reuses prequantized Q/K and output buffers; `end_to_end` includes Sage Q/K quantization and output allocation. FlashAttention setup is outside the timed backward call, and Sage forward setup uses the same block configuration as backward.
-
-The first full matrix and reversed-order sweeps still show Sage below FlashAttention. The best schedules are generally `64x64x32x64` and `128x32x32x32`, with Sage/Flash speedups approximately `0.41-0.57x` for head dimension 64 and `0.44-0.48x` for head dimension 128. Kernel-only and end-to-end results differ by roughly `0-2%`, so the main gap is the fused backward kernel rather than quantization or allocation. A focused post-optimization sweep at `batch=1`, `heads=16`, `seq_len=4096`, and `kernel_only` measured:
-
-| Head dim | `128x64x32x64` | `128x64x16x64` | `128x32x32x32` | `64x64x32x64` | Flash median |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 14.202 ms | 13.200 ms | 10.905 ms | **10.696 ms** | 6.212 ms |
-| 128 | 29.081 ms | 22.378 ms | 19.833 ms | **19.417 ms** | 9.325 ms |
-
-The table records the pre-eight-warp comparison. The accepted launch-bounded head-64 specialization measures `0.329-0.330 ms` at 512 tokens and `9.02-9.22 ms` at 4096 tokens across 30-warmup/100-repeat serial runs; FlashAttention measured `0.429-0.460 ms` and `4.55-4.63 ms`. Thus Sage wins the short shape but remains about `1.98x` slower at 4096. Repeated measurements are interpreted with warmups and reversed order. A serial thermal diagnostic on `heads=32`, `head_dim=128`, `seq_len=8192` showed about `2.3%` latency drift while GPU telemetry varied from `58-77 C`, `102.95-123.6 W`, and `1417-1725 MHz`, so close results are not treated as decisive from one run.
-
-### Current Nsight Attribution
-
-The refreshed SM86 Nsight Compute baseline uses `seq_len=512`, `batch=1`, `heads=16`, NHD, config `64x64x32x64`, and ten warmups. The fused head-64 kernel takes `290.432 us`, executes `17.176M` instructions, uses `164` registers and `25,040` bytes of dynamic shared memory, and has `0.29` eligible warps per scheduler. It reports `20.92%` barrier stalls and `21.46%` short-scoreboard stalls. The fused head-128 kernel takes `684.672 us`, executes `23.745M` instructions, uses `250` registers and `41,424` bytes of shared memory, and has `0.23` eligible warps per scheduler, with `16.86%` barrier and `22.47%` short-scoreboard stalls.
-
-Shared-memory traffic is substantial but is not yet the clearest first target: head-64 reports `417,754` load conflicts and `8,309` store conflicts over `3,006,426` load and `590,547` store wavefronts; head-128 reports `938,443` load conflicts and `16,128` store conflicts over `5,116,371` load and `639,327` store wavefronts. Tensor activity remains low relative to FlashAttention: Sage head-64 reports `5.53%` IMMA and `2.77%` HMMA active cycles, while head-128 reports `4.69%` IMMA and `2.35%` HMMA. FlashAttention's main backward kernels execute about `2.716M` and `4.908M` instructions and reach approximately `22.97%` and `30.61%` HMMA activity for head dimensions 64 and 128.
-
-Line-info source correlation on the older generic head-64 path attributed instruction and global-sector overhead to repeated scalar int8 conversion/repacking and dQ accumulation. The current bounded eight-warp profile instead executes about `15.112M` instructions at 128 registers with `25,312` bytes of dynamic shared memory, `3.58` active and `0.44` eligible warps per scheduler, and `1,048,576` global-reduction sectors. Its `802,816` local-load and `61,440` local-store sectors do not come from the persistent 32-float dKV fragment: SASS keeps that fragment in `R5` through `R36`. Ten scalar/shared-view values are reloaded on every M pair, with four more reloads around dQ atomics. The next no-arithmetic-change experiment should shorten or reconstruct those phase-specific CuTe view/address values rather than move dKV accumulation to shared memory.
-
-### Retained Optimization
-
-The direct pair-scale dS quantization change is retained only for `HeadDim=64, CtaM=64, CtaN=64, NumWarps=4`. It removes one pair of shared reads, one int8 store pass, and one re-rounding pass per adjacent N-warp pair. The focused candidate reduced representative head-64 fused execution from `17.176M` to `15.933M` instructions and duration from `290.432 us` to `276.352 us` in separate `--clock-control none` profiles, while preserving `164` registers, `25,040` bytes of shared memory, zero spills, and the existing correctness contract. The analogous un-gated head-128 experiment was rejected because it reached `255` registers and regressed the long-shape timing; the original head-128 path was restored and reprofiled at `23.745M` instructions and `250` registers.
-
-### Focused dQ Experiment
-
-Optimization is temporarily focused on the head-64 `64x64x32x64` public block configuration. `SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD=1` makes `setup.py` generate and link only that head/config dispatch while iterating; an unset variable still generates the normal eight backward instantiations. A full build and the complete test matrix remain required before retention.
-
-The retained dQ register permutation gives each atomic instruction four rows by eight contiguous columns. It uses two scalar 32-bit warp shuffles per output iteration, applies to every dQ fragment, and reduces `l1tex__t_sectors_pipe_lsu_mem_global_op_red.sum` from `2,097,152` to `1,048,576` at the 512-token profile shape. The earlier four-warp form measured about `10.25 ms` at 4096 tokens and raised registers to `168`; the accepted eight-warp schedule absorbs the same permutation while reducing total instruction count and splitting dKV ownership. Four focused tail/layout cases pass and the production-selected path is Racecheck-clean.
-
-The earlier all-lane row-major permutation is rejected: it paid 32 hardware shuffles per 16x16 fragment and regressed the 4096-token kernel-only result to about `12.11 ms`. The first packed shuffle order is also rejected because it increased reduction sectors to `5,242,880`.
-
-### Allocation-Lifetime Audit
-
-- The score accumulator is already recast in place as P and the dP accumulator is overwritten as dS. These register allocations have disjoint phases and should remain reused.
-- `do_fp16` already aliases `WarpScratchStorage`: fp16 dO is consumed by dP before the same bytes hold `dS*k_scale`, and the scratch is reused again for the final half dKV epilogue. This is the main shared-memory lifetime reuse and must retain its barriers.
-- `q_i8` and `do_i8` cannot alias in the active eight-warp schedule because the dV and dK owners consume both resident pairs in the same phase. Resident K and V also span the complete M loop and overlap.
-- P and `dS*q_scale` occupy disjoint halves of `score_pair_i8` and coexist until the dV/dK MMAs. Each warp's single dK or dV accumulation fragment spans the complete M loop and cannot alias score state.
-- Line-info shows that phase-spanning shared tensor views and scalar coordinates, not the dKV fragment, cause the launch-bound local traffic. Reconstructing selected views inside their use phase is the next low-risk register test.
-- LSE, Delta, and row scales are small. They overlap during score/P/dS materialization; aliasing the dead tail with the four-float scale exchange would save too little shared memory to affect occupancy.
-
-The accepted structural schedule keeps all four int8 MMAs and changes warp ownership only for the focused `64x64` CTA. Eight warps cover a `2 M-halves x 4 N-microtiles` grid concurrently. For each N tile, one M-half warp owns persistent dV and the other owns persistent dK, so each warp carries one 32-float dKV accumulator instead of both. The two M warps exchange maxima before directly quantizing P and `dS*q_scale` at their final pair scales; adjacent N tiles similarly exchange maxima before directly quantizing `dS*k_scale`. This removes all P, dSq, and dSk pair-rescale passes without changing the four-int8/one-fp16 contract.
-
-The first implementation passes the four focused correctness cases and Racecheck with zero hazards. It reduces the fused profile from the four-warp shuffle candidate's `17.480M` instructions and `168` registers to `14.654M` instructions and `146` registers, keeps reduction sectors at `1,048,576`, uses `25,312` bytes of shared memory, and reports zero local spills. Shared load conflicts are `393,216` over `2,867,200` wavefronts and stores fall to `50` conflicts over `399,922` wavefronts. The split ownership also reduces short-scoreboard stalls to `13.51%`, but the 256-thread block is limited to one resident CTA by registers: active warps fall to `2.01` per scheduler, eligible warps to `0.27`, barrier stalls rise to `30.04%`, profile duration rises to about `340 us`, and 4096-token kernel-only time regresses to about `11.69 ms`.
-
-A `__launch_bounds__(256, 2)` build reaches the required `128` registers and raises active/eligible warps to `3.58` / `0.44` per scheduler. It improves the focused 4096-token result to about `9.02-9.05 ms`, but compiler spilling produces `802,816` local-load and `61,440` local-store sectors at 512 tokens; instructions rise to `15.112M` and barrier stalls remain high at `32.81%`. CUDA 13 provides `.pragma "enable_smem_spilling"` on SM75 and newer. PTXAS rejects the pragma on a kernel that declares dynamic shared memory. Converting the exact specialization's fixed allocation to static shared makes the pragma legal, but does not migrate these spills. Source-correlated SASS later established that the 32-float dKV fragment remains scalarized in registers while phase-spanning address/view state is spilled.
-
-The bounded partial-accumulator variant explicitly kept two of the four 16-column float dKV fragments in registers and laid out the other two in lane-contiguous shared memory. The added `16,384` bytes raised explicit storage to `41,696` bytes and reduced local sectors to `327,680` loads / `45,056` stores, but added shared traffic and regressed 4096-token timing from about `9.05` to `9.31 ms`. Splitting the retained register tensor into fixed 1D fragments did not change generated resources or local traffic. This explicit shared-accumulator path is rejected; restore the faster compiler-spilled launch-bounded form and use line-info attribution before another ownership change.
-
-## Benchmark Gate
-
-The correctness migration and evidence-independent cleanup are complete. No obvious redundant allocation, logical-tile recomputation, idle configured warp, duplicate preprocessing reduction, scalar bulk utility copy, or removable CTA barrier remains. The next decisions require paired timing and NCU evidence:
-- Reduce shared-memory bank conflicts only when a change also improves timing or removes a measured dependency. The current migration baseline reports head-64 fused shared conflicts of `417,754` loads and `8,309` stores, and head-128 conflicts of `938,443` loads and `16,128` stores for the measured `64x64` path. These are paired with substantial wavefront counts and must be evaluated as conflicts per wavefront, not raw totals.
-- Reduce the active head-64 path's local traffic without exceeding `128` registers: it has `3.58` active and `0.44` eligible warps per scheduler but reloads ten scalar/view values per M pair. Head-128 remains at `250` registers and `0.23` eligible warps per scheduler on its generic path.
-- Reduce the active head-64 path's `32.81%` barrier stalls after local-address pressure. The historical generic baseline reported `5.53%` / `4.69%` IMMA activity and `2.77%` / `2.35%` HMMA activity for head dimensions 64/128; FlashAttention's main backward reaches about `22.97%` / `30.61%` HMMA activity.
-
-### Utility-Kernel Baseline
-
-The Triton backward already has equivalents for both CUTLASS utility stages. `_zero_dq_accum_kernel` plus `_bwd_preprocess_delta_do_quant` correspond to the combined CUTLASS `preprocess_delta_zero_dq_kernel`; `_convert_dq_accum_kernel` corresponds to `convert_dq_kernel` when `DQ_SPLITS=1`. Triton uses two preprocessing launches while CUTLASS uses one.
-
-An SM86 production-context profile used `batch=1`, `heads=16`, `NHD`, fp16 O/dO/dQ, `BLOCK_M=32`, `BLOCK_N=128`, five warmups, and 30 interleaved repetitions. Both utility sequences ran as part of their complete backward launch order so conversion observed the cache state left by the fused mainloop. Times are median CUDA kernel durations; the combined column includes preprocessing, dQ clearing, and conversion but excludes the fused mainloop.
-
-| Sequence | Head dim | CUTLASS combined | Triton combined | Faster |
+| Head dim | `32x128x4` | `64x128x8` | `32x64x4` | public `64x64x4` |
 |---:|---:|---:|---:|---:|
-| 64 | 64 | 3.904 us | 4.513 us | CUTLASS 1.16x |
-| 64 | 128 | 6.368 us | 5.312 us | Triton 1.20x |
-| 512 | 64 | 16.688 us | 21.186 us | CUTLASS 1.27x |
-| 512 | 128 | 51.296 us | 46.835 us | Triton 1.10x |
-| 2048 | 64 | 94.914 us | 92.385 us | Triton 1.03x |
-| 2048 | 128 | 204.196 us | 176.548 us | Triton 1.16x |
-| 4096 | 64 | 162.148 us | 153.650 us | Triton 1.06x |
-| 4096 | 128 | 401.207 us | 349.527 us | Triton 1.15x |
+| 64 shared memory | 37,328 B | 45,792 B | 25,040 B | 25,312 B for exact internal kernel |
+| 64 registers | 196 | 164 | 164 | 128 launch-bounded |
+| 128 shared memory | 66,000 B | 74,464 B | 41,424 B | 41,424 B |
+| 128 registers | 255 | 250 | 252 | 250 |
 
-CUTLASS preprocessing is faster for short `head_dim=64` inputs, but this does not extend to long sequences or to `head_dim=128`. Conversion is near parity at sequence lengths 2048 and 4096; its short cache-resident results vary more with the preceding workload. There is therefore no general CUTLASS/CuTe utility-kernel speedup to pursue. Keep the existing CUTLASS utilities because they fit its workspace contract and save one preprocessing launch, not because CuTe intrinsically outperforms Triton here.
+The seven generic variants had zero stack/local memory in the last normal resource build. Refresh those figures only when normal generation is rebuilt. Do not infer them from a focused link containing stale generic objects.
 
-This is a native shipped-behavior comparison, not identical arithmetic. Triton emits one dO scale per `BLOCK_M x HEAD_DIM` tile, while CUTLASS emits one per `32 x 16` tile. CUTLASS consequently performs more max reductions and writes more scale metadata, especially for `head_dim=128`; replacing either path requires reconciling that quantization contract before treating timing differences as backend code-generation differences.
+## Build And Validation Workflow
 
-## Bank-Conflict Work
+Focused iteration builds only the active public configuration and leaves stale generated source files in place:
 
-The pre-migration NCU results above are attribution history, not a current baseline: resident Q/dO pairs, the custom transposed-B atom, and the CuTe score/dS materialization contract changed the shared-memory traffic. The performance phase must begin with fresh NCU resource, conflict-per-wavefront, tensor-pipe, eligible-warp, and spill measurements.
+```powershell
+$Env:SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD = '1'
+$Env:MAX_JOBS = '4'
+python setup.py build_ext --inplace
+```
 
-### Migration Status
+Use `MAX_JOBS=4` rather than `build_ext -j 4` on this Windows setup. The latter parallelizes both extension modules, launches two Ninja processes in the same object directory, and can fail with object-file `Permission denied` races.
 
-The correctness-first CuTe migration is complete. K, Q, and quantized dO each have one canonical resident allocation, all explicit shared transpose paths are gone, score/dS materialization is expressed through tensor views and CuTe C-copy contracts, and the kernel uses canonical `SmemLayout*`, `GmemTiledCopy*`, and `SmemCopyAtom*` trait names.
+To restore normal generation and build all eight backward objects:
 
-Final validation compiled the wrapper plus all eight generated backward objects for SM80, relinked `_qattn_cutlass_sm80.pyd`, and passed `tests/test_sagebwd_cutlass.py` on SM86 with `32 passed`. Compute Sanitizer Racecheck passed the same matrix with `0 hazards` (`0 errors`, `0 warnings`). The standalone `SM80_U32x4_LDSM_T_INT8_B` copy-plus-MMA test compiled for SM80 and ran on SM86 with `failures=0`. The generated source set contains exactly eight backward instantiations, and the final shared-memory sizes match the resource snapshot below.
+```powershell
+Remove-Item Env:SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD -ErrorAction SilentlyContinue
+$Env:MAX_JOBS = '4'
+python setup.py build_ext --inplace
+```
 
-### Alternatives To Benchmark
+Focused correctness and Racecheck commands:
 
-Benchmark these as explicit alternatives from the validated CuTe baseline; change one ownership/layout decision at a time and keep only measured improvements:
-- For head-64 `64x64`, shorten or reconstruct the source-attributed phase-spanning CuTe shared-view/address state while preserving the accepted eight-warp ownership, 128-register occupancy threshold, and four-int8/one-fp16 MMA contract.
-- Compare the full logical-tile transposed-B atom against two hardware-atom-sized copies, accepting duplicated LDSM work only if shorter live ranges materially reduce registers.
-- Compare the software-assisted transposed-B atom with the old explicit shared transpose as a retained benchmark patch, including instruction count, registers, shared traffic, and conflict-per-wavefront.
-- Probe K/Q/dO physical layouts that interleave byte columns or change the LDSM row-address map to reduce warp shuffles or `prmt` operations without duplicating shared data.
-- Probe separate swizzle/no-swizzle families for resident K, resident Q, resident int8 dO, score/dS parents, and the dKV epilogue; do not require one universal physical layout.
-- Compare single-buffer and double-buffer Q/fp16-dO/int8-dO pair staging, including head-dimension-specific `No_double_buffer` traits.
-- Compare V-resident-in-shared with V-in-register phases, and forward versus reverse M traversal, after register live ranges are visible.
-- Probe phase-specific CTA-wide `TiledMMA` and A/B/C copy layouts in this order: dKV, dQ, dK, then score/dP.
-- Compare scalar dQ atomics with split accumulation planes, larger N ownership, and a separate reduction kernel.
-- Run the final bank-conflict/resource/stall gate only after selecting among these alternatives; use conflict-per-wavefront, tensor-pipe activity, eligible warps, registers, shared memory, and spills as the decision metrics.
+```powershell
+python -m pytest -q tests/test_sagebwd_cutlass.py -k '64-64 and config3 or 65-64 and config3'
 
-### Avoid
+& 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\compute-sanitizer.bat' `
+  --tool racecheck --error-exitcode 1 `
+  python -m pytest -q `
+  'tests/test_sagebwd_cutlass.py::test_sagebwd_cutlass_config_matches_flashattention[65-64-HND-config3]'
+```
 
-Avoid unless new evidence changes the tradeoff:
-- Replacing dV, dK, or dQ with fp16 MMA. The validated Sage backward accuracy/performance contract is four int8 MMA paths plus fp16 `dO @ V.T`; fp16 gradient MMAs give up both the SM80 int8 throughput advantage and compact operand storage.
-- Direct forward-style composed swizzles on the dV/dQ LDSM views with the existing `SM75_U32x4_LDSM_N` copy path; the tested variants fail CuTe layout vectorization before profiling.
-- Forcing the generic `cp.async` tiled-copy helper to four lanes per row fails CuTe layout construction for `head_dim=128` row-4 staging variants, producing zero-sized tiled-copy shapes before profiling.
-- Site-specific four-lane `cp.async` staging through `GmemTiledCopyQ` / `GmemTiledCopyK` / `GmemTiledCopyV` / `GmemTiledCopydO` is not worth keeping without a new destination-layout idea: V-only and K-only variants built and passed but were neutral/slightly worse by conflict-per-wavefront, while dO-only and Q-only are blocked by the `Rows=4`, `LineLanes=4`, `kRowsPerIter=8` copy-contract assertion.
-- Replacing the per-warp shared `k_scale` cache with register/shuffle broadcasts; it targeted the remaining `STS` offsets but slightly worsened store conflicts per wavefront (`16.03% -> 16.04%` for `head_dim=64`, `21.35% -> 21.35%` for `head_dim=128`) with no register/shared-memory benefit.
-- Forcing volatile 16-bit half stores in the dKV epilogue stage to prevent compiler 32-bit store fusion; tests passed, but conflict-per-wavefront was neutral/slightly worse (`16.03% -> 16.03%` for `head_dim=64`, `21.35% -> 21.35%` for `head_dim=128`) and load conflicts rose for `head_dim=64`.
-- Retuning the dKV CuTe epilogue with no-XOR `Swizzle<0,3,3>` stage storage or a 64-bit final `GmemTiledCopydKV`; both built and passed tests, but no-XOR worsened store conflicts (`16.29% -> 17.63%`, `21.81% -> 23.46%`) and the 64-bit final copy was neutral/slightly worse (`16.29% -> 16.29%`, `21.81% -> 21.81%`) with no resource benefit.
-- Shared-memory padding for bank conflicts, because it increases the shared-memory footprint.
-- Switching backward `dP = dO @ V.T` to the forward V `LDSM_T` pattern; that changes the operand contract and does not match the available int8/fp16 copy atoms.
-- Repeating the FlashAttention-style B-copy tiler, direct dKV epilogue, packed P/dS store, packed `dS*k_scale` store, register-fed dQ `dS*k_scale`, or transposed-copy rowgroup-first lane remap experiments without a new attribution result. The packed `dS*k_scale` store reduced raw store conflicts but worsened store conflicts per wavefront (`68.79% -> 69.73%` for `head_dim=64`, `70.92% -> 71.53%` for `head_dim=128`).
-- Repeating packed `dS*k_scale` after the swizzled score-pair layouts still worsened store conflicts per wavefront (`19.87% -> 21.87%` for `head_dim=64`, `24.80% -> 26.44%` for `head_dim=128`), so it remains rejected.
-- Register-feeding dQ's `dS*k_scale` operand from warp shuffles removed the `sdSk` shared path and reduced raw load/store conflicts, but worsened store conflicts per wavefront (`63.42% -> 65.45%` for `head_dim=64`, `66.66% -> 68.44%` for `head_dim=128`), so it is rejected unless paired with a store-rate fix.
-- The transposed-copy rowgroup-first remap reduced store conflict rates (`63.42% -> 58.83%` for `head_dim=64`, `66.66% -> 60.95%` for `head_dim=128`) but worsened load conflict rates (`17.10% -> 25.26%`, `19.83% -> 29.03%`) and raised `head_dim=64` registers (`228 -> 232`).
+Before production retention, unset the focused flag, regenerate/build all eight objects with four workers, run all 32 cases, run Racecheck, and verify exactly eight generated backward sources.
 
-## Resource Budget Snapshot
+## Latest Results
 
-Current dynamic shared-memory sizes for the generated fused backward variants are:
-- `head_dim=64`: `32x128x4` uses `37,328` bytes, `64x128x8` uses `45,792` bytes, `32x64x4` uses `25,040` bytes, and the public `64x64x4` instantiation's internal eight-warp kernel uses `25,312` bytes.
-- `head_dim=128`: `32x128x4` uses `66,000` bytes, `64x128x8` uses `74,464` bytes, and both `32x64x4` / `64x64x4` use `41,424` bytes.
-- Active generic N scratch slots are capped by `kSmemWarps = min(NumWarps, CtaN / 16)`. The exact eight-warp storage has four score-pair slots and four dSk/dKV scratch slots; fp16 dO aliases the latter behind a CTA barrier.
-- Q and int8-dO cooperative pair staging uses two loader warps for `head_dim=64` and four loader warps for `head_dim=128`; fp16 dO uses the same loader-warps-per-microtile schedule.
-- The active head-64 `64x64` kernel is launch-bounded to `128` registers and reports `802,816` local-load / `61,440` local-store sectors at 512 tokens. The other head-64 generic variants use `196`, `164`, and `164` registers for `32x128`, `64x128`, and `32x64`; head-128 uses `255`, `250`, `252`, and `250` registers. The seven generic fused variants retain zero stack/local memory.
+### Focused Timing
 
-## Benchmark-Guided Performance Issues
+SM86 laptop RTX 3080 Ti, batch 1, 16 heads, NHD, head dimension 64, public `64x64x32x64`, kernel-only mode, 30 warmups, 100 repeats:
 
-These should be decided with paired A/B timing and Nsight Compute after the structural schedule above exists:
-- Exact static tile choice among the small set above, plus 4 vs 8 warps and per-phase atom layouts for `S/dP`, `dKV`, and `dQ`, should be tuned separately for `head_dim=64` and `128` on sm80/sm86.
-- Pipeline depth and lifetime choices: Q/dO double buffering, V-in-register variants, reverse M iteration, and cp.async placement should be kept only when they reduce scoreboard stalls without causing spills or occupancy loss.
-- Even-shape specialization: a fast path for padded `seq_len % 256 == 0` and exact `head_dim` may remove predicate overhead, but prior forward experiments showed full-tile specialization can be noisy, so keep it data-driven.
-- `dQAccum` strategy: scalar atomics, split planes, larger `BlockN`, or non-atomic partial reductions trade global reduction traffic against extra workspace and launch cost. FlashAttention also pays `dQAccum` traffic in the sequence-parallel path, so this needs measurement rather than assumption.
-- Scale/LSE/Delta placement: shared-memory staging is simple, while register/shuffle staging may reduce barriers and shared traffic but can increase register pressure. Choose based on NCU register, stall, and shared-memory metrics.
-- P/dS quantization granularity and max-reduction strategy: per-warp/per-tile scales and where to compute maxima should be benchmarked under the accuracy contract.
-- Utility-kernel balance: preprocessing already fuses `Delta`, dO quantization, and `DQAccum` zeroing. The production-context baseline shows no broad CUTLASS advantage and no long-sequence conversion bottleneck; reconsider fusing conversion or changing copy widths only if full-backward profiles on another target GPU attribute material latency to these stages.
+| Sequence | Sage median | Flash median | Sage/Flash |
+|---:|---:|---:|---:|
+| 512 | 0.3267 ms | 0.4372 ms | 1.338x |
+| 4096, run 1 | 8.9221 ms | 4.6162 ms | 0.517x |
+| 4096, run 2 | 9.0071 ms | 4.6853 ms | 0.520x |
+
+A previous serial thermal diagnostic showed approximately 2.3% timing drift as GPU temperature, power, and clocks varied. Treat sub-2% differences as directional unless supported by profile counters or a controlled A/B rebuild.
+
+The earlier full requested matrix predates the exact eight-warp path. It showed `64x64x32x64` generally best for head-64 and `128x32x32x32` generally best for head-128, with Sage/Flash speedups around `0.41-0.57x` and `0.44-0.48x`. Do not use those absolute times as the current head-64 baseline. Rerun the matrix only after the focused head-64 target beats FlashAttention or focused optimization is stopped.
+
+### Focused NCU Profile
+
+Profile shape: sequence 512, batch 1, 16 heads, NHD, ten warmups.
+
+| Metric | Launch-bounded checkpoint | Current lane-base dQ |
+|---|---:|---:|
+| Duration | about 280 us | 273.568 us |
+| Instructions | 15.112M | 14.428M |
+| Registers/thread | 128 | 128 |
+| Dynamic shared memory | 25,312 B | 25,312 B |
+| Local-load sectors | 802,816 | 675,840 |
+| Local-store sectors | 61,440 | 69,632 |
+| Global-reduction sectors | 1,048,576 | 1,048,576 |
+| Active warps/scheduler | 3.58 | 3.60 |
+| Eligible warps/scheduler | 0.44 | 0.42 |
+
+The last full stall profile, before the lane-base dQ refinement, reported `32.81%` barrier stalls. Refresh barrier, tensor-pipe, bank-conflict, and scoreboard metrics on the current kernel before choosing a barrier or layout experiment.
+
+Preprocessing and dQ conversion contribute roughly 0-2% of end-to-end time. Their CUTLASS-vs-Triton results vary by shape and do not justify separate optimization while the fused kernel is nearly 2x behind FlashAttention.
+
+## Completed Work
+
+- Built the standalone stable-torch backward wrapper and generated static dispatch.
+- Migrated all five matmuls to CuTe/CUTLASS contracts with four INT8 paths and one FP16 path.
+- Added the CuTe-facing transposed INT8 LDSM atom and a standalone copy-plus-MMA test (`failures=0`).
+- Adopted the KV-owned fused schedule with direct dK/dV output and atomic dQ accumulation.
+- Made K/V CTA-resident and Q/dO resident in canonical 32-row pairs.
+- Recast score and dP fragments in place for P and dS.
+- Materialized score operands with warp-contiguous CuTe C-copy contracts.
+- Fused Delta, dO quantization, dO scale reduction, and dQ zeroing into one preprocessing CTA per pair.
+- Added `bench/bench_sagebwd_cutlass.py` with kernel-only/end-to-end modes, statistics, TFLOPS, CSV output, and ranking.
+- Added focused source generation through `SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD=1` while preserving normal eight-source generation.
+- Added two-dimensional eight-warp ownership, direct final-scale quantization, a 128-register launch bound, 4x8 dQ ownership, and the lane-base contiguous dQ atomic address.
+- Audited shared/register lifetimes. Existing score/dP and fp16-dO/scratch aliases are valid. Concurrently live resident and accumulator families are not overlaid.
+
+## Accepted Optimization Ledger
+
+| Change | Evidence |
+|---|---|
+| Head-64 direct pair-scale dS quantization | `17.176M -> 15.933M` instructions and `290.432 -> 276.352 us` on the generic four-warp path |
+| 4x8 dQ ownership | reduction sectors `2,097,152 -> 1,048,576`. Focused correctness clean |
+| Eight-warp `(M-half, N-tile)` ownership | removes all pair requantization. Unbounded resources `146` registers and `14.654M` instructions |
+| `__launch_bounds__(256,2)` | two resident CTAs. 4096 timing improved from about `11.69` to `9.02-9.22 ms` despite local traffic |
+| Lane-base contiguous dQ atomics, exact path only | `15.112M -> 14.428M` instructions, `802,816 -> 675,840` local-load sectors, `8.92-9.01 ms` at 4096. Correctness and Racecheck clean |
+
+## Rejected Experiment Ledger
+
+| Experiment | Rejection evidence |
+|---|---|
+| Direct pair-scale specialization for head-128 | reached 255 registers and regressed long-shape timing |
+| Shared dQ staging | correctness/Racecheck clean, but 168 registers and about `11.65 ms` at 4096 |
+| Standard C retile for dQ | retained `2,097,152` reduction sectors and increased registers |
+| Direct row-major dQ fragment matching | failed all 32 correctness cases (`dQ` cosine about 0.762) |
+| First packed dQ shuffle | increased reduction sectors to `5,242,880` |
+| Full-warp row-major shuffle | clean and `1,572,864` sectors, but 32 shuffles/fragment caused about `12.11 ms` |
+| CUDA shared-spill pragma | required static shared memory and did not change local sectors or storage |
+| Two dKV fragments in explicit shared memory | local traffic fell, but shared traffic raised 4096 timing to about `9.31 ms` |
+| Split retained dKV tensor into fixed 1D fragments | no resource or code-generation change |
+| Broad phase-scoped global view reconstruction | instructions/local loads fell, but 4096 was neutral at `9.25 ms` and 512 regressed to `0.350 ms` |
+| Naive raw dQ pointer per atomic | local loads fell to `393,216`, but address arithmetic raised instructions to `16.676M` and timing to `9.57 ms` |
+| Shared-memory padding and several isolated swizzle/copy-width changes | neutral or worse conflict-per-wavefront, resources, or timing |
+| Register-fed dQ operand and packed dS stores | reduced some raw conflicts but worsened conflict rates or store traffic |
+
+Do not repeat rejected paths without a new attribution result that changes the tradeoff.
+
+## Remaining Bottlenecks
+
+- Long-sequence gap: current Sage is still approximately 1.92-1.95x slower than FlashAttention at 4096.
+- Synchronization: the last full profile attributed about 32.81% of stalls to barriers. The exact loop still has CTA synchronization after staging, scale exchange, quantized-operand materialization, and gradient consumption.
+- Launch-bound local traffic: lane-base dQ reduces loads, but `675,840` local-load and `69,632` local-store sectors remain. Line-info showed repeated scalar/shared-view state rather than the persistent dKV fragment.
+- Instruction overhead: current Sage executes `14.428M` instructions at the 512 profile shape. Scalar quantization, max reductions, address/view setup, and atomics dominate around the five MMA paths.
+- dQ reduction traffic: 4x8 ownership halves sectors, but `1,048,576` reduction sectors remain and still serialize global accumulation.
+- Mainloop pipeline depth: Q/dO is single-buffered. FlashAttention overlaps more staging and has mature head-specific phase layouts.
+- Head-128: it remains on the generic high-register path and is intentionally not being optimized until head-64 wins.
+
+## Ordered Next Work
+
+- Collect a current full NCU set for the lane-base kernel: barrier reasons, tensor-pipe activity, shared conflicts per wavefront, local source attribution, scoreboard stalls, and instruction mix.
+- Use fresh line-info to isolate the remaining repeated local values. Change one address/view lifetime at a time. Broad view reconstruction is already rejected.
+- Reduce synchronization without changing arithmetic. Evaluate subgroup/named barriers where dependencies are confined to one N pair, and evaluate Q/fp16-dO/int8-dO double buffering only if two-CTA occupancy remains possible.
+- Reduce scalar quantization and reduction instructions. A custom packed conversion/copy atom is justified only if SASS attribution shows existing CuTe operations cannot express the required packed flow.
+- Revisit dQ accumulation only with an end-to-end workspace/launch accounting: split planes, a separate reduction, or different ownership must beat the retained 4x8 atomic path in total time.
+- Continue serial 512/4096 timing after resource/profile gates. Do not run concurrent benchmarks or profiles.
+- Once head-64 beats FlashAttention, restore normal generation, build all eight objects with four Ninja workers, run all 32 correctness cases and Racecheck, refresh the full `{heads 16/32} x {D 64/128} x {S 4096/8192}` matrix, and only then optimize other configurations.
+
+## Deferred Work
+
+- Optimizing block sizes other than head-64 `64x64x32x64` before the focused target beats FlashAttention.
+- Decoupling quantization tile sizes from matmul tile sizes.
+- Decoupling forward and backward tile sizes.
+- Backward autotuning and trainable/compile wrappers.
+- GQA/MQA, causal attention, variable length, and additional dtypes.
+
+## Retention Gate
+
+Retain an optimization only when all applicable checks pass:
+- FlashAttention-referenced correctness, including HND/NHD and tail cases.
+- Compute Sanitizer Racecheck.
+- serial warmed 512- and 4096-token timing, with thermal drift considered.
+
+Also check the following, while using the overall speed as the optimization target:
+- registers, shared memory, stack/local memory, and occupancy.
+- global atomic/reduction sectors.
+- shared conflicts per wavefront and synchronization behavior.
+
+## Key Artifacts
+
+- Benchmark harness: `bench/bench_sagebwd_cutlass.py`
+- Focused profile harness: `build/profile_sagebwd_once.py`
+- Latest benchmark CSVs: `build/bench_sagebwd_dq_lane_base_ptr.csv`, `build/bench_sagebwd_dq_lane_base_ptr_isolated_repeat.csv`
+- Latest profile CSV: `build/ncu_sage_hd64_dq_lane_base_ptr_isolated.csv`
+- Previous launch-bound profile: `build/ncu_sage_hd64_2dwarp8_lb2.csv`
+- Runtime tests: `tests/test_sagebwd_cutlass.py`
+- Transposed-copy test: `tests/cuda/test_qattn_cutlass_bwd_int8_transposed_copy.cu`

@@ -4,6 +4,7 @@ import statistics
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
 
 import torch
 from flash_attn import flash_attn_func
@@ -286,7 +287,7 @@ def _assign_sage_ranks(rows: list[dict[str, object]]) -> None:
     kinds = {str(row["kind"]) for row in rows}
     for kind in kinds:
         kind_rows = [row for row in rows if row["kind"] == kind]
-        for rank, row in enumerate(sorted(kind_rows, key=lambda item: float(item["sage_ms"])), start=1):
+        for rank, row in enumerate(sorted(kind_rows, key=lambda item: cast(float, item["sage_ms"])), start=1):
             row["sage_rank"] = rank
 
 
