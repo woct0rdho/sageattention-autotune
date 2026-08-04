@@ -234,28 +234,54 @@ void launch_mma(const Tensor &query,
     reinterpret_cast<float*>(do_scale.mutable_data_ptr()),
     params);
 
-  auto kernel = fused_mma_kernel<HeadDim, BlockM, BlockN, NumWarps>;
-  constexpr int32_t smem_size = sizeof(SharedStorage<Traits>);
-  if constexpr (smem_size >= 48 * 1024)
+  if constexpr (HeadDim == 64 && BlockM == 64 && BlockN == 64 && NumWarps == 4)
   {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    constexpr int32_t kKernelWarps = 8;
+    using KernelTraits = BwdTileTraits<HeadDim, BlockM, BlockN, kKernelWarps>;
+    auto kernel = fused_mma_kernel_2d_warp<HeadDim, BlockM, BlockN, kKernelWarps>;
+    constexpr int32_t smem_size = sizeof(SharedStorage2DWarp<KernelTraits>);
+    kernel<<<kv_grid, dim3(32, kKernelWarps), smem_size, stream>>>(
+      reinterpret_cast<const int8_t*>(query.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(key.const_data_ptr()),
+      reinterpret_cast<const float*>(query_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(key_scale.const_data_ptr()),
+      reinterpret_cast<const half*>(value.const_data_ptr()),
+      reinterpret_cast<const half*>(grad_output.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(do_int8.const_data_ptr()),
+      reinterpret_cast<const float*>(do_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(lse.const_data_ptr()),
+      reinterpret_cast<const float*>(delta.const_data_ptr()),
+      reinterpret_cast<float*>(dq_accum.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_key.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_value.mutable_data_ptr()),
+      params,
+      static_cast<float>(sm_scale));
   }
-  kernel<<<kv_grid, dim3(32, NumWarps), smem_size, stream>>>(
-    reinterpret_cast<const int8_t*>(query.const_data_ptr()),
-    reinterpret_cast<const int8_t*>(key.const_data_ptr()),
-    reinterpret_cast<const float*>(query_scale.const_data_ptr()),
-    reinterpret_cast<const float*>(key_scale.const_data_ptr()),
-    reinterpret_cast<const half*>(value.const_data_ptr()),
-    reinterpret_cast<const half*>(grad_output.const_data_ptr()),
-    reinterpret_cast<const int8_t*>(do_int8.const_data_ptr()),
-    reinterpret_cast<const float*>(do_scale.const_data_ptr()),
-    reinterpret_cast<const float*>(lse.const_data_ptr()),
-    reinterpret_cast<const float*>(delta.const_data_ptr()),
-    reinterpret_cast<float*>(dq_accum.mutable_data_ptr()),
-    reinterpret_cast<half*>(grad_key.mutable_data_ptr()),
-    reinterpret_cast<half*>(grad_value.mutable_data_ptr()),
-    params,
-    static_cast<float>(sm_scale));
+  else
+  {
+    auto kernel = fused_mma_kernel<HeadDim, BlockM, BlockN, NumWarps>;
+    constexpr int32_t smem_size = sizeof(SharedStorage<Traits>);
+    if constexpr (smem_size >= 48 * 1024)
+    {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    }
+    kernel<<<kv_grid, dim3(32, NumWarps), smem_size, stream>>>(
+      reinterpret_cast<const int8_t*>(query.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(key.const_data_ptr()),
+      reinterpret_cast<const float*>(query_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(key_scale.const_data_ptr()),
+      reinterpret_cast<const half*>(value.const_data_ptr()),
+      reinterpret_cast<const half*>(grad_output.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(do_int8.const_data_ptr()),
+      reinterpret_cast<const float*>(do_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(lse.const_data_ptr()),
+      reinterpret_cast<const float*>(delta.const_data_ptr()),
+      reinterpret_cast<float*>(dq_accum.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_key.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_value.mutable_data_ptr()),
+      params,
+      static_cast<float>(sm_scale));
+  }
 
   convert_dq_kernel<HeadDim><<<q_grid, 128, 0, stream>>>(
     reinterpret_cast<const float*>(dq_accum.const_data_ptr()),
