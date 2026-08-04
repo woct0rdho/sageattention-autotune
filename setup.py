@@ -81,6 +81,12 @@ def _generated_sources(generator_name: str) -> list[str]:
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if generator_name == "generate_cutlass_bwd_instantiations" and _env_flag_enabled(
+        "SAGEATTN_CUTLASS_BWD_FOCUSED_BUILD"
+    ):
+        module.HEAD_DIMS = (64,)
+        module.CONFIGS = ((64, 64, 4, 64, 64, 32, 64),)
+        module._remove_stale_sources = lambda root, generated: None
     return [str(path.relative_to(ROOT_PATH)) for path in module.generate(ROOT_PATH)]
 
 
