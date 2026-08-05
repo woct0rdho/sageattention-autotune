@@ -233,8 +233,8 @@ struct Params {
   int32_t batch_size;
   int32_t seq_len;
   int32_t num_heads;
-  int32_t warp_q;
-  int32_t warp_k;
+  int32_t bwd_block_m;
+  int32_t bwd_block_n;
   int32_t blk_q;
   int32_t blk_k;
   int32_t stride_bz_q;
@@ -270,15 +270,13 @@ struct Params {
 template <typename ScaleView>
 __device__ __forceinline__ float query_scale_for_row(const ScaleView scale, const Params &params, const int32_t row)
 {
-  const int32_t scale_idx = (row / params.warp_q) * 8 + (row & 7);
-  return scale(scale_idx);
+  return scale(row / params.blk_q);
 }
 
 template <typename ScaleView>
 __device__ __forceinline__ float key_scale_for_row(const ScaleView scale, const Params &params, const int32_t row)
 {
-  const int32_t scale_idx = (row / params.warp_k) * 4 + ((row & 7) >> 1);
-  return scale(scale_idx);
+  return scale(row / params.blk_k);
 }
 
 template <int32_t HeadDim, typename T>

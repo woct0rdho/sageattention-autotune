@@ -76,8 +76,8 @@ inline Params prepare_params(const Tensor &query,
                                     const TensorLayout tensor_layout,
                                     const int64_t blk_q,
                                     const int64_t blk_k,
-                                    const int64_t warp_q,
-                                    const int64_t warp_k)
+                                    const int64_t bwd_block_m,
+                                    const int64_t bwd_block_n)
 {
   check_int8_tensor(query, "query");
   check_int8_tensor(key, "key");
@@ -94,10 +94,9 @@ inline Params prepare_params(const Tensor &query,
   CHECK_DTYPE(lse, torch::headeronly::ScalarType::Float);
   CHECK_DIMS(lse, 3);
 
-  STD_TORCH_CHECK(warp_q > 0 && warp_k > 0, "warp_q and warp_k must be positive");
   STD_TORCH_CHECK(blk_q > 0 && blk_k > 0, "blk_q and blk_k must be positive");
-  STD_TORCH_CHECK(blk_q % warp_q == 0 && blk_k % warp_k == 0, "blk_q/blk_k must be divisible by warp_q/warp_k");
-  STD_TORCH_CHECK(warp_q % 8 == 0 && warp_k % 8 == 0, "warp_q and warp_k must be divisible by 8");
+  STD_TORCH_CHECK(bwd_block_m == 64 && (bwd_block_n == 64 || bwd_block_n == 128),
+                  "Focused CUTLASS qattn backward requires a 64x64 or 64x128 CTA");
   STD_TORCH_CHECK((blk_q == 32 || blk_q == 128) && (blk_k == 64 || blk_k == 128),
                   "Focused CUTLASS qattn backward requires QBlock=32 or 128 and KBlock=64 or 128");
 
@@ -106,8 +105,8 @@ inline Params prepare_params(const Tensor &query,
     static_cast<int32_t>(query.size(0)),
     0,
     0,
-    static_cast<int32_t>(warp_q),
-    static_cast<int32_t>(warp_k),
+    static_cast<int32_t>(bwd_block_m),
+    static_cast<int32_t>(bwd_block_n),
     static_cast<int32_t>(blk_q),
     static_cast<int32_t>(blk_k),
     static_cast<int32_t>(query.stride(0)), 0, 0,
@@ -295,13 +294,13 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const double sm_scale,
                                                const int64_t blk_q,
                                                const int64_t blk_k,
-                                               const int64_t warp_q,
-                                               const int64_t warp_k)
+                                               const int64_t bwd_block_m,
+                                               const int64_t bwd_block_n)
 {
   namespace bwd = sageattention::qattn_cutlass_bwd;
 
   const auto layout = bwd::parse_tensor_layout(tensor_layout);
-  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, layout, blk_q, blk_k, warp_q, warp_k);
+  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, layout, blk_q, blk_k, bwd_block_m, bwd_block_n);
   STD_TORCH_CHECK(params.head_dim == 64,
                   "Focused CUTLASS qattn backward currently supports head_dim 64 only");
 

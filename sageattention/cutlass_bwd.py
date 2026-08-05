@@ -6,8 +6,8 @@ import torch.nn.functional as F
 from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
-_BWD_QK_CONFIG = (32, 64, 32, 64)
-_BWD_CONFIGS = (_BWD_QK_CONFIG, (128, 64, 128, 64), (128, 128, 128, 128))
+_BWD_CONFIG = (32, 64, 64, 64)
+_BWD_CONFIGS = (_BWD_CONFIG, (128, 64, 64, 64), (128, 128, 64, 128))
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -32,8 +32,8 @@ def _bwd_fake_impl(
     sm_scale: float,
     blk_q: int,
     blk_k: int,
-    warp_q: int,
-    warp_k: int,
+    bwd_block_m: int,
+    bwd_block_n: int,
 ) -> None:
     return None
 
@@ -88,7 +88,7 @@ def _sageattn_cutlass_bwd_configured(
     output = output.contiguous()
     grad_output = grad_output.contiguous()
     lse = lse.contiguous()
-    blk_q, blk_k, warp_q, warp_k = config
+    blk_q, blk_k, bwd_block_m, bwd_block_n = config
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
@@ -116,8 +116,8 @@ def _sageattn_cutlass_bwd_configured(
         head_dim**-0.5,
         blk_q,
         blk_k,
-        warp_q,
-        warp_k,
+        bwd_block_m,
+        bwd_block_n,
     )
     return grad_query[..., :head_dim], grad_key[..., :head_dim], grad_value[..., :head_dim]
 
@@ -131,4 +131,4 @@ def sageattn_cutlass_bwd(
     lse: torch.Tensor,
     tensor_layout: str = "HND",
 ) -> CutlassSageBwdResult:
-    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, _BWD_QK_CONFIG)
+    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, _BWD_CONFIG)

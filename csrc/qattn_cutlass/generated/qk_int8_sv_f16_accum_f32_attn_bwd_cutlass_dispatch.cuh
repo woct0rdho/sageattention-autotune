@@ -67,17 +67,17 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
 {
   if (params.head_dim == 64)
   {
-      if (params.blk_q == 32 && params.blk_k == 64 && params.warp_q == 32 && params.warp_k == 64)
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 64)
       {
         launch_mma<64, 64, 64, 4, 32, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
-      if (params.blk_q == 128 && params.blk_k == 64 && params.warp_q == 128 && params.warp_k == 64)
+      if (params.blk_q == 128 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 64)
       {
         launch_mma<64, 64, 64, 4, 128, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
-      if (params.blk_q == 128 && params.blk_k == 128 && params.warp_q == 128 && params.warp_k == 128)
+      if (params.blk_q == 128 && params.blk_k == 128 && params.bwd_block_m == 64 && params.bwd_block_n == 128)
       {
         launch_mma<64, 64, 128, 8, 128, 128>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;

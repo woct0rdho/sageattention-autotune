@@ -33,5 +33,5 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                double sm_scale,
                                                int64_t blk_q,
                                                int64_t blk_k,
-                                               int64_t warp_q,
-                                               int64_t warp_k);
+                                               int64_t bwd_block_m,
+                                               int64_t bwd_block_n);
