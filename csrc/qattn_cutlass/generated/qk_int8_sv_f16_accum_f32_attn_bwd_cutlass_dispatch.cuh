@@ -6,7 +6,7 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
-extern template void launch_mma<64, 64, 64, 4, 32, 64>(
+extern template void launch_mma<64, 64, 64, 4, 32, 64, BwdQuantizationPolicy::kDynamic>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
@@ -21,7 +21,22 @@ extern template void launch_mma<64, 64, 64, 4, 32, 64>(
   const Params &params,
   double sm_scale);
 
-extern template void launch_mma<64, 64, 128, 8, 32, 64>(
+extern template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(
+  const torch::stable::Tensor &query,
+  const torch::stable::Tensor &key,
+  const torch::stable::Tensor &query_scale,
+  const torch::stable::Tensor &key_scale,
+  const torch::stable::Tensor &value,
+  const torch::stable::Tensor &output,
+  const torch::stable::Tensor &grad_output,
+  const torch::stable::Tensor &lse,
+  const torch::stable::Tensor &grad_query,
+  const torch::stable::Tensor &grad_key,
+  const torch::stable::Tensor &grad_value,
+  const Params &params,
+  double sm_scale);
+
+extern template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPowerOfTwoDs>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
@@ -52,14 +67,19 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
 {
   if (params.head_dim == 64)
   {
-      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 64)
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 64 && params.quantization_policy == 0)
       {
-        launch_mma<64, 64, 64, 4, 32, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 64, 4, 32, 64, BwdQuantizationPolicy::kDynamic>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
-      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128)
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128 && params.quantization_policy == 0)
       {
-        launch_mma<64, 64, 128, 8, 32, 64>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        return;
+      }
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128 && params.quantization_policy == 1)
+      {
+        launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPowerOfTwoDs>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
         return;
       }
   }

@@ -2,7 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
+from sageattention.cutlass_bwd import _BWD_CONFIG, _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
+
+_BWD_TEST_CANDIDATES = tuple((config, "dynamic") for config in _BWD_CONFIGS) + ((_BWD_CONFIG, "power2_ds"),)
 
 
 def _make_qkvo(
@@ -76,27 +78,29 @@ def _metric(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float,
     return cos_sim, fro_rel_err, max_abs_err
 
 
-def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str) -> None:
+def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str, *, format_experiment: bool) -> None:
     cos_sim, fro_rel_err, max_abs_err = _metric(actual, expected)
     msg = f"{name}: cos_sim={cos_sim:.5f} fro_rel_err={fro_rel_err:.3g} max_abs_err={max_abs_err:.3g}"
-    assert 1 - cos_sim < 2e-3, msg
-    assert fro_rel_err < 6e-2, msg
-    assert max_abs_err < 2e-1, msg
+    assert 1 - cos_sim < (1e-2 if format_experiment else 2e-3), msg
+    assert fro_rel_err < (1.5e-1 if format_experiment else 6e-2), msg
+    assert max_abs_err < (5e-1 if format_experiment else 2e-1), msg
 
 
-@pytest.mark.parametrize("config", _BWD_CONFIGS)
+@pytest.mark.parametrize(("config", "quantization_policy"), _BWD_TEST_CANDIDATES)
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
 @pytest.mark.parametrize("head_dim", (64,))
 @pytest.mark.parametrize("seq_len", (64, 65))
 def test_sagebwd_cutlass_config_matches_flashattention(
     config: tuple[int, int, int, int],
+    quantization_policy: str,
     tensor_layout: str,
     head_dim: int,
     seq_len: int,
 ) -> None:
     q, k, v, dout = _make_qkvo(seq_len=seq_len, head_dim=head_dim, tensor_layout=tensor_layout)
     out, lse, dq_ref, dk_ref, dv_ref = _flash_forward_backward(q, k, v, dout, tensor_layout)
-    dq, dk, dv = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, config)
-    _check_close(dq, dq_ref, "dQ")
-    _check_close(dk, dk_ref, "dK")
-    _check_close(dv, dv_ref, "dV")
+    dq, dk, dv = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, config, quantization_policy)
+    format_experiment = quantization_policy != "dynamic"
+    _check_close(dq, dq_ref, "dQ", format_experiment=format_experiment)
+    _check_close(dk, dk_ref, "dK", format_experiment=format_experiment)
+    _check_close(dv, dv_ref, "dV", format_experiment=format_experiment)
