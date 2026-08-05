@@ -8,7 +8,7 @@ from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
 _BWD_CONFIGS = ((32, 64, 64, 64), _BWD_CONFIG)
-_BWD_QUANTIZATION_POLICY_IDS = {"dynamic": 0, "power2_ds": 1}
+_BWD_QUANTIZATION_POLICY_IDS = {"dynamic": 0, "power2_ds": 1, "periodic_ds": 2}
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -88,7 +88,7 @@ def _sageattn_cutlass_bwd_configured(
         supported = ", ".join(_BWD_QUANTIZATION_POLICY_IDS)
         raise ValueError(f"quantization_policy must be one of: {supported}.")
     if quantization_policy != "dynamic" and config != _BWD_CONFIG:
-        raise ValueError("Power-of-two dS quantization is only built for the 64x128 backward CTA.")
+        raise ValueError("Approximate dS quantization policies are only built for the 64x128 backward CTA.")
 
     q = q.contiguous()
     k = k.contiguous()
