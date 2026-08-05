@@ -299,6 +299,8 @@ Instruction counts do not map linearly to elapsed time, but this rules out minor
 - A literal fixed multiplier of 127 rounded about `99.9%` of long-shape P values to zero in the range scan. A guarded multiplier near 64 avoids the observed overshoot but loses still more tail precision. dV-only emulation at `seq=2048/4096` measured dynamic local P quantization at about `0.9996` cosine and `2.6-2.7%` relative error, versus fixed multipliers 127/96/64 at `0.52/0.44/0.33` cosine for `seq=2048` and `0.35/0.28/0.19` for `seq=4096`.
 - The naive global fixed-P representation is therefore rejected: it removes the local scale reduction by destroying the long-shape dV signal. The useful clamp optimization is conversion-level: keep local dynamic scales, use a single saturating `F2I.S8` conversion, and verify that the bounded baseline produces identical results and no instruction increase.
 - The native baseline rebuild used four jobs and passed the focused K64/K128, NHD/HND, aligned/tail matrix (`8 passed in 6.50 s`). INT4 is explicitly deferred and is not part of the active experiment queue.
+- The conversion-level saturation experiment replaced the 32 aligned K128 `F2I.FTZ.NTZ` instructions with `F2I.S8`; instruction slots stayed at `2088` with `33` padding NOPs, and resource counts did not change. Focused correctness remained `8 passed`.
+- Fresh serial long controls for the saturating helper measured K128 at `4.198/16.155 ms` NHD and `4.180/15.982 ms` HND for 4096/8192. This is neutral within the existing run-to-run spread, so the helper is retained as overflow protection with no claimed speedup. It is a conversion-level clamp, not an added floating-point clamp sequence.
 
 ## What We Have Done
 
