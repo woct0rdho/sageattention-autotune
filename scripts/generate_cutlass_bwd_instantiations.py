@@ -5,8 +5,7 @@ from pathlib import Path
 HEAD_DIMS = (64,)
 CONFIGS = (
     (64, 64, 4, 32, 64),
-    (64, 64, 4, 128, 64),
-    (64, 128, 8, 128, 128),
+    (64, 128, 8, 32, 64),
 )
 GENERATED_DIR = Path("csrc/qattn_cutlass/generated")
 DISPATCH_HEADER = "qk_int8_sv_f16_accum_f32_attn_bwd_cutlass_dispatch.cuh"
