@@ -77,7 +77,8 @@ inline Params prepare_params(const Tensor &query,
                                     const int64_t blk_q,
                                     const int64_t blk_k,
                                     const int64_t bwd_block_m,
-                                    const int64_t bwd_block_n)
+                                    const int64_t bwd_block_n,
+                                    const int64_t quantization_policy)
 {
   check_int8_tensor(query, "query");
   check_int8_tensor(key, "key");
@@ -99,6 +100,13 @@ inline Params prepare_params(const Tensor &query,
                   "Focused CUTLASS qattn backward requires a 64x64 or 64x128 CTA");
   STD_TORCH_CHECK((blk_q == 32 || blk_q == 128) && (blk_k == 64 || blk_k == 128),
                   "Focused CUTLASS qattn backward requires QBlock=32 or 128 and KBlock=64 or 128");
+  STD_TORCH_CHECK(
+    quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kDynamic) ||
+      quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPowerOfTwoDs),
+    "Unsupported CUTLASS qattn backward quantization policy");
+  STD_TORCH_CHECK(
+    quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kDynamic) || bwd_block_n == 128,
+    "Power-of-two dS quantization is only built for the 64x128 CTA");
 
   Params params = {
     static_cast<int32_t>(query.size(3)),
@@ -109,6 +117,7 @@ inline Params prepare_params(const Tensor &query,
     static_cast<int32_t>(bwd_block_n),
     static_cast<int32_t>(blk_q),
     static_cast<int32_t>(blk_k),
+    static_cast<int32_t>(quantization_policy),
     static_cast<int32_t>(query.stride(0)), 0, 0,
     static_cast<int32_t>(key.stride(0)), 0, 0,
     static_cast<int32_t>(value.stride(0)), 0, 0,
@@ -197,7 +206,8 @@ template <int32_t HeadDim,
           int32_t BlockN,
           int32_t NumWarps,
           int32_t QuantBlockQ,
-          int32_t QuantBlockK>
+          int32_t QuantBlockK,
+          BwdQuantizationPolicy QuantizationPolicy>
 void launch_mma(const Tensor &query,
                     const Tensor &key,
                     const Tensor &query_scale,
@@ -219,6 +229,10 @@ void launch_mma(const Tensor &query,
   static_assert(
     QuantBlockQ == 32 && QuantBlockK == 64,
     "Focused backward A/B uses the selected Q32/K64 quantization format");
+  static_assert(
+    QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
+      (BlockN == 128 && QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs),
+    "Power-of-two dS quantization is only built for the K128 kernel");
   using MicroTraits = BwdTileTraits<64>;
   constexpr int32_t kKernelWarps = BlockN == 128 ? NumWarps : 2 * NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;
@@ -270,8 +284,8 @@ void launch_mma(const Tensor &query,
   if constexpr (BlockN == 128)
   {
     auto kernel = params.seq_len % BlockN == 0
-      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
-      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
+      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, true>
+      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, false>;
     launch_kernel(kernel);
   }
   else
@@ -309,12 +323,13 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const int64_t blk_q,
                                                const int64_t blk_k,
                                                const int64_t bwd_block_m,
-                                               const int64_t bwd_block_n)
+                                               const int64_t bwd_block_n,
+                                               const int64_t quantization_policy)
 {
   namespace bwd = sageattention::qattn_cutlass_bwd;
 
   const auto layout = bwd::parse_tensor_layout(tensor_layout);
-  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, layout, blk_q, blk_k, bwd_block_m, bwd_block_n);
+  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, layout, blk_q, blk_k, bwd_block_m, bwd_block_n, quantization_policy);
   STD_TORCH_CHECK(params.head_dim == 64,
                   "Focused CUTLASS qattn backward currently supports head_dim 64 only");
 

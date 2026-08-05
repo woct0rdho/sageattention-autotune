@@ -10,11 +10,17 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
+from sageattention.cutlass_bwd import (
+    _BWD_CONFIG,
+    _BWD_CONFIGS,
+    _BWD_QUANTIZATION_POLICY_IDS,
+    _sageattn_cutlass_bwd_configured,
+)
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.quant_per_block import per_block_int8
 
 BlockConfig = tuple[int, int, int, int]
+BackwardCandidate = tuple[BlockConfig, str]
 _FORWARD_QK_CONFIG: BlockConfig = (64, 64, 32, 64)
 
 
@@ -36,6 +42,15 @@ def _parse_block_configs(values: list[str] | None) -> tuple[BlockConfig, ...]:
         invalid = ", ".join(_format_block_config(config) for config in unsupported)
         raise ValueError(f"unsupported backward block config(s): {invalid}; supported configs: {supported}")
     return configs
+
+
+def _make_candidates(block_configs: tuple[BlockConfig, ...], policies: list[str]) -> tuple[BackwardCandidate, ...]:
+    return tuple(
+        (config, policy)
+        for config in block_configs
+        for policy in policies
+        if policy == "dynamic" or config == _BWD_CONFIG
+    )
 
 
 def _bench(fn, *args, warmup: int, repeats: int) -> dict[str, float]:
@@ -147,9 +162,10 @@ def _sage_end_to_end_backward(
     lse: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
+    quantization_policy: str,
 ) -> None:
     with torch.inference_mode():
-        _sageattn_cutlass_bwd_configured(q, k, v, output, dout, lse, layout, block_config)
+        _sageattn_cutlass_bwd_configured(q, k, v, output, dout, lse, layout, block_config, quantization_policy)
 
 
 def _prepare_prequantized_inputs(
@@ -207,6 +223,7 @@ def _sage_kernel_only_backward(
     layout_i: int,
     sm_scale: float,
     block_config: BlockConfig,
+    quantization_policy: str,
 ) -> None:
     blk_q, blk_k, bwd_block_m, bwd_block_n = block_config
     with torch.inference_mode():
@@ -228,6 +245,7 @@ def _sage_kernel_only_backward(
             blk_k,
             bwd_block_m,
             bwd_block_n,
+            _BWD_QUANTIZATION_POLICY_IDS[quantization_policy],
         )
 
 
@@ -253,6 +271,7 @@ def _make_row(
     seq_len: int,
     layout: str,
     block_config: BlockConfig,
+    quantization_policy: str,
     flops: int,
     flash_stats: dict[str, float],
     sage_stats: dict[str, float],
@@ -267,6 +286,7 @@ def _make_row(
         "seq_len": seq_len,
         "layout": layout,
         "block_config": _format_block_config(block_config),
+        "quantization_policy": quantization_policy,
         "backward_flops": flops,
         "flash_ms": flash_ms,
         "flash_mean_ms": flash_stats["mean_ms"],
@@ -296,7 +316,7 @@ def _benchmark_case(
     v: torch.Tensor,
     dout: torch.Tensor,
     layout: str,
-    block_configs: tuple[BlockConfig, ...],
+    candidates: tuple[BackwardCandidate, ...],
     warmup: int,
     repeats: int,
     include_end_to_end: bool,
@@ -312,7 +332,7 @@ def _benchmark_case(
     flash_stats = _bench(_flash_backward, *flash_args, warmup=warmup, repeats=repeats)
 
     rows: list[dict[str, object]] = []
-    for block_config in block_configs:
+    for block_config, quantization_policy in candidates:
         output, lse = _prepare_sage_forward(q, k, v, layout)
 
         if include_end_to_end:
@@ -326,6 +346,7 @@ def _benchmark_case(
                 lse,
                 layout,
                 block_config,
+                quantization_policy,
                 warmup=warmup,
                 repeats=repeats,
             )
@@ -338,6 +359,7 @@ def _benchmark_case(
                     seq_len=seq_len,
                     layout=layout,
                     block_config=block_config,
+                    quantization_policy=quantization_policy,
                     flops=flops,
                     flash_stats=flash_stats,
                     sage_stats=sage_stats,
@@ -364,6 +386,7 @@ def _benchmark_case(
                 layout_i,
                 sm_scale,
                 block_config,
+                quantization_policy,
                 warmup=warmup,
                 repeats=repeats,
             )
@@ -376,6 +399,7 @@ def _benchmark_case(
                     seq_len=seq_len,
                     layout=layout,
                     block_config=block_config,
+                    quantization_policy=quantization_policy,
                     flops=flops,
                     flash_stats=flash_stats,
                     sage_stats=sage_stats,
@@ -398,7 +422,7 @@ def _write_rows(path: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def _print_row(row: dict[str, object]) -> None:
     print(
-        "{kind},{batch_size},{num_heads},{head_dim},{seq_len},{layout},{block_config},{backward_flops},"
+        "{kind},{batch_size},{num_heads},{head_dim},{seq_len},{layout},{block_config},{quantization_policy},{backward_flops},"
         "{flash_ms:.4f},{flash_mean_ms:.4f},{flash_stdev_ms:.4f},{flash_tflops:.3f},"
         "{sage_ms:.4f},{sage_mean_ms:.4f},{sage_stdev_ms:.4f},{sage_tflops:.3f},"
         "{sage_speedup:.3f},{sage_rank}".format(**row)
@@ -430,6 +454,12 @@ def main() -> None:
         nargs="*",
         help="Configs as blk_q,blk_k,bwd_block_m,bwd_block_n. Defaults to all generated backward configs.",
     )
+    parser.add_argument(
+        "--quantization-policies",
+        nargs="+",
+        choices=tuple(_BWD_QUANTIZATION_POLICY_IDS),
+        default=["dynamic"],
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--mode", choices=["all", "end-to-end", "kernel-only"], default="all")
@@ -444,6 +474,9 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     block_configs = _parse_block_configs(args.block_configs)
+    candidates = _make_candidates(block_configs, args.quantization_policies)
+    if not candidates:
+        raise ValueError("No supported block-config and quantization-policy combinations were selected.")
     include_end_to_end = args.mode in ("all", "end-to-end")
     include_kernel_only = args.mode in ("all", "kernel-only")
 
@@ -454,6 +487,7 @@ def main() -> None:
         f"seq_lens={args.seq_lens} layout={args.layout} warmup={args.warmup} repeats={args.repeats}"
     )
     print(f"block_configs={[_format_block_config(config) for config in block_configs]}")
+    print(f"quantization_policies={args.quantization_policies}")
     print("TFLOPS use 8*batch*heads*head_dim*seq_len^2 effective dense backward FLOPs and median CUDA-event time")
     print(
         "end_to_end includes Sage Q/K quantization and output allocation; kernel_only uses prequantized Q/K and reused dQ/dK/dV"
@@ -462,7 +496,7 @@ def main() -> None:
         "Sage forward setup is not timed and uses the same block config as Sage backward; sage_speedup > 1 means Sage is faster"
     )
     print(
-        "kind,batch_size,num_heads,head_dim,seq_len,layout,block_config,backward_flops,"
+        "kind,batch_size,num_heads,head_dim,seq_len,layout,block_config,quantization_policy,backward_flops,"
         "flash_ms,flash_mean_ms,flash_stdev_ms,flash_tflops,"
         "sage_ms,sage_mean_ms,sage_stdev_ms,sage_tflops,sage_speedup,sage_rank"
     )
@@ -478,7 +512,7 @@ def main() -> None:
                     v=v,
                     dout=dout,
                     layout=args.layout,
-                    block_configs=block_configs,
+                    candidates=candidates,
                     warmup=args.warmup,
                     repeats=args.repeats,
                     include_end_to_end=include_end_to_end,

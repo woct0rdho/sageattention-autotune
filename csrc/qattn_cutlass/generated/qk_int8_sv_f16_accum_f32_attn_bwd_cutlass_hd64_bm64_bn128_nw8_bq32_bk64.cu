@@ -5,7 +5,7 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
-template void launch_mma<64, 64, 128, 8, 32, 64>(
+template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,

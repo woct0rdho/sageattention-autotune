@@ -8,6 +8,7 @@ from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
 _BWD_CONFIGS = ((32, 64, 64, 64), _BWD_CONFIG)
+_BWD_QUANTIZATION_POLICY_IDS = {"dynamic": 0, "power2_ds": 1}
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -34,6 +35,7 @@ def _bwd_fake_impl(
     blk_k: int,
     bwd_block_m: int,
     bwd_block_n: int,
+    quantization_policy: int,
 ) -> None:
     return None
 
@@ -47,6 +49,7 @@ def _sageattn_cutlass_bwd_configured(
     lse: torch.Tensor,
     tensor_layout: str,
     config: tuple[int, int, int, int],
+    quantization_policy: str = "dynamic",
 ) -> CutlassSageBwdResult:
     if not all(tensor.is_cuda for tensor in (q, k, v, output, grad_output, lse)):
         raise ValueError("Input tensors must be CUDA tensors.")
@@ -81,6 +84,11 @@ def _sageattn_cutlass_bwd_configured(
         raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
     if lse.shape != (q.size(0), num_heads, seq_len):
         raise ValueError("lse must have shape (batch, heads, seq_len).")
+    if quantization_policy not in _BWD_QUANTIZATION_POLICY_IDS:
+        supported = ", ".join(_BWD_QUANTIZATION_POLICY_IDS)
+        raise ValueError(f"quantization_policy must be one of: {supported}.")
+    if quantization_policy != "dynamic" and config != _BWD_CONFIG:
+        raise ValueError("Power-of-two dS quantization is only built for the 64x128 backward CTA.")
 
     q = q.contiguous()
     k = k.contiguous()
@@ -89,6 +97,7 @@ def _sageattn_cutlass_bwd_configured(
     grad_output = grad_output.contiguous()
     lse = lse.contiguous()
     blk_q, blk_k, bwd_block_m, bwd_block_n = config
+    quantization_policy_i = _BWD_QUANTIZATION_POLICY_IDS[quantization_policy]
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
@@ -118,6 +127,7 @@ def _sageattn_cutlass_bwd_configured(
         blk_k,
         bwd_block_m,
         bwd_block_n,
+        quantization_policy_i,
     )
     return grad_query[..., :head_dim], grad_key[..., :head_dim], grad_value[..., :head_dim]
 

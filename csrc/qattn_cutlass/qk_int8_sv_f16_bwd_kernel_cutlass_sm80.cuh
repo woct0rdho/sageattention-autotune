@@ -258,6 +258,12 @@ __device__ __forceinline__ auto make_smem_tensor(Storage& storage, const Layout 
   return cute::make_tensor(cute::make_smem_ptr(storage.begin() + offset), layout);
 }
 
+enum class BwdQuantizationPolicy : int32_t
+{
+  kDynamic = 0,
+  kPowerOfTwoDs = 1,
+};
+
 struct Params {
   int32_t head_dim;
   int32_t batch_size;
@@ -267,6 +273,7 @@ struct Params {
   int32_t bwd_block_n;
   int32_t blk_q;
   int32_t blk_k;
+  int32_t quantization_policy;
   int32_t stride_bz_q;
   int32_t stride_seq_q;
   int32_t stride_h_q;
@@ -367,6 +374,18 @@ __device__ __forceinline__ int8_t round_to_int8(const float value)
   int32_t result;
   asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(result) : "f"(value));
   return static_cast<int8_t>(result);
+}
+
+__device__ __forceinline__ float power_of_two_int8_scale(const float max_abs)
+{
+  const uint32_t max_exponent = __float_as_uint(fmaxf(max_abs, 0x1.0p-120f)) >> 23;
+  return __uint_as_float((max_exponent - 6u) << 23);
+}
+
+__device__ __forceinline__ float inverse_power_of_two(const float value)
+{
+  const uint32_t exponent = __float_as_uint(value) >> 23;
+  return __uint_as_float((254u - exponent) << 23);
 }
 
 struct LaneCoord
@@ -1386,6 +1405,7 @@ template <int32_t HeadDim,
           int32_t NumWarps,
           int32_t QuantBlockQ,
           int32_t QuantBlockK,
+          BwdQuantizationPolicy QuantizationPolicy,
           bool IsAligned>
 __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
                                                                                const int8_t *__restrict__ const K,
@@ -1411,6 +1431,10 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
   static_assert(
     QuantBlockQ == 32 && QuantBlockK == 64,
     "K128 eight-warp kernel currently implements the selected Q32/K64 quantization format");
+  static_assert(
+    QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
+      QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs,
+    "Unsupported K128 backward quantization policy");
   static_assert(
     Traits::kCtaNMicroTiles == NumWarps && Traits::kCtaMMicroTiles == 4,
     "K128 ownership requires one physical warp per N16 tile and two temporal M halves");
@@ -1788,7 +1812,14 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
     const float p_scale = p_max_abs / 127.5f + 1.0e-7f;
     if (lane_id == 0)
     {
-      shared.ds_scale[warp_id] = ds_max_abs / 127.5f + 1.0e-7f;
+      if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs)
+      {
+        shared.ds_scale[warp_id] = power_of_two_int8_scale(ds_max_abs);
+      }
+      else
+      {
+        shared.ds_scale[warp_id] = ds_max_abs / 127.5f + 1.0e-7f;
+      }
     }
     __syncthreads();
 
@@ -1799,7 +1830,15 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
       ds_scale = fmaxf(ds_scale, shared.ds_scale[4 * n_domain + scale_warp]);
     }
     const float inv_p_scale = 1.0f / p_scale;
-    const float inv_ds_scale = 1.0f / ds_scale;
+    float inv_ds_scale;
+    if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs)
+    {
+      inv_ds_scale = inverse_power_of_two(ds_scale);
+    }
+    else
+    {
+      inv_ds_scale = 1.0f / ds_scale;
+    }
     constexpr auto transposed_store_shape = cute::make_shape(
       cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockM>{});
     constexpr auto score_store_shape = cute::make_shape(

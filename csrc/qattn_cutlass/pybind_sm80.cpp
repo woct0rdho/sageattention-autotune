@@ -48,7 +48,8 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_cutlass_sm80, m) {
             "int blk_q, "
             "int blk_k, "
             "int bwd_block_m, "
-            "int bwd_block_n"
+            "int bwd_block_n, "
+            "int quantization_policy"
           ") -> ()");
 }
 
