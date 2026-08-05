@@ -165,11 +165,11 @@ K64 is no longer the public default. It remains generated until the next attribu
 
 ### Correctness And Accuracy
 
-The retained source passes the eight focused FlashAttention-referenced cases: K64/K128, NHD/HND, and aligned/tail lengths 64/65.
+The retained source passes the expanded focused FlashAttention-referenced matrix (`16 passed`): dynamic K64/K128, optional power-of-two and periodic K128 policies, NHD/HND, and aligned/tail lengths 64/65.
 
 ```text
 python -m pytest -q tests/test_sagebwd_cutlass.py
-8 passed
+16 passed
 ```
 
 Retained K64 and K128 schedules have passed Compute Sanitizer Racecheck at sequence lengths 512 and 513:
@@ -310,7 +310,8 @@ Instruction counts do not map linearly to elapsed time, but this rules out minor
 - Periodic predicted-dS simulation is bounded but approximate. A `2x` guarded scale recalibrated every 16 M32 blocks produced sequence-8192 dQ/dK cosine `0.99180-0.99196`, relative error `12.66-12.79%`, zero rate `31.99-32.32%`, and saturation `5.0e-5-5.2e-5` for seeds 0/1. It passes the first format tier but not the schedule-preserving tier; the next kernel probe must show a material removal of dS max/reduction work before this trade is retained.
 - The periodic K128 probe passes the expanded focused matrix (`16 passed`) and Racecheck at 512/513 after adding a barrier around the cached domain-scale update. Full-pipeline sequence-8192 dQ/dK relative error is `12.74-13.17%` with cosine `0.99169-0.99186` and maximum absolute error `0.082-0.108` for seeds 0/1; dV remains identical to dynamic dS.
 - Corrected alternating controls show periodic/dynamic paired ratios of `0.957/0.949` NHD and `0.955/0.951` HND at 4096/8192. Fixed-clock NCU at 8192 measures `20.294 -> 19.340 ms`, `5.297B -> 5.048B` elapsed SM cycles, and `1.599B -> 1.597B` executed instructions. The branch removes most exact dS max/reduction work without increasing the aligned register or shared-memory footprint.
-- Retain periodic dS as an optional approximate K128 reference, with dynamic dS still the public default. Its `4.3-5.1%` main-kernel win is large enough to justify the format tier, and it now unlocks a direct P/dS-to-dKV handoff experiment; it is not a default promotion because its error exceeds the schedule-preserving gate.
+- Retain periodic dS as an optional approximate K128 reference, with dynamic dS still the public default. Its `4.3-5.1%` main-kernel win is large enough to justify the format tier, and it unlocks direct P/dS-to-dKV handoff experiments; it is not a default promotion because its error exceeds the schedule-preserving gate.
+- The mirror-only dS-to-dK mapping probe established an exact synthesized `N16 x M32` view across two adjacent existing dS mirror slots: its loaded MMA-A fragment matched the canonical `sdSPair` reload with zero mismatches for both N-half positions. An isolated `periodic_ds_mirror_dkv` specialization retained the dQ mirror, omitted canonical dS stores, and loaded dK through `AutoVectorizingCopyWithAssumedAlignment<8>` after the existing CTA barrier. It passed the expanded focused matrix (`20 passed` while present), but lost paired kernel-only timing by `1.9%/2.2%` at NHD 4096/8192 and `0.8%/4.5%` at HND 4096/8192. The aligned candidate added 8 SASS slots; the HND variant rose from 235 to 237 registers. Reusing the canonical LDSM atom is not a valid fallback because the synthesized source layout fails CuTe's register-vectorization contract. Remove the specialization and retain only the mapping probe for a future producer/register-direct consumer with a different cost model.
 
 ## What We Have Done
 
@@ -359,6 +360,7 @@ The following paths are closed unless new source/SASS evidence or a new hardware
 | Coarser Q/K blocks | Exact-scale Q32/K128 is rejected. It passed the 12-case focused matrix and long accuracy, but lost every kernel-only and end-to-end NHD/HND 4096/8192 forward/reverse control. Q64/K128 remains open only as a direct/predicted-dS two-M-pair redesign. |
 | Exact-max power-of-two dS | Retained as an optional K128 policy. It removes one reciprocal and wins paired long timing by `0.6-1.0%`, while increasing executed instructions `0.39%` and raising dQ/dK relative error to about `5.7%`. It is not the public default. |
 | Periodic predicted dS max-skip | Retained as an optional K128 policy. It skips exact dS max/reduction on 15 of every 16 M32 blocks, wins paired long timing by `4.3-5.1%`, and stays spill-free, but dQ/dK relative error is `12.7-13.2%`; it remains outside the default path. |
+| Mirror-only dS-to-dK handoff | Rejected as an isolated periodic policy. The exact two-slot mirror mapping passed focused correctness, but ordinary vectorized mirror loads added SASS/register overhead and lost all four paired long kernel-only controls. The mapping remains a probe artifact; no generated policy is retained. |
 
 The fresh Q32/K128 aligned image retained 235 registers and zero local traffic while reducing SASS slots `2088 -> 2056` and FFMA instructions `114 -> 98`; `FMNMX` increased `47 -> 53`. Kernel-only regressions ranged from `0.2%` to `3.6%`, and end-to-end regressions from `0.8%` to `4.0%`. Halving external K-scale generation did not recover the longer exact dS reduction dependency, so the specialization and generated dispatch were removed.
 
@@ -405,7 +407,7 @@ The next candidate sequence is deliberately narrow. Each step must retain the cu
 - Fixed-P result: the naive global linear scale is rejected before kernel integration because dV emulation failed badly at long sequence lengths. Conversion-level `F2I.S8` saturation is retained as a neutral safety improvement.
 - Direct P/dS handoff variant: only after fixed P is measured, combine producer fragments with a mirror-only dS dQ store. This is the highest-value revisit of the rejected warp-local handoff because it can remove canonical P/dS movement rather than merely retile it.
 - Q32/K128 single-domain result: the exact-scale specialization is rejected and removed after losing all kernel-only and end-to-end controls. Revisit K128 domains only with a direct/predicted dS format that removes the eight-warp maximum dependency.
-- Power-of-two and clipped-dS variants: exact power-of-two dS and the periodic max-skip policy are retained as measured optional references. Combine periodic dS with direct producer-to-dKV consumption next; only proceed to a more aggressive direct dS scale when it removes the exact maximum, barrier, and second dS pass. Record saturation and zero rates with every accuracy result.
+- Power-of-two and clipped-dS variants: exact power-of-two dS and the periodic max-skip policy are retained as measured optional references. The mirror-only periodic dS-to-dK handoff is rejected because its vectorized shared load loses to canonical LDSM; direct producer-to-dKV work remains open only if it eliminates that load and the canonical P/dS handoff with a new producer mapping. Proceed to a more aggressive direct dS scale only when it removes the exact maximum, barrier, and second dS pass. Record saturation and zero rates with every accuracy result.
 - Q64/K128 paired-M variant: attempt only if a fixed/predicted dS path makes two M32 pairs live at once worthwhile. It must use a new M64 lifetime design; a Q64-only source change is not sufficient.
 - Packet-handoff variant: revisit a Q/dO packet mapping only when the direct P/dS consumer topology removes line-694 work. Do not retry lane-major packets or generic double buffering as isolated changes.
 - dV/dK/dQ scale application: treat it as the next target after a representation path has removed P/dS work. It is dynamically large, but no candidate is retained if it converts multiply work into spills, higher shared traffic, or a weaker format without a timing win.
@@ -499,4 +501,5 @@ Repeat for HND, then reverse sequence/configuration order for the paired control
 - Native-SM86 Sage CUDA/SASS SourceCounters: `build/ncu_sage_hd64_q32_k64_k128_cache_pds_seq8192_source_sm86.csv`
 - Power-of-two dS fixed-clock NCU controls: `build/ncu_sage_hd64_power2_ds_dynamic_seq8192.csv`, `build/ncu_sage_hd64_power2_ds_candidate_seq8192.csv`
 - Periodic dS fixed-clock NCU control: `build/ncu_sage_hd64_periodic_ds_candidate_seq8192_corrected.csv`
+- Rejected mirror-only dS-to-dK paired timing: `build/bench_sagebwd_periodic_ds_mirror_dkv_nhd_kernel.csv`, `build/bench_sagebwd_periodic_ds_mirror_dkv_hnd_kernel.csv`
 - Targeted Flash SM80/SM86 cubins, build logs, and SASS: `build/native_sm86_attribution/`
