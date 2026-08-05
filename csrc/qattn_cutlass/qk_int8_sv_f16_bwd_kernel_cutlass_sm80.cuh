@@ -753,7 +753,7 @@ __device__ __forceinline__ int32_t dq_stage_offset(const int32_t row, const int3
   return row * 16 + physical_col;
 }
 
-template <typename Traits, typename Accum>
+template <bool IsAligned, typename Traits, typename Accum>
 __device__ __forceinline__ void accumulate_dq_fragment_shared_contiguous(const Accum &accum_frag,
                                                                           const float scale,
                                                                           float *const smem_stage,
@@ -784,7 +784,7 @@ __device__ __forceinline__ void accumulate_dq_fragment_shared_contiguous(const A
     const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
     const float value = smem_stage[dq_stage_offset(row_local, dim_local)];
     const int32_t row = lane_row + target_pair * kRowsPerTargetPair;
-    if (row < seq_len)
+    if (IsAligned || row < seq_len)
     {
       constexpr int32_t kPairColumnOffset = 8;
       atomicAdd(
@@ -800,7 +800,8 @@ template <int32_t HeadDim,
           int32_t CtaN,
           int32_t NumWarps,
           int32_t QuantBlockQ,
-          int32_t QuantBlockK>
+          int32_t QuantBlockK,
+          bool IsAligned>
 __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mma_kernel_2d_warp(const int8_t *__restrict__ const Q,
                                         const int8_t *__restrict__ const K,
                                         const float *__restrict__ const QScale,
@@ -844,7 +845,7 @@ __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mm
   const int32_t n_pair = n_tile / 2;
   const int32_t n_cta_base = n_block * Traits::kCtaN;
   const int32_t n_base = n_cta_base + n_tile * Traits::kBlockN;
-  const bool n_valid = n_base < params.seq_len;
+  const bool n_valid = IsAligned || n_base < params.seq_len;
 
   if (n_cta_base >= params.seq_len)
   {
@@ -1074,7 +1075,7 @@ __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mm
         const int32_t col = n_base + n_local;
         float p = 0.0f;
         float ds = 0.0f;
-        if (row < params.seq_len && col < params.seq_len)
+        if (IsAligned || (row < params.seq_len && col < params.seq_len))
         {
           const bool upper_row = (idx & 2) != 0;
           const float score = static_cast<float>(acc_score(idx)) * score_scale;
@@ -1123,7 +1124,7 @@ __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mm
         const int32_t col = n_base + n_local;
         int8_t p_i8 = 0;
         int8_t ds_i8 = 0;
-        if (row < params.seq_len && col < params.seq_len)
+        if (IsAligned || (row < params.seq_len && col < params.seq_len))
         {
           p_i8 = round_to_int8(rPFloat(idx) * inv_p_scale);
           ds_i8 = round_to_int8(acc_dp(idx) * inv_ds_scale);
@@ -1266,7 +1267,7 @@ __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mm
         const int32_t dq_stage_slot = n_tile + m_half;
         auto *const dq_stage = reinterpret_cast<float *>(
           shared.score_pair_i8.begin() + dq_stage_slot * score_pair_offset);
-        accumulate_dq_fragment_shared_contiguous<Traits>(
+        accumulate_dq_fragment_shared_contiguous<IsAligned, Traits>(
           dq_acc,
           ds_scale * k_block_scale,
           dq_stage,
