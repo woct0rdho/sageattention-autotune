@@ -186,7 +186,38 @@ struct SharedStorage
 };
 
 template <typename Traits>
+struct QDoMmaBPacketStorage
+{
+};
+
+template <typename Traits>
+  requires (Traits::kCtaN == 128)
+struct QDoMmaBPacketStorage<Traits>
+{
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutQ>> q_i8_mma_b;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutdO>> do_i8_mma_b;
+};
+
+template <typename Traits>
+struct VOrQDoMmaBStorage
+{
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
+};
+
+template <typename Traits>
+  requires (Traits::kCtaN == 128)
+struct VOrQDoMmaBStorage<Traits>
+{
+  union
+  {
+    alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
+    QDoMmaBPacketStorage<Traits> qdo_mma_b;
+  };
+};
+
+template <typename Traits>
 struct SharedStorage2DWarp
+  : VOrQDoMmaBStorage<Traits>
 {
   static_assert(
     Traits::kCtaM == 64 &&
@@ -209,7 +240,6 @@ struct SharedStorage2DWarp
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<SmemLayoutdOFp16Pair>> do_fp16_pair;
   WarpScratchStorage warp_scratch;
   alignas(16) cute::ArrayEngine<cute::uint128_t, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutScorePair>> score_pair_i8;
-  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> lse;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
   float p_scale[Traits::kNumWarps];
@@ -1579,6 +1609,33 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
     const int32_t k_scale_index_unclamped = n_cta_base / QuantBlockK + n_domain;
     const int32_t k_scale_index = k_scale_index_unclamped < k_scale_extent ? k_scale_index_unclamped : k_scale_extent - 1;
     const float k_block_scale = gKScale(k_scale_index);
+    constexpr auto qdo_pair_shape = cute::make_shape(
+      cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+    if (warp_id < kDimBlocks)
+    {
+      const auto sQPair = cute::local_tile(
+        sQ, qdo_pair_shape, cute::make_coord(cute::_0{}, warp_id));
+      const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
+      auto fragment = thr_mma_score.partition_fragment_B(sQdK);
+      cute::copy(
+        tiled_copy_transposed_b,
+        thr_copy_transposed_b.partition_S(sQdK),
+        thr_copy_transposed_b.retile_D(fragment));
+      store_packed_mma_b_fragment(shared.qdo_mma_b.q_i8_mma_b, fragment, warp_id, lane_id);
+    }
+    else if (warp_id < 2 * kDimBlocks)
+    {
+      const int32_t dim_block = warp_id - kDimBlocks;
+      const auto sdOPair = cute::local_tile(
+        sdOInt8, qdo_pair_shape, cute::make_coord(cute::_0{}, dim_block));
+      const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
+      auto fragment = thr_mma_score.partition_fragment_B(sdOdV);
+      cute::copy(
+        tiled_copy_transposed_b,
+        thr_copy_transposed_b.partition_S(sdOdV),
+        thr_copy_transposed_b.retile_D(fragment));
+      store_packed_mma_b_fragment(shared.qdo_mma_b.do_i8_mma_b, fragment, dim_block, lane_id);
+    }
     auto acc_score_0 = cute::partition_fragment_C(score_mma, BlockMNShape{});
     auto acc_score_1 = cute::partition_fragment_C(score_mma, BlockMNShape{});
     auto acc_dp_0 = cute::partition_fragment_C(half_mma, BlockMNShape{});
@@ -1836,7 +1893,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         auto tDvP = thr_mma_score.partition_fragment_A(sPPair);
         auto tDvdO = thr_mma_score.partition_fragment_B(sdOdV);
         cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tDvP));
-        cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sdOdV), thr_copy_transposed_b.retile_D(tDvdO));
+        load_packed_mma_b_fragment(shared.qdo_mma_b.do_i8_mma_b, tDvdO, dim_base / Traits::kBlockK, lane_id);
         cute::gemm(thr_mma_score, tDvP, tDvdO, dv_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
         const float do_scale = gDOScale[(m_pair_base / (2 * Traits::kBlockM)) * kDimBlocks + dim_block];
@@ -1857,7 +1914,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         auto tDkdS = thr_mma_score.partition_fragment_A(sdSPair);
         auto tDkQ = thr_mma_score.partition_fragment_B(sQdK);
         cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tDkdS));
-        cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(tDkQ));
+        load_packed_mma_b_fragment(shared.qdo_mma_b.q_i8_mma_b, tDkQ, dim_block, lane_id);
         cute::gemm(thr_mma_score, tDkdS, tDkQ, dk_acc);
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dk_acc); ++idx)
