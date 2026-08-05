@@ -247,7 +247,9 @@ void launch_mma(const Tensor &query,
     reinterpret_cast<float*>(do_scale.mutable_data_ptr()),
     params);
 
-  auto kernel = fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK>;
+  auto kernel = params.seq_len % BlockN == 0
+    ? fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
+    : fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
   constexpr int32_t smem_size = sizeof(SharedStorage2DWarp<KernelTraits>);
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   kernel<<<kv_grid, dim3(32, kKernelWarps), smem_size, stream>>>(
