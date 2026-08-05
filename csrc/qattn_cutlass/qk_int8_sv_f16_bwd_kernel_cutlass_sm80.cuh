@@ -1880,6 +1880,10 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
 
     if (n_valid)
     {
+      auto tDvP = thr_mma_score.partition_fragment_A(sPPair);
+      auto tDkdS = thr_mma_score.partition_fragment_A(sdSPair);
+      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tDvP));
+      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tDkdS));
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
@@ -1890,9 +1894,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
         auto dv_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dv_acc);
-        auto tDvP = thr_mma_score.partition_fragment_A(sPPair);
         auto tDvdO = thr_mma_score.partition_fragment_B(sdOdV);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tDvP));
         load_packed_mma_b_fragment(shared.qdo_mma_b.do_i8_mma_b, tDvdO, dim_base / Traits::kBlockK, lane_id);
         cute::gemm(thr_mma_score, tDvP, tDvdO, dv_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
@@ -1911,9 +1913,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
         auto dk_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dk_acc);
-        auto tDkdS = thr_mma_score.partition_fragment_A(sdSPair);
         auto tDkQ = thr_mma_score.partition_fragment_B(sQdK);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tDkdS));
         load_packed_mma_b_fragment(shared.qdo_mma_b.q_i8_mma_b, tDkQ, dim_block, lane_id);
         cute::gemm(thr_mma_score, tDkdS, tDkQ, dk_acc);
 #pragma unroll
