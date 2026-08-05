@@ -4,7 +4,10 @@ import torch.nn.functional as F
 
 from sageattention.cutlass_bwd import _BWD_CONFIG, _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
 
-_BWD_TEST_CANDIDATES = tuple((config, "dynamic") for config in _BWD_CONFIGS) + ((_BWD_CONFIG, "power2_ds"),)
+_BWD_TEST_CANDIDATES = tuple((config, "dynamic") for config in _BWD_CONFIGS) + (
+    (_BWD_CONFIG, "power2_ds"),
+    (_BWD_CONFIG, "periodic_ds"),
+)
 
 
 def _make_qkvo(

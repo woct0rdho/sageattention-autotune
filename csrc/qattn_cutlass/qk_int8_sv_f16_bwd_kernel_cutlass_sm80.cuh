@@ -262,6 +262,7 @@ enum class BwdQuantizationPolicy : int32_t
 {
   kDynamic = 0,
   kPowerOfTwoDs = 1,
+  kPeriodicDs = 2,
 };
 
 struct Params {
@@ -1433,7 +1434,8 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
     "K128 eight-warp kernel currently implements the selected Q32/K64 quantization format");
   static_assert(
     QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
-      QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs,
+      QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs ||
+      QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs,
     "Unsupported K128 backward quantization policy");
   static_assert(
     Traits::kCtaNMicroTiles == NumWarps && Traits::kCtaMMicroTiles == 4,
@@ -1808,9 +1810,15 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
       }
     }
     p_max_abs = warp_reduce_max(p_max_abs);
-    ds_max_abs = warp_reduce_max(ds_max_abs);
+    const int32_t m_pair_index = m_pair_base / (2 * Traits::kBlockM);
+    const bool exact_ds_scale = QuantizationPolicy != BwdQuantizationPolicy::kPeriodicDs ||
+      (m_pair_index % 16 == 0);
+    if (exact_ds_scale)
+    {
+      ds_max_abs = warp_reduce_max(ds_max_abs);
+    }
     const float p_scale = p_max_abs / 127.5f + 1.0e-7f;
-    if (lane_id == 0)
+    if (lane_id == 0 && exact_ds_scale)
     {
       if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs)
       {
@@ -1821,13 +1829,44 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         shared.ds_scale[warp_id] = ds_max_abs / 127.5f + 1.0e-7f;
       }
     }
-    __syncthreads();
-
-    float ds_scale = shared.ds_scale[4 * n_domain];
-#pragma unroll
-    for (int32_t scale_warp = 1; scale_warp < 4; ++scale_warp)
+    if (exact_ds_scale)
     {
-      ds_scale = fmaxf(ds_scale, shared.ds_scale[4 * n_domain + scale_warp]);
+      __syncthreads();
+    }
+
+    float ds_scale;
+    if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs)
+    {
+      if (exact_ds_scale)
+      {
+        ds_scale = shared.ds_scale[4 * n_domain];
+#pragma unroll
+        for (int32_t scale_warp = 1; scale_warp < 4; ++scale_warp)
+        {
+          ds_scale = fmaxf(ds_scale, shared.ds_scale[4 * n_domain + scale_warp]);
+        }
+        if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs)
+        {
+          __syncthreads();
+          if (lane_id == 0 && (warp_id & 3) == 0)
+          {
+            shared.ds_scale[4 * n_domain] = ds_scale;
+          }
+        }
+      }
+      else
+      {
+        ds_scale = shared.ds_scale[4 * n_domain] * 2.0f;
+      }
+    }
+    else
+    {
+      ds_scale = shared.ds_scale[4 * n_domain];
+#pragma unroll
+      for (int32_t scale_warp = 1; scale_warp < 4; ++scale_warp)
+      {
+        ds_scale = fmaxf(ds_scale, shared.ds_scale[4 * n_domain + scale_warp]);
+      }
     }
     const float inv_p_scale = 1.0f / p_scale;
     float inv_ds_scale;
@@ -2026,11 +2065,23 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
               lane_id);
             cute::gemm(thr_mma_score, tDqdS, tDqK, dq_acc);
           }
-          float dq_ds_scale = shared.ds_scale[4 * domain];
-#pragma unroll
-          for (int32_t scale_warp = 1; scale_warp < 4; ++scale_warp)
+          float dq_ds_scale;
+          if constexpr (QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs)
           {
-            dq_ds_scale = fmaxf(dq_ds_scale, shared.ds_scale[4 * domain + scale_warp]);
+            dq_ds_scale = shared.ds_scale[4 * domain];
+            if (!exact_ds_scale)
+            {
+              dq_ds_scale *= 2.0f;
+            }
+          }
+          else
+          {
+            dq_ds_scale = shared.ds_scale[4 * domain];
+#pragma unroll
+            for (int32_t scale_warp = 1; scale_warp < 4; ++scale_warp)
+            {
+              dq_ds_scale = fmaxf(dq_ds_scale, shared.ds_scale[4 * domain + scale_warp]);
+            }
           }
           const int32_t domain_k_scale_index_unclamped = n_cta_base / QuantBlockK + domain;
           const int32_t domain_k_scale_index =

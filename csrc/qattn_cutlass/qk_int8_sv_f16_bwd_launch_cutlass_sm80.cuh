@@ -102,7 +102,8 @@ inline Params prepare_params(const Tensor &query,
                   "Focused CUTLASS qattn backward requires QBlock=32 or 128 and KBlock=64 or 128");
   STD_TORCH_CHECK(
     quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kDynamic) ||
-      quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPowerOfTwoDs),
+      quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPowerOfTwoDs) ||
+      quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPeriodicDs),
     "Unsupported CUTLASS qattn backward quantization policy");
   STD_TORCH_CHECK(
     quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kDynamic) || bwd_block_n == 128,
@@ -231,8 +232,10 @@ void launch_mma(const Tensor &query,
     "Focused backward A/B uses the selected Q32/K64 quantization format");
   static_assert(
     QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
-      (BlockN == 128 && QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs),
-    "Power-of-two dS quantization is only built for the K128 kernel");
+      (BlockN == 128 &&
+       (QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs ||
+        QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs)),
+    "Approximate dS quantization policies are only built for the K128 kernel");
   using MicroTraits = BwdTileTraits<64>;
   constexpr int32_t kKernelWarps = BlockN == 128 ? NumWarps : 2 * NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;

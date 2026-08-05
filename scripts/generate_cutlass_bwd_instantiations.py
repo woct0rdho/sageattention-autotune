@@ -7,12 +7,14 @@ CONFIGS = (
     (64, 64, 4, 32, 64, "dynamic"),
     (64, 128, 8, 32, 64, "dynamic"),
     (64, 128, 8, 32, 64, "power2_ds"),
+    (64, 128, 8, 32, 64, "periodic_ds"),
 )
 POLICY_EXPRESSIONS = {
     "dynamic": "BwdQuantizationPolicy::kDynamic",
     "power2_ds": "BwdQuantizationPolicy::kPowerOfTwoDs",
+    "periodic_ds": "BwdQuantizationPolicy::kPeriodicDs",
 }
-POLICY_IDS = {"dynamic": 0, "power2_ds": 1}
+POLICY_IDS = {"dynamic": 0, "power2_ds": 1, "periodic_ds": 2}
 GENERATED_DIR = Path("csrc/qattn_cutlass/generated")
 DISPATCH_HEADER = "qk_int8_sv_f16_accum_f32_attn_bwd_cutlass_dispatch.cuh"
 SOURCE_PREFIX = "qk_int8_sv_f16_accum_f32_attn_bwd_cutlass"
