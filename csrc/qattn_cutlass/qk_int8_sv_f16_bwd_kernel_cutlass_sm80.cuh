@@ -1431,7 +1431,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
     "K128 eight-warp kernel is specialized for the head64 M64xN128 schedule");
   static_assert(
     QuantBlockQ == 32 && QuantBlockK == 64,
-    "K128 eight-warp kernel currently implements the selected Q32/K64 quantization format");
+    "K128 eight-warp kernel currently implements the selected QBlock=32/KBlock=64 quantization format");
   static_assert(
     QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
       QuantizationPolicy == BwdQuantizationPolicy::kPowerOfTwoDs ||
@@ -1471,7 +1471,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
   constexpr int32_t kDimBlocks = HeadDim / Traits::kBlockK;
   constexpr int32_t kDqNPairs = Traits::kCtaN / (2 * Traits::kBlockN);
   constexpr int32_t kQuantDomains = Traits::kCtaN / QuantBlockK;
-  static_assert(kDimBlocks == kDqNPairs && kQuantDomains == 2, "K128 dQ ownership expects four N32 pairs and two K64 domains");
+  static_assert(kDimBlocks == kDqNPairs && kQuantDomains == 2, "K128 dQ ownership expects four N32 pairs and two KBlock=64 domains");
   const int32_t pair_blocks = (params.seq_len + 2 * Traits::kBlockM - 1) / (2 * Traits::kBlockM);
   const float *const gDOScale = DOScale + (batch * params.num_heads + head) * pair_blocks * kDimBlocks;
   const int32_t q_scale_extent = (params.seq_len + QuantBlockQ - 1) / QuantBlockQ;

@@ -4,7 +4,6 @@ from pathlib import Path
 # Focused optimization currently builds only the exact head-64 target.
 HEAD_DIMS = (64,)
 CONFIGS = (
-    (64, 64, 4, 32, 64, "dynamic"),
     (64, 128, 8, 32, 64, "dynamic"),
     (64, 128, 8, 32, 64, "power2_ds"),
     (64, 128, 8, 32, 64, "periodic_ds"),
