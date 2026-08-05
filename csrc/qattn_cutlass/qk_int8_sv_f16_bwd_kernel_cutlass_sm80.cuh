@@ -746,16 +746,33 @@ __device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle(const Accum 
   }
 }
 
+__device__ __forceinline__ int32_t dq_stage_offset(const int32_t row, const int32_t col)
+{
+  const int32_t deinterleaved_col = ((col & 1) << 3) | (col >> 1);
+  const int32_t physical_col = deinterleaved_col ^ (((row >> 1) & 3) << 2);
+  return row * 16 + physical_col;
+}
+
 template <typename Traits, typename Accum>
-__device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle_contiguous(const Accum &accum_frag,
-                                                                                const float scale,
-                                                                                float *const dst,
-                                                                                const int32_t row_base,
-                                                                                const int32_t dim_base,
-                                                                                const int32_t seq_len,
-                                                                                const int32_t lane_id)
+__device__ __forceinline__ void accumulate_dq_fragment_shared_contiguous(const Accum &accum_frag,
+                                                                          const float scale,
+                                                                          float *const smem_stage,
+                                                                          float *const dst,
+                                                                          const int32_t row_base,
+                                                                          const int32_t dim_base,
+                                                                          const int32_t seq_len,
+                                                                          const int32_t lane_id)
 {
   static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
+#pragma unroll
+  for (int32_t idx = 0; idx < cute::size(accum_frag); ++idx)
+  {
+    const int32_t row_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
+    const int32_t dim_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
+    smem_stage[dq_stage_offset(row_local, dim_local)] = static_cast<float>(accum_frag(idx)) * scale;
+  }
+  __syncwarp();
+
   const int32_t lane_row = row_base + lane_id / 8;
   float *const lane_dst = dst + lane_row * Traits::kHeadDim + dim_base + lane_id % 8;
 #pragma unroll
@@ -763,22 +780,19 @@ __device__ __forceinline__ void accumulate_dq_fragment_warp_shuffle_contiguous(c
   {
     constexpr int32_t kRowsPerTargetPair = 4;
     const int32_t target_pair = target_idx / 2;
-    const int32_t source_group = (target_idx >= 4 ? 2 : 0) + ((target_idx & 1) != 0 ? 4 : 0);
     const int32_t row_local = target_pair * kRowsPerTargetPair + lane_id / 8;
     const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
-    const int32_t source_lane = (row_local & 7) * 4 + (dim_local & 7) / 2;
-    const float source_even = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group)), source_lane);
-    const float source_odd = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group + 1)), source_lane);
-    const float value = (dim_local & 1) == 0 ? source_even : source_odd;
+    const float value = smem_stage[dq_stage_offset(row_local, dim_local)];
     const int32_t row = lane_row + target_pair * kRowsPerTargetPair;
     if (row < seq_len)
     {
       constexpr int32_t kPairColumnOffset = 8;
       atomicAdd(
         lane_dst + target_pair * kRowsPerTargetPair * Traits::kHeadDim + (target_idx & 1) * kPairColumnOffset,
-        value * scale);
+        value);
     }
   }
+  __syncwarp();
 }
 
 template <int32_t HeadDim,
@@ -1246,9 +1260,16 @@ __global__ __launch_bounds__(32 * NumWarps, NumWarps == 8 ? 2 : 1) void fused_mm
             lane_id);
           cute::gemm(thr_mma_score, tDqdS, tDqK, dq_acc);
         }
-        accumulate_dq_fragment_warp_shuffle_contiguous<Traits>(
+        static_assert(
+          score_pair_offset * sizeof(cute::uint128_t) >= 16 * 16 * sizeof(float),
+          "Each dead score-pair slot must fit one warp-local dQ transpose");
+        const int32_t dq_stage_slot = n_tile + m_half;
+        auto *const dq_stage = reinterpret_cast<float *>(
+          shared.score_pair_i8.begin() + dq_stage_slot * score_pair_offset);
+        accumulate_dq_fragment_shared_contiguous<Traits>(
           dq_acc,
           ds_scale * k_block_scale,
+          dq_stage,
           DQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim,
           m_base,
           dim_base,
