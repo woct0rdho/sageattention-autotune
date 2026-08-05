@@ -1519,6 +1519,32 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
   cute::clear(dk_accum_frag);
   cute::clear(dv_accum_frag);
 
+  constexpr auto v_subtile_shape = cute::make_shape(
+    cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
+  const auto sVTile0 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::_0{}));
+  const auto sVTile1 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::_1{}));
+  const auto sVTile2 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::Int<2>{}));
+  const auto sVTile3 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::Int<3>{}));
+  const auto sVHalf0 = cute::recast<cute::half_t>(sVTile0);
+  const auto sVHalf1 = cute::recast<cute::half_t>(sVTile1);
+  const auto sVHalf2 = cute::recast<cute::half_t>(sVTile2);
+  const auto sVHalf3 = cute::recast<cute::half_t>(sVTile3);
+  auto tdPrV0 = thr_mma_half.partition_fragment_B(sVHalf0);
+  auto tdPrV1 = thr_mma_half.partition_fragment_B(sVHalf1);
+  auto tdPrV2 = thr_mma_half.partition_fragment_B(sVHalf2);
+  auto tdPrV3 = thr_mma_half.partition_fragment_B(sVHalf3);
+  cute::clear(tdPrV0);
+  cute::clear(tdPrV1);
+  cute::clear(tdPrV2);
+  cute::clear(tdPrV3);
+  if (n_valid)
+  {
+    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf0), thr_copy_half_b.retile_D(tdPrV0));
+    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf1), thr_copy_half_b.retile_D(tdPrV1));
+    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf2), thr_copy_half_b.retile_D(tdPrV2));
+    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf3), thr_copy_half_b.retile_D(tdPrV3));
+  }
+
   constexpr int32_t kTailLoaderWarp0 = 1;
   constexpr int32_t kTailLoaderWarp1 = 3;
   constexpr int32_t kRowStateLoaderWarp = 7;
@@ -1595,20 +1621,43 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
           sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kBlockK));
         const auto sdOTile1 = cute::local_tile(
           sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_1{}, dim_base / Traits::kBlockK));
-        const auto sVTile = cute::local_tile(
-          sV,
-          cute::make_shape(cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{}),
-          cute::make_coord(n_tile, dim_base / Traits::kBlockK));
         const auto sdOHalf0 = cute::recast<cute::half_t>(sdOTile0);
         const auto sdOHalf1 = cute::recast<cute::half_t>(sdOTile1);
-        const auto sVHalf = cute::recast<cute::half_t>(sVTile);
         auto tdPrdO = thr_mma_half.partition_fragment_A(sdOHalf0);
-        auto tdPrV = thr_mma_half.partition_fragment_B(sVHalf);
-        cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf), thr_copy_half_b.retile_D(tdPrV));
         cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf0), thr_copy_half_a.retile_D(tdPrdO));
-        cute::gemm(thr_mma_half, tdPrdO, tdPrV, acc_dp_0);
+        if (dim_base == 0)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_0);
+        }
+        else if (dim_base == Traits::kBlockK)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_0);
+        }
+        else if (dim_base == 2 * Traits::kBlockK)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_0);
+        }
+        else
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_0);
+        }
         cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf1), thr_copy_half_a.retile_D(tdPrdO));
-        cute::gemm(thr_mma_half, tdPrdO, tdPrV, acc_dp_1);
+        if (dim_base == 0)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_1);
+        }
+        else if (dim_base == Traits::kBlockK)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_1);
+        }
+        else if (dim_base == 2 * Traits::kBlockK)
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_1);
+        }
+        else
+        {
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_1);
+        }
       }
     }
 
