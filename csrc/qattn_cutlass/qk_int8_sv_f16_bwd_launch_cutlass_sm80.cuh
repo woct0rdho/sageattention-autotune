@@ -96,8 +96,8 @@ inline Params prepare_params(const Tensor &query,
   CHECK_DIMS(lse, 3);
 
   STD_TORCH_CHECK(blk_q > 0 && blk_k > 0, "blk_q and blk_k must be positive");
-  STD_TORCH_CHECK(bwd_block_m == 64 && (bwd_block_n == 64 || bwd_block_n == 128),
-                  "Focused CUTLASS qattn backward requires a 64x64 or 64x128 CTA");
+  STD_TORCH_CHECK(bwd_block_m == 64 && bwd_block_n == 128,
+                  "Focused CUTLASS qattn backward currently requires the 64x128 CTA");
   STD_TORCH_CHECK((blk_q == 32 || blk_q == 128) && (blk_k == 64 || blk_k == 128),
                   "Focused CUTLASS qattn backward requires QBlock=32 or 128 and KBlock=64 or 128");
   STD_TORCH_CHECK(
@@ -105,10 +105,6 @@ inline Params prepare_params(const Tensor &query,
       quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPowerOfTwoDs) ||
       quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kPeriodicDs),
     "Unsupported CUTLASS qattn backward quantization policy");
-  STD_TORCH_CHECK(
-    quantization_policy == static_cast<int64_t>(BwdQuantizationPolicy::kDynamic) || bwd_block_n == 128,
-    "Power-of-two dS quantization is only built for the 64x128 CTA");
-
   Params params = {
     static_cast<int32_t>(query.size(3)),
     static_cast<int32_t>(query.size(0)),
@@ -224,12 +220,11 @@ void launch_mma(const Tensor &query,
                     const double sm_scale)
 {
   static_assert(
-    HeadDim == 64 && BlockM == 64 &&
-      ((BlockN == 64 && NumWarps == 4) || (BlockN == 128 && NumWarps == 8)),
-    "Only the focused head-64 64x64 and 64x128 backward matmul configurations are built");
+    HeadDim == 64 && BlockM == 64 && BlockN == 128 && NumWarps == 8,
+    "Only the focused head-64 64x128 backward matmul configuration is built");
   static_assert(
     QuantBlockQ == 32 && QuantBlockK == 64,
-    "Focused backward A/B uses the selected Q32/K64 quantization format");
+    "Focused backward A/B uses the selected QBlock=32/KBlock=64 quantization format");
   static_assert(
     QuantizationPolicy == BwdQuantizationPolicy::kDynamic ||
       (BlockN == 128 &&
@@ -237,7 +232,7 @@ void launch_mma(const Tensor &query,
         QuantizationPolicy == BwdQuantizationPolicy::kPeriodicDs)),
     "Approximate dS quantization policies are only built for the K128 kernel");
   using MicroTraits = BwdTileTraits<64>;
-  constexpr int32_t kKernelWarps = BlockN == 128 ? NumWarps : 2 * NumWarps;
+  constexpr int32_t kKernelWarps = NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;
   const auto device_guard = make_device_guard(query);
   const auto stream = get_current_cuda_stream(query);
@@ -284,20 +279,10 @@ void launch_mma(const Tensor &query,
       params,
       static_cast<float>(sm_scale));
   };
-  if constexpr (BlockN == 128)
-  {
-    auto kernel = params.seq_len % BlockN == 0
-      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, true>
-      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, false>;
-    launch_kernel(kernel);
-  }
-  else
-  {
-    auto kernel = params.seq_len % BlockN == 0
-      ? fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
-      : fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
-    launch_kernel(kernel);
-  }
+  auto kernel = params.seq_len % BlockN == 0
+    ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, true>
+    : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, QuantizationPolicy, false>;
+  launch_kernel(kernel);
 
   convert_dq_kernel<HeadDim><<<q_grid, 128, 0, stream>>>(
     reinterpret_cast<const float*>(dq_accum.const_data_ptr()),

@@ -10,12 +10,7 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import (
-    _BWD_CONFIG,
-    _BWD_CONFIGS,
-    _BWD_QUANTIZATION_POLICY_IDS,
-    _sageattn_cutlass_bwd_configured,
-)
+from sageattention.cutlass_bwd import _BWD_CONFIG, _BWD_QUANTIZATION_POLICY_IDS, _sageattn_cutlass_bwd_configured
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.quant_per_block import per_block_int8
 
@@ -35,10 +30,11 @@ def _parse_block_config(value: str) -> BlockConfig:
 
 
 def _parse_block_configs(values: list[str] | None) -> tuple[BlockConfig, ...]:
-    configs = tuple(_BWD_CONFIGS) if not values else tuple(_parse_block_config(value) for value in values)
-    unsupported = tuple(config for config in configs if config not in _BWD_CONFIGS)
+    supported_configs = (_BWD_CONFIG,)
+    configs = supported_configs if not values else tuple(_parse_block_config(value) for value in values)
+    unsupported = tuple(config for config in configs if config not in supported_configs)
     if unsupported:
-        supported = ", ".join(_format_block_config(config) for config in _BWD_CONFIGS)
+        supported = ", ".join(_format_block_config(config) for config in supported_configs)
         invalid = ", ".join(_format_block_config(config) for config in unsupported)
         raise ValueError(f"unsupported backward block config(s): {invalid}; supported configs: {supported}")
     return configs

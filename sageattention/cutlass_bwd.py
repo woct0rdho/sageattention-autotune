@@ -7,7 +7,6 @@ from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
-_BWD_CONFIGS = ((32, 64, 64, 64), _BWD_CONFIG)
 _BWD_QUANTIZATION_POLICY_IDS = {"dynamic": 0, "power2_ds": 1, "periodic_ds": 2}
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
