@@ -364,7 +364,9 @@ __device__ __forceinline__ float warp_reduce_max(float value)
 
 __device__ __forceinline__ int8_t round_to_int8(const float value)
 {
-  return static_cast<int8_t>(__float2int_rn(value));
+  int32_t result;
+  asm volatile("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(result) : "f"(value));
+  return static_cast<int8_t>(result);
 }
 
 struct LaneCoord
