@@ -47,8 +47,8 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_cutlass_sm80, m) {
             "float sm_scale, "
             "int blk_q, "
             "int blk_k, "
-            "int warp_q, "
-            "int warp_k"
+            "int bwd_block_m, "
+            "int bwd_block_n"
           ") -> ()");
 }
 

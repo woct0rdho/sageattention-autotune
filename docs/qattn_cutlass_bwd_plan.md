@@ -2,7 +2,7 @@
 
 ## Status Snapshot
 
-The correctness-first CuTe migration is complete. Optimization is intentionally focused on one active public head-64 `64x64x32x64` configuration. That public four-warp instantiation selects an internal eight-warp `2 M-halves x 4 N-microtiles` kernel. Other block-size and head-dimension paths are temporarily removed from the active generated dispatch while this kernel is optimized. The prior implementations remain recoverable from git.
+The correctness-first CuTe migration is complete. The current retained baseline is the public head-64 Q32/K64 `64x64x32x64` configuration, which selects an internal eight-warp `2 M-halves x 4 N-microtiles` kernel. It remains the source-level and long-shape A/B reference, but it is no longer the optimization destination. The primary program is now a clean head-64 `M64 x N128`, eight-warp backward redesign that attacks repeated on-chip movement, scalar materialization, synchronization, and dQ reduction together. Isolated small-margin K64 tuning is deferred until the structural redesign space is exhausted.
 
 The latest focused kernel combines block-scaled Q/K, one logical dS quantization, CTA-local dQ fusion, compile-time quantization geometry, Ampere hardware max reductions, in-loop Q/dO tail prefetch, a resident-K MMA-B packet cache, a warp-local shared dQ transpose epilogue, and an aligned-sequence specialization. On the SM86 test GPU the retained Q32/K64 64x64 path:
 - passes all 12 focused head-64 NHD/HND and tail cases across the three generated candidates.
@@ -14,7 +14,9 @@ The latest focused kernel combines block-scaled Q/K, one logical dS quantization
 
 The shared dQ transpose removes the per-atomic source shuffles and improves matched long-shape Sage timing by `3.8-4.7%`. The aligned specialization then improves the retained kernel by approximately `6.5-6.8%` without changing registers, shared-memory allocation, or reduction traffic. It is selected only when `seq_len % BlockN == 0`; every other length uses the existing predicated implementation. A same-build direct-global versus shared-LDSM A/B selects the direct-global resident-K packet because it is `3.3-4.1%` faster at serial NHD/HND 4096/8192 despite using more shared storage. The fused main kernel, not preprocessing or allocation, remains the performance blocker.
 
-The coordinated backward quantization rewrite is accepted. Quantization geometry is intentionally independent from matmul geometry. The focused build contains Q32/K64 and Q128/K64 on the two-resident-CTA 64x64 path plus exploratory Q128/K128 on the one-resident-CTA 64x128 path. Controlled long-shape timing and accuracy favor Q32/K64 as the default: it is at least as fast as Q128/K64, is slightly more accurate, and the 64-column CTA is more stable than the wider candidate after compile-time scale indexing.
+The coordinated backward quantization rewrite is accepted, and Q32/K64 is the selected initial quantization geometry. Quantization, forward matmul, and backward matmul geometry may now vary independently. The backward API, generator, generated dispatch, Python wrapper, and benchmark labels now represent configurations as `(QBlock, KBlock, backward CTA M, backward CTA N)`; forward `warp_q`/`warp_k` metadata is no longer overloaded for backward selection. The dormant generic scale lookup was also corrected to index true Q/K block scales. The new backward target therefore uses two K64 quantization domains inside one N128 CTA rather than forcing KBlock to equal the CTA N extent. Q128/K64 and Q128/K128 remain historical comparison points, not geometries to carry indefinitely.
+
+The geometry-decoupling prerequisite builds successfully and passes all 12 focused tests. A serial K64 diagnostic after the interface-only change measured `5.5863/20.4472 ms` at 4096/8192 NHD; the 4096 Flash sample was high-variance, so this run is an interface-regression check rather than new performance evidence. The exact K64 device body and launch bounds were not changed.
 
 The active focused source generation contains three head-64 backward instantiations for direct comparison. A production rebuild and the full validation matrix are deferred until the focused kernel is complete; the previous multi-configuration generator and dispatch can be restored from git when broader coverage resumes.
 
@@ -27,6 +29,8 @@ The active focused source generation contains three head-64 backward instantiati
 - Production scope remains head dimensions 64 and 128; the active focused dispatch currently supports padded head dimension 64 only.
 - No GQA/MQA: Q, K, and V must have matching head counts.
 - Standalone backward API only. Trainable wrapper and autotuning remain deferred.
+- Internal Q/K quantization geometry and backward CTA geometry are independent compile-time choices. The focused experiment uses one explicit pair rather than an autotuned search.
+- Forward optimization is out of scope. If quantization-state or interface compatibility requires a forward change, modify only the CUTLASS forward kernel and leave the CUDA and Triton forward kernels unchanged.
 - Correctness reference is FlashAttention backward.
 - Kernel code remains torch-free in `qk_int8_sv_f16_bwd_kernel_cutlass_sm80.cuh`. Stable-torch validation, allocation, and launch code remain in `qk_int8_sv_f16_bwd_launch_cutlass_sm80.cuh`.
 
@@ -41,6 +45,35 @@ The arithmetic contract is fixed:
 | `dP = dO @ V.T` | FP16 `m16n8k16`, FP32 accumulator |
 
 Do not replace dV, dK, or dQ with FP16 MMA. The intended advantage is SM80 INT8 tensor-core throughput and the smaller INT8 operand/register/shared-memory footprint. A custom hardware atom such as `int8_transposed_ldsm_cute.cuh` is allowed only when existing CuTe atoms cannot express the required operation.
+
+## Redesign Objective And Amdahl Budget
+
+The measured Sage tensor-active cycle-time proxy is already `0.600x` Flash, so the intended three-versus-five tensor-work reduction is present. Let `f = 0.44` approximate Flash's long-shape tensor-active fraction, let Sage tensor work cost `0.60x` Flash tensor work, and let `b` be Sage non-tensor cost relative to Flash non-tensor cost. The activity-based planning proxy becomes:
+
+```text
+speedup = 1 / (0.60 * f + b * (1 - f))
+```
+
+| Sage non-tensor factor `b` | Whole-backward proxy |
+|---:|---:|
+| 1.00 | 1.21x |
+| 0.80 | 1.40x |
+| 0.70 | 1.52x |
+| 0.60 | 1.67x |
+
+This is not a wall-time decomposition because tensor and non-tensor execution overlap. It does establish the required scale of change: merely matching Flash's non-MMA path leaves the ceiling near `1.21x`; approaching `1.5-1.67x` requires Sage's non-MMA path to become 30-40% cheaper than Flash's or to be hidden under tensor execution. The redesign must make the INT8 representation reduce movement and control work as well as tensor work.
+
+The fixed initial research configuration is:
+
+| Axis | Selected focus |
+|---|---|
+| Head dimension and dtype | head 64, fp16 inputs/outputs |
+| Q/K quantization | QBlock=32, KBlock=64 |
+| Backward matmul CTA | M64 x N128, 8 warps / 256 threads |
+| On-the-fly P/dS format | current signed INT8 block scaling first; physical packing may change |
+| Forward matmul | current fixed CUTLASS path unless compatibility requires a CUTLASS-only change |
+
+Large-margin structural changes take precedence over isolated instruction, swizzle, predicate, or epilogue changes. A small-margin experiment is justified before the structural program is exhausted only when it removes a resource blocker, enables the new schedule, or supplies attribution needed for a larger rewrite. Otherwise, sub-3% candidates wait until the K128, one-touch operand, and software-pipeline designs have been retained or rejected with evidence.
 
 ## Current Implementation
 
@@ -99,7 +132,7 @@ After dV and dK finish for a pair, odd-N warps 2 and 3 prefetch the next Q/int8-
 
 ### Block-Scaled Quantization Contract
 
-The accepted backward-specific contract uses block-scaled Q/K with compile-time block sizes chosen so each 32-row Q mainloop pair and resident K tile see invariant scale factors. Q32/K64 is the retained default. Q128/K64 isolates coarser Q quantization on the same matmul schedule, while Q128/K128 is the exploratory wider-CTA comparison. The score path remains INT8 QK, dV uses separately quantized P and INT8 dO, and dK and dQ share one quantized dS tile.
+The accepted backward-specific contract uses block-scaled Q/K with compile-time block sizes. Q32/K64 is the selected initial format. The current exact K64 kernel sees one invariant Q scale per 32-row mainloop pair and one invariant K scale per resident tile. The redesign generalizes this contract so a backward CTA can contain an integer number of quantization domains: the target N128 CTA has two independent K64 domains, and its M64 slice has two Q32 domains. The score path remains INT8 QK, dV uses separately quantized P and INT8 dO, and dK and dQ share one quantized dS tile within each quantization domain.
 
 The implementation defines `dS = P * (dP - Delta) * sm_scale`, so the softmax scale is already included before dS quantization:
 
@@ -110,19 +143,19 @@ dK += int8(dS_i8).T @ int8(Q) * (ds_scale * q_scale)
 dQ += int8(dS_i8) @ int8(K).T * (ds_scale * k_scale)
 ```
 
-This preserves all four INT8 MMA paths, removes the former second dS maximum/materialization, and moves Q/K dequantization factors to the FP32 dK/dQ accumulation. The backward wrapper already produces the block-scaled Q/K representation through `per_block_int8`; the forward quantization path is unchanged. Quantization geometry is represented independently from the CTA matmul geometry in the generated configuration and kernel template.
+This preserves all four INT8 MMA paths, removes the former second dS maximum/materialization, and moves Q/K dequantization factors to the FP32 dK/dQ accumulation. The backward wrapper already produces the block-scaled Q/K representation through `per_block_int8`; the forward quantization path is unchanged. The template parameters name quantization and matmul geometry separately, but the current exact kernel still requires `QuantBlockK >= CtaN`. Removing that restriction and indexing multiple quantization domains per CTA is the first redesign prerequisite.
 
-The numerical and timing gates are complete for the focused candidates without loosening tolerances. Q128/K64 has dQ/dK relative error around `4.10-4.20%`, compared with `4.85-4.99%` for Q128/K128. Q32/K64 is slightly more accurate than Q128/K64 and is at least as fast in controlled long-shape timing, so it remains the default. Exposing `QBlock`/`KBlock` as a public accuracy control and autotuning matmul geometry independently remain production follow-up work.
+The numerical and timing gates are complete for the existing focused candidates under the original tolerances. Q128/K64 has dQ/dK relative error around `4.10-4.20%`, compared with `4.85-4.99%` for Q128/K128. Q32/K64 is slightly more accurate than Q128/K64 and is at least as fast in controlled long-shape timing, so it is the fixed starting point for the new matmul schedule. Internal geometry decoupling happens now; public quantization controls and autotuning remain deferred.
 
-## Active Configuration
+## Current Baseline And Redesign Target
 
 The active generated dispatch contains three focused public configurations:
 
-| Public config | CTA M | CTA N | Generated warps | Current implementation |
-|---|---:|---:|---:|---|
-| `32x64x32x64` | 64 | 64 | 4 | default block-scaled exact internal eight-warp head-64 kernel |
-| `128x64x128x64` | 64 | 64 | 4 | coarser-Q comparison on the same internal eight-warp kernel |
-| `128x128x128x128` | 64 | 128 | 8 | exploratory internal sixteen-warp head-64 kernel |
+| Backward config `(QBlock,KBlock,CtaM,CtaN)` | Generated warps | Current implementation |
+|---|---:|---|
+| `32x64x64x64` | 4 | default block-scaled exact internal eight-warp head-64 kernel |
+| `128x64x64x64` | 4 | coarser-Q comparison on the same internal eight-warp kernel |
+| `128x128x64x128` | 8 | exploratory internal sixteen-warp head-64 kernel |
 
 The prior `{64,128}` head-dimension cross product and three other public block configurations are intentionally out of the active build during focused optimization. Retrieve them from git before resuming broader coverage.
 
@@ -135,6 +168,33 @@ Current focused resource figures are:
 | Q128/K128, 64x128 | 16 warps / 512 threads | 128 | 49,536 B | 1 CTA |
 
 The K64 resource contract is current-source evidence. The direct-global resident-K packet is retained, not provisional. Generic and head-128 resource tables are intentionally omitted because those generated paths are not in the focused build; refresh them only after broader production generation is restored.
+
+The selected redesign target is intentionally one configuration:
+
+| Quantization | Backward CTA | Internal launch | Resource policy |
+|---|---:|---:|---|
+| Q32/K64 | M64 x N128 | 8 warps / 256 threads | one resident CTA is acceptable; avoid compiler-local traffic |
+
+The target may use `__launch_bounds__(256, 1)` and materially more than 128 registers/thread if register-resident V, persistent dK+dV accumulators, or resident K operand packets remove larger shared-memory and synchronization costs. Two-CTA occupancy remains a requirement for the retained K64 baseline, not an absolute rule for the K128 redesign.
+
+During controlled A/B work, the generator may temporarily contain the retained K64 baseline and the new K128 candidate. Once the candidate passes the retention gates and wins long-shape timing, collapse generated dispatch and Python configuration to the single selected Q32/K64 plus M64xN128 geometry. Remove Q128/K64, Q128/K128, the old K64 exact path, temporal K128 code, and helpers used only by removed geometries rather than preserving inactive variants in the source tree. The arbitrary-length predicated implementation for the selected geometry must exist before the old fallback is removed. All removed paths remain recoverable from git.
+
+## Critical Redesign Program
+
+- **Completed prerequisite:** the backward API, generator, generated dispatch, Python wrapper, and benchmark labels now use explicit Q/K quantization blocks plus backward CTA M/N. Forward `warp_q`/`warp_k` metadata is no longer used to select backward geometry.
+- Implement a clean aligned head-64 M64xN128, eight-warp KV-owned kernel. It should follow the successful structural choices of Flash's SM86 head-64 schedule: 256 threads, persistent dK and dV accumulators, V resident in registers when profitable, distinct score/dKV/dQ warp layouts, and double-buffered Q/dO state. Do not port the rejected temporal-eight-warp body.
+- Build one canonical on-the-fly P/dS packet per score tile and consume it in normal and transposed orientations through CuTe copy atoms. The design objective is one scalar materialization and one packed store, with no mirrored dS tile and no repeated operand repacking. An interleaved 16-bit `{P_i8, dS_i8}` physical packet is the first layout to evaluate.
+- Keep two K64 and two Q32 quantization domains inside the M64xN128 CTA. Compute and apply their scales independently, then combine scaled FP32 dQ contributions before one N128 atomic epilogue. This preserves the selected accuracy geometry while halving K-tile ownership and matching Flash's dQ reduction granularity.
+- Software-pipeline QK/dP, scalar P/dS production, and gradient MMA consumption across two packet buffers. Prefetch Q8, dO8, fp16 dO, and row state for the next M slice while dV/dK/dQ consume the current packet. Group-level synchronization may replace lockstep CTA barriers when ownership and buffer lifetimes make it race-free.
+- Keep the retained K64 kernel unchanged as the benchmark reference while these structural pieces are incomplete. Once the new schedule is retained, simplify the codebase to the selected geometry before doing lower-margin tuning.
+
+## Accuracy Policy
+
+Schedule, ownership, layout, staging, and synchronization changes that preserve Q/K block sizes and the mathematical P/dS quantization contract must pass the existing tolerances. Do not loosen accuracy to hide an indexing, race, scale, or accumulation bug.
+
+Changing Q/K block sizes or the on-the-fly P/dS numerical format is an explicit speed/accuracy experiment and may use a separately documented tolerance tier. Before changing a threshold, record dQ/dK/dV cosine similarity, Frobenius relative error, and maximum absolute error for the retained Q32/K64 format and the candidate across fixed NHD/HND, aligned, tail, and long-shape cases. An initial experimental outer ceiling on the focused randomized tests is `1 - cosine < 5e-3`, Frobenius relative error `< 0.10`, and maximum absolute error `< 0.35` for each gradient, with no NaN or Inf. These are maximum guardrails, not target tolerances; tighten them to the observed retained candidate margin after selection.
+
+Do not loosen a threshold in response to one failing seed. A format-changing candidate must show a repeatable long-shape speed gain large enough to justify its measured quality loss, and its accuracy tier must be visible in the plan, tests, and benchmark output. Only one quantization/format candidate should remain active after the decision.
 
 ## Build And Validation Workflow
 
@@ -325,7 +385,7 @@ The `1.67x` figure applies only to the five equal-size MMA paths: four paths at 
 | Double-buffer resident Q/dO stages | Separating the aliased fp16 dO and dS/dKV scratch storage restored correctness, but the candidate regressed from `0.3123 -> 0.3369 ms` at 512 and `8.43-8.54 -> 8.90 ms` at 4096. It increased dynamic shared memory to `37,984 B`, local-load sectors to `774,656`, and instructions to `14.662M`. |
 | Broad unpredicated aligned path | Removing Q/dO/K/V copy, row-state, resident-K packet, and dKV-store predicates increased local sectors from `131,072/8,192` to `262,144/16,384`, instructions from `8.769M` to `8.823M`, profile duration from `153.280` to `154.016 us`, and NHD timing to `5.4006/20.8451 ms`. Retain only scalar score/dS and dQ-row specialization. |
 
-Do not repeat rejected paths without a new attribution result that changes the tradeoff.
+Do not repeat rejected paths without a new attribution result that changes the tradeoff. The rejected temporal-eight-warp K128 result applies to that old two-orientation, unfused-dQ body; the clean M64xN128 program above is a different schedule and must not inherit the old rejection by association.
 
 ## Remaining Bottlenecks
 
@@ -336,39 +396,54 @@ Do not repeat rejected paths without a new attribution result that changes the t
 - Transposed INT8 B preparation: the custom Q/K/int8-dO loader performs integer shuffles and byte permutations around LDSM, and the same operand transformation is consumed by dV, dK, and dQ. It is a structural candidate only if a replacement reduces both instruction and long-shape time without adding a CTA barrier.
 - Synchronization and dependencies: aligned barrier/short-scoreboard stalls remain `20.94%/12.35%`; the loop still publishes scales, quantized operands, dKV state, and dQ staging through dependent barriers. Lower eligible warps (`0.47` per scheduler) indicate limited independent work despite the two-CTA occupancy contract.
 - dQ reduction: CTA-local fusion and 4x8 ownership reduce the profile reduction contract to `524,288` sectors, but at 4096 Sage still issues `2x` Flash's global-reduction instructions/sectors. FP32 atomics remain a dependency chain in both implementations, so changing ownership requires full workspace and launch accounting.
-- N-tile amortization: Sage's K64 main kernel uses twice the K-tile count of Flash's K128 head-64 kernel. This repeats Q/dO, row-state, scalar score/dS, and reduction work more often. The temporal eight-warp K128 candidate failed the resource/scheduler gate, so any wider-tile design must preserve useful occupancy or prove a long-shape gain that justifies one resident CTA.
+- N-tile amortization: Sage's K64 main kernel uses twice the K-tile count of Flash's K128 head-64 kernel. This repeats Q/dO, row-state, scalar score/dS, and reduction work more often. The new M64xN128 design deliberately allows one resident CTA and higher register use when they buy register-resident operands, fewer barriers, and lower total instruction volume; useful issue efficiency and no compiler-local traffic matter more than nominal occupancy.
+- Kernel-internal geometry coupling: host configuration is now decoupled, but the current exact kernel still requires the K quantization block to cover the complete CTA N tile. That prevents the selected Q32/K64 format from using an N128 backward tile and is the next implementation barrier.
 - Helper kernels and HBM: preprocessing/allocation and dQ conversion are only about 0-2% of Sage's long-shape time, and Sage/Flash DRAM throughput is low (`5.07%/4.25%` at 4096). They are not the current optimization targets.
 - Head-128: it is absent from the active generated dispatch and remains recoverable from git; restoration and optimization are deferred until focused head-64 work is complete.
 
 ## Ordered Next Work
 
-- Reduce the explicit shared-load/store and scalar materialization work as one schedule change. The dQ transpose, score/dS loops, and operand staging must be evaluated together because isolated bank/conflict improvements have repeatedly traded for compiler-local traffic or scoreboard stalls.
-- Attribute and remove repeated transposed-loader shuffles, byte permutations, and scale/conversion instructions only where the source census gives a measured target. Preserve the CuTe/CUTLASS MMA contracts and do not add a CTA-wide synchronization point.
-- Revisit N-tile amortization with a K128 design that keeps the two-resident-CTA K64 contract as the reference. The rejected temporal eight-warp path is not evidence that all wider tiles fail; it is evidence that the old two-orientation dS and unfused dQ body must be redesigned before a wider tile is viable.
-- Reduce dQ dependency pressure only with an end-to-end comparison of atomic ownership, split workspaces, or a separate reduction. A lower sector count alone is insufficient.
-- Extend Q/dO prefetch overlap into operand preparation only when producer warps can wait on their own copies and publish complete fragments at the existing boundary. Do not add another per-pair CTA barrier.
-- Keep the direct-global resident-K packet and aligned scalar/dQ specialization as baselines. Any replacement must pass the two-CTA resource gate, focused correctness, Racecheck, and serial NHD/HND 4096/8192 timing.
-- Restore the removed generator/dispatch and broader head-dimension paths from git after focused head-64 optimization stops, then rebuild serially, run the full correctness/Racecheck and accuracy matrix, and refresh `{heads 16/32} x {D 64/128} x {S 4096/8192}`.
-- After broader coverage is restored, expose Q/K quantization block sizes as an accuracy control and autotune backward matmul geometry, ownership, and forward geometry independently.
+### Priority 0: Structural Backward Redesign
+
+- **Configuration separation complete.** Add exactly one candidate mapping: Q32/K64 quantization to head-64 M64xN128 with eight internal warps. Keep the current K64 mapping only for same-build comparison.
+- Compile a resource-complete aligned K128 skeleton before filling in lower-level tuning. Establish that 256 threads, persistent dK+dV state, selected shared buffers, and any register-resident V/K packets fit the SM86 architectural limits without compiler-local memory. Do not impose the K64 128-register launch bound.
+- Implement the score/dP ownership and the two-Q32-by-two-K64 scale-domain mapping. Validate exact accumulator coordinates and scale application with a standalone small-shape correctness probe before adding optimized stores or overlap.
+- Implement the canonical P/dS packet and all three gradient consumers around it. The first complete version should halve K-tile-level dQ reductions and remove mirrored dS materialization; source counters must confirm that it does not recreate the old transposed-loader and shared-store excess elsewhere.
+- Add the two-stage Q/dO/row-state and P/dS software pipeline. Evaluate register-resident V first, then persistent K operand packets only if register headroom remains. Synchronization changes are part of this coordinated schedule, not isolated barrier substitutions.
+- Add the predicated arbitrary-length specialization for the selected geometry, then run matched K64/K128 correctness, Racecheck, source/profile, and serial 4096/8192 NHD/HND A/B. If K128 is retained, remove the old generated configurations and geometry-specific code in the same development phase.
+
+### Priority 1: Format And Remaining Structural Pressure
+
+- If scalar quantization remains on the critical path after the one-touch schedule, evaluate one format change at a time: power-of-two P/dS scales, a different P/dS packet representation, or a coarser Q/K block. Use the separate accuracy tier and keep only the selected format.
+- If dQ atomics remain material after N128 fusion, compare alternative ownership or split workspaces only with complete workspace, reduction-launch, and end-to-end timing. Sector reduction alone is not evidence.
+- If shared movement remains above Flash after canonical packing, use fresh source attribution to redesign the specific copy atom or register handoff. Do not resume the prior broad mirror, padding, or swizzle search without a new structural target.
+
+### Priority 2: Small-Margin Work
+
+Only after Priority 0 and applicable Priority 1 designs are retained or rejected should isolated predicate, address, conversion, bank-conflict, or epilogue changes resume. Keep them only when controlled long-shape timing exceeds thermal noise and the added code does not undermine the single-configuration design.
 
 ## Deferred Work
 
-- Production exposure of Q/K quantization block sizes and independent forward/backward matmul autotuning.
-- Optimizing block sizes other than focused head-64 `64x64x32x64` before the focused investigation stops.
+- Forward performance optimization and forward autotuning. A compatibility change, if required, is limited to the CUTLASS forward kernel at one fixed geometry; do not change the CUDA or Triton forward kernels.
+- Production exposure of Q/K quantization block sizes and forward/backward matmul autotuning.
+- Additional backward block sizes, head-128, and restoration of broad generated dispatch while the selected head-64 M64xN128 path is under investigation.
 - Backward trainable/compile wrappers.
 - GQA/MQA, causal attention, variable length, and additional dtypes.
 
 ## Retention Gate
 
 Retain an optimization only when all applicable checks pass:
-- FlashAttention-referenced correctness, including HND/NHD and tail cases.
+- FlashAttention-referenced correctness, including HND/NHD and tail cases, under the applicable schedule-preserving or format-changing accuracy policy above.
 - Compute Sanitizer Racecheck.
 - serial warmed 4096- and 8192-token timing, with thermal drift considered. The 512-token shape is profile context only and is too noisy for retention decisions.
 
 Also check the following, while using the overall speed as the optimization target:
-- registers, shared memory, stack/local memory, and occupancy.
+- registers, shared memory, stack/local memory, and occupancy. One resident K128 CTA and register use above 128/thread are acceptable; compiler-local traffic requires explicit performance evidence.
 - global atomic/reduction sectors.
 - shared conflicts per wavefront and synchronization behavior.
+- target-shape non-tensor instructions and explicit shared load/store classes relative to both the K64 baseline and Flash.
+
+A prerequisite refactor may be retained without an immediate timing gain when it is required for the selected K128 schedule and does not regress the K64 baseline. A standalone micro-optimization below approximately 3% is not sufficient while higher-margin structural work remains. The complete K128 candidate must beat the K64 baseline by a stable long-shape margin and materially improve at least one governing structural counter; nominal occupancy or a 512-token duration alone cannot decide it.
 
 ## Key Artifacts
 

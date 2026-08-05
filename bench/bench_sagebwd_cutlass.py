@@ -24,7 +24,7 @@ def _parse_block_config(value: str) -> BlockConfig:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("block config must contain integers") from exc
     if len(parts) != 4:
-        raise argparse.ArgumentTypeError("block config must be 'blk_q,blk_k,warp_q,warp_k'")
+        raise argparse.ArgumentTypeError("block config must be 'blk_q,blk_k,bwd_block_m,bwd_block_n'")
     return parts
 
 
@@ -208,7 +208,7 @@ def _sage_kernel_only_backward(
     sm_scale: float,
     block_config: BlockConfig,
 ) -> None:
-    blk_q, blk_k, warp_q, warp_k = block_config
+    blk_q, blk_k, bwd_block_m, bwd_block_n = block_config
     with torch.inference_mode():
         _qattn_cutlass_sm80.qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(
             q_int8,
@@ -226,8 +226,8 @@ def _sage_kernel_only_backward(
             sm_scale,
             blk_q,
             blk_k,
-            warp_q,
-            warp_k,
+            bwd_block_m,
+            bwd_block_n,
         )
 
 
@@ -428,7 +428,7 @@ def main() -> None:
     parser.add_argument(
         "--block-configs",
         nargs="*",
-        help="Configs as blk_q,blk_k,warp_q,warp_k. Defaults to all generated backward configs.",
+        help="Configs as blk_q,blk_k,bwd_block_m,bwd_block_n. Defaults to all generated backward configs.",
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
