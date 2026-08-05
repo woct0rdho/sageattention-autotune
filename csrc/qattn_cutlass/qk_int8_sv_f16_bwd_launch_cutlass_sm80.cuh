@@ -216,10 +216,11 @@ void launch_mma(const Tensor &query,
     HeadDim == 64 && BlockM == 64 &&
       ((BlockN == 64 && NumWarps == 4) || (BlockN == 128 && NumWarps == 8)),
     "Only the focused head-64 64x64 and 64x128 backward matmul configurations are built");
-  static_assert((QuantBlockQ == 32 || QuantBlockQ == 128) && QuantBlockK == BlockN,
-                "Focused backward quantization specializations require QBlock=32 or 128 and KBlock=CTA N");
+  static_assert(
+    QuantBlockQ == 32 && QuantBlockK == 64,
+    "Focused backward A/B uses the selected Q32/K64 quantization format");
   using MicroTraits = BwdTileTraits<64>;
-  constexpr int32_t kKernelWarps = 2 * NumWarps;
+  constexpr int32_t kKernelWarps = BlockN == 128 ? NumWarps : 2 * NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;
   const auto device_guard = make_device_guard(query);
   const auto stream = get_current_cuda_stream(query);
@@ -246,27 +247,40 @@ void launch_mma(const Tensor &query,
     reinterpret_cast<float*>(do_scale.mutable_data_ptr()),
     params);
 
-  auto kernel = params.seq_len % BlockN == 0
-    ? fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
-    : fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
   constexpr int32_t smem_size = sizeof(SharedStorage2DWarp<KernelTraits>);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-  kernel<<<kv_grid, dim3(32, kKernelWarps), smem_size, stream>>>(
-    reinterpret_cast<const int8_t*>(query.const_data_ptr()),
-    reinterpret_cast<const int8_t*>(key.const_data_ptr()),
-    reinterpret_cast<const float*>(query_scale.const_data_ptr()),
-    reinterpret_cast<const float*>(key_scale.const_data_ptr()),
-    reinterpret_cast<const half*>(value.const_data_ptr()),
-    reinterpret_cast<const half*>(grad_output.const_data_ptr()),
-    reinterpret_cast<const int8_t*>(do_int8.const_data_ptr()),
-    reinterpret_cast<const float*>(do_scale.const_data_ptr()),
-    reinterpret_cast<const float*>(lse.const_data_ptr()),
-    reinterpret_cast<const float*>(delta.const_data_ptr()),
-    reinterpret_cast<float*>(dq_accum.mutable_data_ptr()),
-    reinterpret_cast<half*>(grad_key.mutable_data_ptr()),
-    reinterpret_cast<half*>(grad_value.mutable_data_ptr()),
-    params,
-    static_cast<float>(sm_scale));
+  const auto launch_kernel = [&](auto kernel) {
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    kernel<<<kv_grid, dim3(32, kKernelWarps), smem_size, stream>>>(
+      reinterpret_cast<const int8_t*>(query.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(key.const_data_ptr()),
+      reinterpret_cast<const float*>(query_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(key_scale.const_data_ptr()),
+      reinterpret_cast<const half*>(value.const_data_ptr()),
+      reinterpret_cast<const half*>(grad_output.const_data_ptr()),
+      reinterpret_cast<const int8_t*>(do_int8.const_data_ptr()),
+      reinterpret_cast<const float*>(do_scale.const_data_ptr()),
+      reinterpret_cast<const float*>(lse.const_data_ptr()),
+      reinterpret_cast<const float*>(delta.const_data_ptr()),
+      reinterpret_cast<float*>(dq_accum.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_key.mutable_data_ptr()),
+      reinterpret_cast<half*>(grad_value.mutable_data_ptr()),
+      params,
+      static_cast<float>(sm_scale));
+  };
+  if constexpr (BlockN == 128)
+  {
+    auto kernel = params.seq_len % BlockN == 0
+      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
+      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
+    launch_kernel(kernel);
+  }
+  else
+  {
+    auto kernel = params.seq_len % BlockN == 0
+      ? fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
+      : fused_mma_kernel_2d_warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
+    launch_kernel(kernel);
+  }
 
   convert_dq_kernel<HeadDim><<<q_grid, 128, 0, stream>>>(
     reinterpret_cast<const float*>(dq_accum.const_data_ptr()),

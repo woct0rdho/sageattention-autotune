@@ -7,7 +7,7 @@ from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 64)
-_BWD_CONFIGS = (_BWD_CONFIG, (128, 64, 64, 64), (128, 128, 64, 128))
+_BWD_CONFIGS = (_BWD_CONFIG, (32, 64, 64, 128))
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
