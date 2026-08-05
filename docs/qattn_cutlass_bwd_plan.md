@@ -6,18 +6,28 @@
 
 The focused implementation targets head-dimension 64, fp16, non-causal fixed-length attention on SM86. Q/K quantization uses QBlock=32 and KBlock=64. Backward quantization geometry and CTA geometry are independent compile-time choices.
 
-The worktree currently generates exactly two backward configurations:
+The worktree generates two backward geometry configurations and four explicit source instantiations:
 
-| Config `(QBlock,KBlock,CtaM,CtaN)` | Generated template | Role |
+| Config `(QBlock,KBlock,CtaM,CtaN)` | Generated policies | Role |
 |---|---|---|
-| `(32,64,64,64)` | `<64,64,64,4,32,64>` | K64 controlled reference |
-| `(32,64,64,128)` | `<64,64,128,8,32,64>` | K128 selected implementation and public default |
+| `(32,64,64,64)` | `dynamic` | K64 controlled reference |
+| `(32,64,64,128)` | `dynamic`, `power2_ds`, `periodic_ds` | K128 selected implementation and public default geometry; optional format references |
 
-`sageattention/cutlass_bwd.py` selects K128 through `_BWD_CONFIG = (32, 64, 64, 128)`. K64 remains in `_BWD_CONFIGS` for same-build controls. There is no active source candidate beyond the retained K128 schedule. The format and geometry candidates below are planning-only until they have a separate generated instantiation, correctness evidence, and a full long-shape comparison.
+`sageattention/cutlass_bwd.py` selects K128 through `_BWD_CONFIG = (32, 64, 64, 128)`. K64 remains in `_BWD_CONFIGS` for same-build controls. Dynamic dS is the public default; power-of-two and periodic dS are explicit K128 policies selected by policy ID. The mirror-only dS-to-dK policy was evaluated and removed. There is no active source candidate beyond these retained instantiations. New format or geometry candidates require a separate generated specialization, correctness evidence, resource inspection, and a full long-shape comparison before entering dispatch.
 
 `setup.py` emits only `arch=compute_86,code=sm_86`. Existing filenames and module names containing `sm80` are legacy identifiers; they do not indicate a built SM80 image. Sage's native-SM86 image materially improved its earlier SM80-image profile on the NVIDIA GeForce RTX 3080 Ti Laptop GPU.
 
 The installed FlashAttention 2.9.1 extension has no `sm_86` cubin, so its active backward reference uses the wheel's `sm_80` image. A targeted compile of the exact current-source specialization found no material SM80/SM86 code-generation delta, so the installed wheel remains the Flash reference; a whole-package FlashAttention rebuild is not justified.
+
+### Active Policy Matrix
+
+| Policy ID | Policy | Generated geometry | Status and measured role |
+|---:|---|---|---|
+| `0` | `dynamic` | K64 and K128 | Public default; schedule-preserving accuracy reference |
+| `1` | `power2_ds` | K128 only | Optional exact-max format; approximately `0.6-1.0%` faster in paired long main-kernel timing, but near the schedule-preserving dQ/dK error limit |
+| `2` | `periodic_ds` | K128 only | Optional approximate format; approximately `4.3-5.1%` faster in paired long main-kernel timing, but outside the schedule-preserving accuracy tier |
+
+All K128 policies preserve the `Q32/K64`, `M64xN128`, eight-warp body and the existing dQ mirror; K64 remains the unchanged dynamic control. Approximate policies are compile-time specializations selected through the runtime policy ID; they do not add inner-kernel policy branches.
 
 ### Supported Contract
 
@@ -91,7 +101,7 @@ The native source counters show that the problem is the exact max-based P/dS qua
 
 - Fixed-scale P, dynamic dS is closed for a global linear INT8 scale. Full-domain scans and dV emulation showed that a fixed multiplier zeros nearly all long-shape P values and collapses dV cosine, even though conversion-level saturation is cheap. Retain local P scaling unless a new multi-level or residual representation preserves the tail with fewer total instructions.
 - Exact power-of-two dS is retained as an optional K128 policy, not the default. It keeps the exact maximum and second conversion pass, derives a symmetric block exponent, and replaces one reciprocal with bit-level inverse construction. Paired long timing wins by about `0.6-1.0%`, but executed instructions rise and dQ/dK relative error approaches the `0.06` schedule-preserving limit.
-- Direct clipped or predicted dS is next. Use a fixed, running, or cheaply predicted dS scale so P and dS can both be quantized during reconstruction. This is the only route that removes the dS maximum/reduction/barrier/second pass together. It is deliberately an approximate format experiment: record saturation, zero rate, and scale histograms, and keep it behind a separate dispatch path.
+- Periodic predicted dS is the current approximate reference. It uses an exact domain scale every 16 M32 blocks and a guarded cached scale for the other blocks, removing most exact dS maximum/reduction work while remaining behind an explicit dispatch path. A future one-pass clipped or predicted scale is worthwhile only if it removes the remaining maximum, reduction, barrier, and second conversion pass without reproducing the rejected mirror-load overhead. Record saturation, zero rate, and scale histograms for every new format.
 - Do not retry packed conversion in isolation. An inline `cvt.pack` or vector conversion is acceptable only if a standalone SASS comparison proves it replaces scalar F2IP/conversion instructions rather than adding packing around them. It is a complement to a one-pass format, not the primary optimization.
 
 Q/K block changes are separately timed in the full backward pipeline because `per_block_int8` runs outside the fused main kernel. A coarser Q or K block is useful only if its external quantization saving, fewer scale domains, and any in-main handoff saving outweigh its accuracy loss. dO quantization is likewise measured separately from the main-kernel attribution before it becomes a target.
@@ -298,16 +308,16 @@ Instruction counts do not map linearly to elapsed time, but this rules out minor
 - Corrected full reconstructed-P scans with the actual Sage forward LSE and Q32/K64 backward quantization reached maxima `0.324/0.155/0.172` at `seq=512` and `0.060/0.051/0.043` at `seq=8192` for seeds 0/1/2, with no values above 1. A fixed multiplier of 127 nevertheless zeroed about `99.94%` at `seq=4096` and effectively all values at `seq=8192`.
 - A literal fixed multiplier of 127 rounded about `99.9%` of long-shape P values to zero in the range scan. A guarded multiplier near 64 avoids the observed overshoot but loses still more tail precision. dV-only emulation at `seq=2048/4096` measured dynamic local P quantization at about `0.9996` cosine and `2.6-2.7%` relative error, versus fixed multipliers 127/96/64 at `0.52/0.44/0.33` cosine for `seq=2048` and `0.35/0.28/0.19` for `seq=4096`.
 - The naive global fixed-P representation is therefore rejected: it removes the local scale reduction by destroying the long-shape dV signal. The useful clamp optimization is conversion-level: keep local dynamic scales, use a single saturating `F2I.S8` conversion, and verify that the bounded baseline produces identical results and no instruction increase.
-- The native baseline rebuild used four jobs and passed the focused K64/K128, NHD/HND, aligned/tail matrix (`8 passed in 6.50 s`). INT4 is explicitly deferred and is not part of the active experiment queue.
-- The conversion-level saturation experiment replaced the 32 aligned K128 `F2I.FTZ.NTZ` instructions with `F2I.S8`; instruction slots stayed at `2088` with `33` padding NOPs, and resource counts did not change. Focused correctness remained `8 passed`.
+- The retained native-SM86 build uses four jobs and passes the expanded K64/K128, optional-policy, NHD/HND, aligned/tail matrix (`16 passed`). INT4 is explicitly deferred and is not part of the active experiment queue.
+- The conversion-level saturation experiment replaced the 32 aligned K128 `F2I.FTZ.NTZ` instructions with `F2I.S8`; instruction slots stayed at `2088` with `33` padding NOPs, and resource counts did not change. The expanded retained correctness matrix remains `16 passed`.
 - Fresh serial long controls for the saturating helper measured K128 at `4.198/16.155 ms` NHD and `4.180/15.982 ms` HND for 4096/8192. This is neutral within the existing run-to-run spread, so the helper is retained as overflow protection with no claimed speedup. It is a conversion-level clamp, not an added floating-point clamp sequence.
 - Exact-max power-of-two dS simulation is viable for a kernel probe. Relative dQ/dK error increased from `3.4-3.8%` for dynamic scaling to `5.0-5.5%`; cosine remained about `0.9985`, zero rate increased from `18-19%` to `24-26%`, and conversion saturation stayed between `2e-6` and `8e-6`. The real candidate must prove that exponent construction removes enough reciprocal/scale work to offset the format loss.
-- The real exact-max policy passes the expanded focused matrix (`12 passed`) and the strict schedule-preserving limits through sequence 8192. At 8192, dQ/dK cosine is `0.998340/0.998372`, relative error is `5.768%/5.711%`, maximum absolute error is `0.00587/0.00536`, and dV is identical to the dynamic-dS kernel.
+- The real exact-max policy passes its focused K128 NHD/HND aligned/tail cases and the strict schedule-preserving limits through sequence 8192. At 8192, dQ/dK cosine is `0.998340/0.998372`, relative error is `5.768%/5.711%`, maximum absolute error is `0.00587/0.00536`, and dV is identical to the dynamic-dS kernel.
 - Aligned SASS remains 235 registers, zero local memory, and `2088` slots. Power-of-two dS removes one `MUFU.RCP` and one `FFMA`, adds one `FMNMX`, two `IADD3`, and two `LOP3`, and raises non-NOP slots `2055 -> 2058`; it is a latency trade rather than an instruction-count reduction.
 - Alternating same-process controls measured power-of-two/dynamic paired ratios of `0.994/0.990` for NHD and `0.994/0.990` for HND at 4096/8192, reproduced at `0.994/0.991` and `0.992/0.992` with 200 pairs and another seed. Fixed-clock NCU at 8192 measured `20.294 -> 20.125 ms`, `5.297B -> 5.253B` elapsed SM cycles, and `1.599B -> 1.606B` executed instructions.
 - Aligned sequence 512 and odd-tail 513 Racecheck both report `0 hazards, 0 errors, 0 warnings` for the power-of-two specialization.
 - Keep this policy as an explicit same-build format reference and composition candidate, with dynamic dS remaining the public default. Its modest speedup does not justify silently spending the accuracy margin, but it proves that reciprocal latency is measurable and provides the control for a direct one-pass dS experiment.
-- Periodic predicted-dS simulation is bounded but approximate. A `2x` guarded scale recalibrated every 16 M32 blocks produced sequence-8192 dQ/dK cosine `0.99180-0.99196`, relative error `12.66-12.79%`, zero rate `31.99-32.32%`, and saturation `5.0e-5-5.2e-5` for seeds 0/1. It passes the first format tier but not the schedule-preserving tier; the next kernel probe must show a material removal of dS max/reduction work before this trade is retained.
+- Periodic predicted-dS simulation is bounded but approximate. A `2x` guarded scale recalibrated every 16 M32 blocks produced sequence-8192 dQ/dK cosine `0.99180-0.99196`, relative error `12.66-12.79%`, zero rate `31.99-32.32%`, and saturation `5.0e-5-5.2e-5` for seeds 0/1. It passes the first format tier but not the schedule-preserving tier; this motivated the retained periodic K128 policy as an explicit accuracy/performance reference.
 - The periodic K128 probe passes the expanded focused matrix (`16 passed`) and Racecheck at 512/513 after adding a barrier around the cached domain-scale update. Full-pipeline sequence-8192 dQ/dK relative error is `12.74-13.17%` with cosine `0.99169-0.99186` and maximum absolute error `0.082-0.108` for seeds 0/1; dV remains identical to dynamic dS.
 - Corrected alternating controls show periodic/dynamic paired ratios of `0.957/0.949` NHD and `0.955/0.951` HND at 4096/8192. Fixed-clock NCU at 8192 measures `20.294 -> 19.340 ms`, `5.297B -> 5.048B` elapsed SM cycles, and `1.599B -> 1.597B` executed instructions. The branch removes most exact dS max/reduction work without increasing the aligned register or shared-memory footprint.
 - Retain periodic dS as an optional approximate K128 reference, with dynamic dS still the public default. Its `4.3-5.1%` main-kernel win is large enough to justify the format tier, and it unlocks direct P/dS-to-dKV handoff experiments; it is not a default promotion because its error exceeds the schedule-preserving gate.
@@ -335,6 +345,8 @@ Instruction counts do not map linearly to elapsed time, but this rules out minor
 - Promoted K128 to the public default after full NHD/HND, 4096/8192, forward/reverse controls.
 - Added an optional exact-max power-of-two dS policy for K128. It preserves the strict accuracy gate and improves paired long main-kernel timing by `0.6-1.0%`; dynamic dS remains the default.
 - Added an optional periodic predicted-dS policy for K128. It recalibrates every 16 M32 blocks with a `2x` guard, passes the first approximate accuracy tier and Racecheck, and improves paired long main-kernel timing by `4.3-5.1%`; dynamic dS remains the default.
+- Propagated explicit quantization policy IDs through the stable-torch launch, generated dispatch, Python wrapper, benchmark CLI, and focused tests; the generated set is now K64 dynamic plus K128 dynamic, power-of-two, and periodic policies.
+- Derived an exact two-slot dS mirror-to-dK fragment mapping, tested mirror-only dK consumption, and removed the candidate after it lost all four governing long kernel-only controls. The mapping is retained only as a probe result for a future producer/register-direct consumer.
 
 ### Completed Decisions
 
@@ -370,13 +382,13 @@ The decisions above apply to their isolated source implementations. The followin
 
 | Coupled candidate | Why the isolated result is no longer decisive | Required proof before long timing |
 |---|---|---|
-| Direct-register P/dS to dV/dK plus mirror-only dS for dQ | The rejected warp-local handoff still paid for dynamic P/dS scaling and canonical-plus-mirrored storage. Fixed P or a direct dS format can let dV/dK consume producer fragments while only dQ materializes the known-good mirrored dS layout. | CuTe copy-plus-MMA mapping, no spills, source/SASS evidence that canonical P/dS stores and reloads disappear, and preserved dQ race safety. |
+| Direct-register P/dS to dV/dK plus the retained dS mirror for dQ | The rejected warp-local handoff still paid for dynamic P/dS scaling and canonical-plus-mirrored storage. A producer/register-direct consumer can let dV/dK consume fragments while dQ alone retains the known-good mirrored dS layout; the ordinary vectorized mirror-only dK load is already rejected. | Resolve `rP`/`rdS` ownership, no spills, source/SASS evidence that canonical P/dS stores and reloads disappear, and preserved dQ race safety. |
 | Q32/K128 plus direct or predicted dS | The isolated exact-scale single-domain body removed dQ FFMA work but lost because all eight warps remained on the dS maximum dependency. A one-pass dS format can remove that newly identified failure condition. | Remove the exact eight-warp maximum/barrier path, retain one-domain dQ scaling, show no spills, and beat Q32/K64 in the full serial matrix. |
 | Q64/K128 two-M-pair staging plus Q/dO double buffering | The rejected buffer raised live state without amortizing quantization. A true M64 domain can amortize Q scale and allow a direct-quantized pair to overlap the next pair's staging. | Storage/liveness prototype first; no local traffic, bounded registers, and an explicit removal of an M-pair quantization/reduction pass. |
 | Producer-specialized Q/dO MMA-B handoff plus direct P/dS consumers | The rejected lane-major packet still served the same broad consumer pattern and increased conflicts. A direct dV/dK path can reduce consumers and may justify a new packet/copy mapping. | Standalone producer-to-consumer copy/MMA test and source evidence that line-694 loader instructions or MIO stalls fall rather than move elsewhere. |
 | FP16 dO prefetch after a direct-quantization register reduction | The rejected prefetch was evaluated with the current high-live-range P/dS path. It can be reconsidered only if the new format releases registers and wait stalls remain material. | Register count no higher than the direct-quant baseline, zero local sectors, and a same-build timing win. |
 
-Transposed dQ, all-eight-warp dQ ownership, FP16x2 P/dS compaction, broad predicate removal, and the old temporal K128 body remain closed. The direct-register candidate preserves the mirrored dS direction instead of retrying the rejected canonical/transposed dQ reads. Explicit F2IP packing also remains closed as an isolated change.
+Transposed dQ, all-eight-warp dQ ownership, FP16x2 P/dS compaction, broad predicate removal, and the old temporal K128 body remain closed. The direct-register candidate must preserve the existing dS mirror for dQ while avoiding the rejected ordinary mirror-only dK load; it must not retry the rejected canonical/transposed dQ reads. Explicit F2IP packing also remains closed as an isolated change.
 
 Failed transient source implementations have been removed. The retained source contains the persistent P/dS MMA-A reuse, saturating `F2I.S8` conversion, optional power-of-two dS policy, and optional periodic dS max-skip policy relative to the packet-cache source.
 
@@ -391,35 +403,35 @@ Failed transient source implementations have been removed. The retained source c
 
 ## What Remains To Do
 
-### Priority 0: Native-SM86 Attribution Closed
+The native-SM86 attribution, Flash image decision, K128 baseline, explicit policy plumbing, optional-format measurements, and mirror-only handoff rejection are complete. The remaining work must change producer/consumer ownership or remove a measured representation pass; register-only, occupancy-only, and previously rejected isolated transformations remain closed.
 
-- Captured matched sequence-8192 Flash-wheel and native-SM86 Sage main kernels with the same seeded inputs, warmup count, launch order, and raw-NCU metric set.
-- Added native Sage CUDA/SASS SourceCounters correlation and re-ranked P/dS reconstruction/quantization, packed MMA-B handoff, scale application, dQ staging, and control work.
-- Built only the exact FlashAttention kernel probe for SM80 and SM86; both builds remained below five minutes. No full FlashAttention package rebuild occurred.
-- Keep the installed FlashAttention wheel as the runtime reference for upcoming experiments because its targeted SM80/SM86 comparison showed no notable architectural difference.
-- Keep K64 generated as the same-build geometry reference until one attributed candidate is tested or K64 removal is explicitly approved.
+### Priority 1: Direct Producer/Register Handoff
 
-### Priority 1: Direct Quantization And Single-Domain Format
+- Resolve the producer-to-consumer mapping for `rP` and `rdS`, starting with the existing `tDvP` and dK MMA-A fragments. The current probe established that a producer C fragment has 8 INT8 values per lane while the dK consumer owns 16, so a direct path must combine the two M-half producer fragments with a lower-cost permutation than the rejected shuffle formulation.
+- Preserve the existing `sdSMirror` stores and dQ layout. The rejected ordinary vectorized mirror-only dK load is not a fallback; the viable candidate must consume P/dS in registers or eliminate the canonical store/reload while materializing only the mirror needed by dQ.
+- Build an isolated compile-time K128 candidate only after a copy-plus-MMA probe proves the lane/register mapping. Inspect registers, local memory, SASS slots, shared stores/loads, barriers, and the dQ mirror lifetime before long timing.
+- Require aligned and odd-tail correctness, Racecheck at sequence 512/513, and paired NHD/HND 4096/8192 kernel-only and end-to-end timing against dynamic dS and periodic dS. The candidate must beat the relevant control, not merely reduce shared stores.
 
-The next candidate sequence is deliberately narrow. Each step must retain the current `Q32/K64, M64xN128` implementation as a same-build control and must remove measured work, rather than only alter register allocation or occupancy.
+### Priority 2: One-Pass dS And Paired Domains
 
-- Full-pipeline baseline first: separate Q/K `per_block_int8`, dO preprocessing, fused main, and dQ postprocess timing for the retained implementation. Record full-pipeline time as well as the main-kernel NCU counters, so a coarser Q/K block cannot win only outside the measured path.
-- Fixed-P result: the naive global linear scale is rejected before kernel integration because dV emulation failed badly at long sequence lengths. Conversion-level `F2I.S8` saturation is retained as a neutral safety improvement.
-- Direct P/dS handoff variant: only after fixed P is measured, combine producer fragments with a mirror-only dS dQ store. This is the highest-value revisit of the rejected warp-local handoff because it can remove canonical P/dS movement rather than merely retile it.
-- Q32/K128 single-domain result: the exact-scale specialization is rejected and removed after losing all kernel-only and end-to-end controls. Revisit K128 domains only with a direct/predicted dS format that removes the eight-warp maximum dependency.
-- Power-of-two and clipped-dS variants: exact power-of-two dS and the periodic max-skip policy are retained as measured optional references. The mirror-only periodic dS-to-dK handoff is rejected because its vectorized shared load loses to canonical LDSM; direct producer-to-dKV work remains open only if it eliminates that load and the canonical P/dS handoff with a new producer mapping. Proceed to a more aggressive direct dS scale only when it removes the exact maximum, barrier, and second dS pass. Record saturation and zero rates with every accuracy result.
-- Q64/K128 paired-M variant: attempt only if a fixed/predicted dS path makes two M32 pairs live at once worthwhile. It must use a new M64 lifetime design; a Q64-only source change is not sufficient.
-- Packet-handoff variant: revisit a Q/dO packet mapping only when the direct P/dS consumer topology removes line-694 work. Do not retry lane-major packets or generic double buffering as isolated changes.
-- dV/dK/dQ scale application: treat it as the next target after a representation path has removed P/dS work. It is dynamically large, but no candidate is retained if it converts multiply work into spills, higher shared traffic, or a weaker format without a timing win.
-- Flash comparison: compare the best predeclared Sage configuration with the installed FlashAttention dispatch-selected kernel for each shape. Do not constrain either implementation to the other's quantization or CTA tile size.
+- Evaluate a new clipped or predicted dS representation only when it removes the remaining exact maximum/reduction/barrier/second-pass work beyond the retained periodic reference. Keep it behind a new explicit policy ID and record saturation, clipping, zero rate, scale distributions, accuracy, SASS, and resource usage.
+- Revisit `Q64/K128` only as a two-M32-pair lifetime redesign. It must amortize a quantization or scale domain and use a direct or one-pass dS path; a Q64-only API or scale change is insufficient.
+- Keep exact power-of-two and periodic dS as same-build controls. Do not promote either to the public default without clearing the schedule-preserving accuracy gate.
 
-### Priority 2: Lower-Bit Atom Feasibility (Deferred)
+### Priority 3: Packet And Scale Follow-Ups
+
+- Revisit Q/dO packet mapping only after the direct P/dS consumer topology removes enough line-694 handoff work to justify a new copy contract. Do not retry lane-major packets or generic double buffering in isolation.
+- Revisit dV/dK/dQ FP32 scale application after a representation change releases live state. Retain only a candidate with no spills, no increase in disqualifying shared traffic, and a long-shape timing win.
+- Compare the best predeclared Sage configuration with FlashAttention's installed dispatch-selected kernel for every retained shape and layout. Keep the Flash wheel as the reference; matching nominal tiles is not required.
+- Keep K64 generated as the same-build geometry control until an explicit removal decision is made.
+
+### Priority 4: Lower-Bit Atom Feasibility (Deferred)
 
 Signed-INT4 feasibility and integration are deferred outside the current SM86 INT8 optimization scope. Do not spend build or profiling time on an S4 assembler, copy-plus-MMA, or low-bit accuracy probe during this plan; reopen it only after the INT8 representation and dataflow work is complete and explicitly approved.
 
 Every candidate must remain spill-free, preserve the 57,664-byte shared-memory lifetime graph unless a measured redesign justifies changing it, and beat the retained source in the full serial matrix.
 
-### Priority 3: Production Completion
+### Priority 5: Production Completion
 
 - Decide whether to remove the K64 reference after the next attributed experiment.
 - Restore broader generated dispatch and head dimension 128 only after the head-64 source is finalized.
