@@ -935,21 +935,11 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       scale_index_unclamped < k_scale_extent ? scale_index_unclamped : k_scale_extent - 1;
     return gKScale(scale_index);
   };
-  float aligned_k_block_scale = 0.0f;
-  if constexpr (IsAligned)
-  {
-    aligned_k_block_scale = load_k_block_scale();
-  }
-
   for (int32_t m_pair_base = 0; m_pair_base < params.seq_len; m_pair_base += 2 * Traits::kBlockM)
   {
     const int32_t q_block_index = m_pair_base / QuantBlockQ;
     const float q_block_scale = gQScale(q_block_index);
-    float k_block_scale = aligned_k_block_scale;
-    if constexpr (!IsAligned)
-    {
-      k_block_scale = load_k_block_scale();
-    }
+    const float k_block_scale = load_k_block_scale();
     constexpr auto QdO_pair_shape = cute::make_shape(
       cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
     if (warp_id < kDimBlocks)
