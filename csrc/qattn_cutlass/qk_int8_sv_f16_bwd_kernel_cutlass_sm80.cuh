@@ -703,7 +703,7 @@ template <int32_t HeadDim,
           int32_t QuantBlockQ,
           int32_t QuantBlockK,
           bool IsAligned>
-__global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
+__global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
                                                                                const int8_t *__restrict__ const K,
                                                                                const float *__restrict__ const QScale,
                                                                                const float *__restrict__ const KScale,
@@ -864,6 +864,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
     }
   }
+  // The cooperative K/V load crosses warp ownership; publish it before V fragments are read.
   __syncthreads();
 
   auto dK_accum_frag = cute::make_tensor<float>(
@@ -1209,8 +1210,9 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
       auto sdSMirrorHalf = cute::local_tile(sdSMirror, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
       cute::copy(tiled_copy_score_c, tCrdS, thr_copy_score_c.partition_D(sdSMirrorHalf));
     }
-    __syncthreads();
 
+    // Publish the cross-warp Q/dO packets and mirrored dS before either consumer runs.
+    __syncthreads();
     if (n_valid)
     {
       const float dK_scale = dS_scale * q_block_scale;
@@ -1259,7 +1261,6 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
       }
     }
 
-    __syncthreads();
     const int32_t next_m_pair_base = m_pair_base + 2 * Traits::kBlockM;
     const bool has_next_m_pair = next_m_pair_base < params.seq_len;
     if (has_next_m_pair && is_tail_loader)
