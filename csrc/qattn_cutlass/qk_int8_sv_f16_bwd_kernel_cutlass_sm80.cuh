@@ -1284,21 +1284,37 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     if ((n_tile & 1) == 0)
     {
       const int32_t dim_base = n_pair * Traits::kBlockK;
+      // Keep each packed K fragment live across both M halves; the alternative reloads it for each half.
+      auto dQ_acc_like = cute::partition_fragment_C(score_mma, BlockMNShape{});
+      auto dQ_sum_0 = cute::make_fragment_like<float>(dQ_acc_like);
+      auto dQ_sum_1 = cute::make_fragment_like<float>(dQ_acc_like);
+      cute::clear(dQ_sum_0);
+      cute::clear(dQ_sum_1);
 #pragma unroll
-      for (int32_t m_half = 0; m_half < 2; ++m_half)
+      for (int32_t domain = 0; domain < kQuantDomains; ++domain)
       {
-        auto dQ_acc_like = cute::partition_fragment_C(score_mma, BlockMNShape{});
-        auto dQ_sum = cute::make_fragment_like<float>(dQ_acc_like);
-        cute::clear(dQ_sum);
+        auto dQ_acc_0 = cute::partition_fragment_C(score_mma, BlockMNShape{});
+        auto dQ_acc_1 = cute::partition_fragment_C(score_mma, BlockMNShape{});
+        cute::clear(dQ_acc_0);
+        cute::clear(dQ_acc_1);
 #pragma unroll
-        for (int32_t domain = 0; domain < kQuantDomains; ++domain)
+        for (int32_t pair_in_domain = 0; pair_in_domain < 2; ++pair_in_domain)
         {
-          auto dQ_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
-          cute::clear(dQ_acc);
+          const int32_t dQ_pair = 2 * domain + pair_in_domain;
+          constexpr auto k_pair_shape = cute::make_shape(
+            cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
+          const auto sKPair = cute::local_tile(
+            sK, k_pair_shape, cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
+          const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
+          auto tdQK = thr_mma_score.partition_fragment_B(sKdQ);
+          load_packed_mma_b_fragment(
+            shared.k_i8_mma_b,
+            tdQK,
+            dQ_pair * kDimBlocks + dim_base / Traits::kBlockK,
+            lane_id);
 #pragma unroll
-          for (int32_t pair_in_domain = 0; pair_in_domain < 2; ++pair_in_domain)
+          for (int32_t m_half = 0; m_half < 2; ++m_half)
           {
-            const int32_t dQ_pair = 2 * domain + pair_in_domain;
             const int32_t dQ_dS_slot = 2 * dQ_pair + m_half;
             auto sdSScratchStorage = make_smem_tensor(
               shared.warp_scratch.dS_dKV,
@@ -1307,50 +1323,56 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
             auto sdSScratch = cute::recast<int8_t>(sdSScratchStorage);
             auto sdSdQ = cute::local_tile(sdSScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
             auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ);
-            constexpr auto k_pair_shape = cute::make_shape(
-              cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
-            const auto sKPair = cute::local_tile(
-              sK, k_pair_shape, cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
-            const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
-            auto tdQK = thr_mma_score.partition_fragment_B(sKdQ);
             cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ), thr_copy_score_a.retile_D(tdQdS));
-            load_packed_mma_b_fragment(
-              shared.k_i8_mma_b,
-              tdQK,
-              dQ_pair * kDimBlocks + dim_base / Traits::kBlockK,
-              lane_id);
-            cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc);
-          }
-          const int32_t domain_k_factor_unclamped = k_domain_base + domain;
-          const int32_t domain_k_factor_index =
-            domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
-          const float dQ_predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
-            (dO_l2_max * gdSKFactors[domain_k_factor_index] + delta_abs_max);
-          const float dQ_dS_scale = dQ_predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
-          const int32_t domain_k_scale_index_unclamped = k_domain_base + domain;
-          const int32_t domain_k_scale_index =
-            domain_k_scale_index_unclamped < k_scale_extent ? domain_k_scale_index_unclamped : k_scale_extent - 1;
-          const float dQ_scale = dQ_dS_scale * gKScale(domain_k_scale_index);
-#pragma unroll
-          for (int32_t idx = 0; idx < cute::size(dQ_acc); ++idx)
-          {
-            dQ_sum(idx) += static_cast<float>(dQ_acc(idx)) * dQ_scale;
+            if (m_half == 0)
+            {
+              cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_0);
+            }
+            else
+            {
+              cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_1);
+            }
           }
         }
-        static_assert(
-          score_pair_offset * sizeof(cute::uint128_t) >= 16 * 16 * sizeof(float),
-          "Each dead score-pair slot must fit one warp-local dQ transpose");
-        auto *const dQ_stage = reinterpret_cast<float *>(
-          shared.score_pair_i8.begin() + n_tile * score_pair_offset);
-        accumulate_dQ_float_fragment_shared_contiguous<IsAligned, Traits>(
-          dQ_sum,
-          dQ_stage,
-          dQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim,
-          m_pair_base + m_half * Traits::kBlockM,
-          dim_base,
-          params.seq_len,
-          lane_id);
+        const int32_t domain_k_factor_unclamped = k_domain_base + domain;
+        const int32_t domain_k_factor_index =
+          domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
+        const float dQ_predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
+          (dO_l2_max * gdSKFactors[domain_k_factor_index] + delta_abs_max);
+        const float dQ_dS_scale = dQ_predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
+        const int32_t domain_k_scale_index_unclamped = k_domain_base + domain;
+        const int32_t domain_k_scale_index =
+          domain_k_scale_index_unclamped < k_scale_extent ? domain_k_scale_index_unclamped : k_scale_extent - 1;
+        const float dQ_scale = dQ_dS_scale * gKScale(domain_k_scale_index);
+#pragma unroll
+        for (int32_t idx = 0; idx < cute::size(dQ_acc_0); ++idx)
+        {
+          dQ_sum_0(idx) += static_cast<float>(dQ_acc_0(idx)) * dQ_scale;
+          dQ_sum_1(idx) += static_cast<float>(dQ_acc_1(idx)) * dQ_scale;
+        }
       }
+      static_assert(
+        score_pair_offset * sizeof(cute::uint128_t) >= 16 * 16 * sizeof(float),
+        "Each dead score-pair slot must fit one warp-local dQ transpose");
+      auto *const dQ_stage = reinterpret_cast<float *>(
+        shared.score_pair_i8.begin() + n_tile * score_pair_offset);
+      float *const dQ_head = dQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim;
+      accumulate_dQ_float_fragment_shared_contiguous<IsAligned, Traits>(
+        dQ_sum_0,
+        dQ_stage,
+        dQ_head,
+        m_pair_base,
+        dim_base,
+        params.seq_len,
+        lane_id);
+      accumulate_dQ_float_fragment_shared_contiguous<IsAligned, Traits>(
+        dQ_sum_1,
+        dQ_stage,
+        dQ_head,
+        m_pair_base + Traits::kBlockM,
+        dim_base,
+        params.seq_len,
+        lane_id);
     }
 
     if (has_next_m_pair && is_tail_loader)
