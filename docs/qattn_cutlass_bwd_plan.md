@@ -216,7 +216,7 @@ The current source-level dependency audit changes the order of the next optimiza
 - Treat the current four CTA barriers as dependency boundaries, not scheduling controls. The startup barrier publishes the cooperative K/V load and is required: removing it produced 4,096 Racecheck hazards between the asynchronous shared write at SASS offset `+0x740` and cross-warp `LDSM` reads around `+0x1960` through `+0x1a10`. The pre-dK/dV barrier publishes packed Q/dO and mirrored dS to their cross-warp consumers. The post-dK barrier before dQ has been removed because each dQ producer overwrites only its owned even-warp score slot; Racecheck and Synccheck are clean for aligned and odd-tail NHD/HND cases. Keep the end-of-iteration barrier that protects the next Q/dO and row-state publication.
 - Test a canonical dS view. dS is written into the score-pair representation and copied again into `dS_dKV` for dQ. A CuTe view that lets dK and dQ consume the score-pair dS directly could remove mirror stores, reduce shared storage, and preserve the current numerical policy. The physical layout must be proven for both consumers; a generic single-domain rewrite is not sufficient.
 - Narrow the packed handoffs. The packed Q/dO/K helpers move four scalar words per lane, and the final SASS contains scalar shared loads/stores plus byte and halfword P/dS stores. A lane-major layout with vector shared transactions is worth testing only if it reduces emitted instructions and shared wavefronts without adding repacking shuffles. Broad packetization, register-V retention, and direct/transposed dQ staging already regressed and are not first-line candidates.
-- Consider resource-aware pipelining. The even-length variant uses 243 registers and 57.63 KiB dynamic shared memory, so lowering registers alone cannot create a second resident block. The active K packet allocation is larger than the four packed tiles it stores; an exact-size packet could free roughly 6 KiB for double-buffered staging and a producer/consumer pipeline. This is higher risk and should follow the barrier and canonical-dS experiments.
+- Consider resource-aware pipelining only through proven lifetime aliasing. The even-length variant uses 243 registers and 57.63 KiB dynamic shared memory, so lowering shared storage alone cannot create a second resident block. The Q, dO, and K packet allocations have been audited and are exact for the fragments they store; in particular, the K packet uses `16 fragments * 4 words * 32 lanes * 4 bytes = 8,192 bytes`. There is no approximately 6 KiB unused K-packet margin. Double buffering therefore needs a genuinely dead region or a different ownership schedule.
 - Lower priority: scalar arithmetic and end-to-end workspace traffic. Hoist combined score and epilogue scale products only if SASS confirms fewer instructions. The compiler already emits fused score arithmetic and `MUFU.EX2`, so exp/scale approximations should not change the numerical policy. Loading both FP16 and INT8 dO remains a possible end-to-end preprocessing optimization, but the main kernel's approximately 3% DRAM utilization makes it unlikely to improve kernel-only time.
 
 Candidate NCU CSVs are long-format metric rows after two `==PROF==` preamble lines; future aggregation must strip those lines and pivot by `Metric Name`. The instrumented native sequence-8192 capture is approximately 20.61 ms and must not be compared directly with normal benchmark timings near 16 ms.
@@ -253,6 +253,8 @@ This is the experiment log behind the current design. Historical measurements re
 - INT4. Deferred until the INT8 path has a stronger accuracy margin and a demonstrated end-to-end need.
 - Direct `rP`/`rdS` producer-register handoff and geometry changes. Deferred until the long accuracy telemetry and source-level attribution gaps are closed, not rejected. Future searches may change Q/K quantization block sizes, CTA M/N tile sizes, K-side attention tile sizes, warp count, and warp arrangement. Every new shape needs a separate lifetime/resource design and full backward validation.
 - Broad Q/dO packetization, broad vector packets, register-V retention, direct/transposed dQ staging, and split dV/dK variants. These were slower or resource-heavy in prior measurements. Revisit only with a narrower layout or ownership hypothesis and source/SASS evidence that targets a measured handoff cost.
+- Dimension-owned dK/dV without Q/dO packets. Rejected after an isolated implementation assigned four dK dimension owners and four dV dimension owners, captured one direct Q or dO operand per owner, and traversed all eight N16 score slots. dQ used four private 1 KiB regions in dead resident-V storage. Racecheck exposed a real first ordering bug: direct operand loads after the publication barrier could overlap the next-pair asynchronous Q/dO prefetch. Capturing those fragments before the existing barrier and deferring prefetch until after dQ made Racecheck and Synccheck clean for NHD/HND at 512/513. Focused tests passed, and sequence-4096 output differences versus the retained build stayed below `6.10e-5` maximum and `1e-5` relative L2. The final image nevertheless used a 96-byte stack frame in the aligned specialization and regressed serial 4096/8192 kernel-only and end-to-end controls by approximately `15-21%`, so the source was reverted.
+- Plain 32-byte-row dS/dKV scratch. Rejected despite reducing each warp scratch slot from 1,024 to 512 bytes. A dedicated fragment probe showed zero mismatches between the existing C-fragment store/MMA-A load path and the compact layout, and the reused `16x16` FP16 dK/dV epilogue stage fit exactly. The candidate reduced dynamic shared memory from 57,632 to 53,536 bytes, tail registers from 243 to 223, and static SASS by 8/9 instructions in tail/aligned variants, with no stack/local spill. Focused tests and the full 512/513 NHD/HND Racecheck/Synccheck matrix passed; dK/dV were bitwise identical at sequence 4096 and dQ differed only by `3.05e-5` maximum with `7.43e-6` relative L2 from cross-run atomic ordering. Candidate/control/candidate timing tied NHD 4096 but regressed HND 4096 by approximately `1.7-3.2%` and the 8192 rows by approximately `1.1-3.7%`. Matched sequence-4096 NCU counters explained the loss: shared-load bank conflicts rose from `2,097,152` to `10,485,760`, store conflicts from `542,057` to `4,510,420`, and load/store wavefronts by approximately `11.1%/14.1%`. Keep the swizzled layout unless a compact replacement also proves its bank behavior. Reports: `build/ncu_sagebwd_narrow_scratch_control_seq4096.csv` and `build/ncu_sagebwd_narrow_scratch_candidate_seq4096.csv`.
 - Pre-dK/dV publication-barrier removal. Rejected after an isolated same-order run. Native Racecheck reported zero hazards for NHD/HND at 512/513, but aligned registers increased from 243 to 249. NHD was effectively tied, while HND regressed from 16.1038 to 17.2969 ms at sequence 8192 and from 3.9695 to 4.2977 ms at sequence 4096. This is the barrier that publishes packed Q/dO and mirrored dS, and it remains in the active kernel; it is distinct from the removed post-dK barrier before dQ.
 
 ## Next Work
@@ -265,7 +267,7 @@ The next optimization cycle remains backward-only. Use QBlock=32, KBlock=64, CTA
 - Capture future shared-memory candidates at sequence 8192. Compare event time, executed instructions, registers, shared load/store wavefronts and conflicts, synchronization stalls, eligible warps, and L1/shared throughput.
 - Test a canonical dS score-pair view without changing the predictor, INT8 scales, or accumulation format. Require exact layout/ownership reasoning for dK and dQ, then run the full correctness matrix before timing. The packed-K dQ handoff is already retained and should be the comparison baseline.
 - Test vectorized packed Q/dO/K and P/dS handoffs only when generated SASS shows the intended vector transactions. Reject versions that trade shared stores for shuffles, bank conflicts, or higher register pressure.
-- Investigate exact-size K packet storage and double-buffered producer/consumer staging only if the first four steps identify barrier or handoff latency as the limiting cost.
+- Do not pursue packet compaction as free storage: the active Q/dO/K packet allocations are exact for their fragment counts. Investigate double-buffered producer/consumer staging only through a proven dead-lifetime alias or a new ownership schedule, and only if the preceding measurements identify barrier or handoff latency as the limiting cost.
 - Keep the scale/index-hoist candidate as the lower-priority arithmetic control and measure any follow-up dO workspace reuse end to end. Further scale changes require emitted-SASS evidence and must preserve the fixed dS guard and FP8/FP4 exclusion.
 - Reconsider quantization blocks or CTA/warp geometry only after the reference handoffs are understood; the tested CTA-N=64, packet, register-V, and dQ transpose alternatives do not currently justify promotion.
 
@@ -296,6 +298,39 @@ Focused correctness:
 ```powershell
 python -m pytest -q tests/test_sagebwd_cutlass.py
 ```
+
+Native-only Racecheck and Synccheck matrix:
+
+```powershell
+$cases = @(
+  @{ Layout = 'NHD'; SeqLen = 512 },
+  @{ Layout = 'NHD'; SeqLen = 513 },
+  @{ Layout = 'HND'; SeqLen = 512 },
+  @{ Layout = 'HND'; SeqLen = 513 }
+)
+
+foreach ($case in $cases) {
+  compute-sanitizer --target-processes application-only `
+    --tool racecheck --racecheck-report all `
+    --kernel-name 'kernel_substring=fused_mma_kernel_k128_8warp' `
+    python data/racecheck_cutlass_bwd_kernel_only.py `
+    --seq-len $case.SeqLen --layout $case.Layout
+  if ($LASTEXITCODE -ne 0) {
+    throw "Racecheck failed for $($case.Layout) $($case.SeqLen)"
+  }
+
+  compute-sanitizer --target-processes application-only `
+    --tool synccheck `
+    --kernel-name 'kernel_substring=fused_mma_kernel_k128_8warp' `
+    python data/racecheck_cutlass_bwd_kernel_only.py `
+    --seq-len $case.SeqLen --layout $case.Layout
+  if ($LASTEXITCODE -ne 0) {
+    throw "Synccheck failed for $($case.Layout) $($case.SeqLen)"
+  }
+}
+```
+
+Compute Sanitizer's kernel filter is a key/value expression, `kernel_substring=...`; it is not NCU's `regex:...` syntax. Keep `--target-processes application-only` and use the native-only helper so PyTorch setup, Triton compilation, and unrelated child-process kernels are outside instrumentation. Racecheck should end with `0 hazards displayed (0 errors, 0 warnings)` and Synccheck with `ERROR SUMMARY: 0 errors` for all four cases.
 
 Benchmark both layouts and modes:
 
