@@ -10,26 +10,18 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import _BWD_CONFIG, _sageattn_cutlass_bwd_configured
+from sageattention.cutlass_bwd import _BWD_CONFIG
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
 
 BlockConfig = tuple[int, int, int, int]
 BackwardCandidate = BlockConfig
-PreparedKernelInputs = tuple[
+PreparedQuantizedQK = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    int,
-    float,
 ]
 _FORWARD_QK_CONFIG: BlockConfig = (64, 64, 32, 64)
 
@@ -159,32 +151,17 @@ def _prepare_sage_forward(
     return output, lse
 
 
-def _sage_end_to_end_backward(
+def _prepare_quantized_qk(
     q: torch.Tensor,
     k: torch.Tensor,
-    v: torch.Tensor,
-    output: torch.Tensor,
-    dout: torch.Tensor,
-    lse: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
-) -> None:
-    with torch.inference_mode():
-        _sageattn_cutlass_bwd_configured(q, k, v, output, dout, lse, layout, block_config)
-
-
-def _prepare_prequantized_inputs(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    output: torch.Tensor,
-    dout: torch.Tensor,
-    layout: str,
-    block_config: BlockConfig,
-) -> PreparedKernelInputs:
+) -> PreparedQuantizedQK:
     blk_q, blk_k, _, _ = block_config
+    # Transitional proxy for forward-owned reuse: keep the backward-compatible
+    # Q/K representation outside the timed backward region.
     with torch.inference_mode():
-        q_int8, q_scale, k_int8, k_scale = per_block_int8(
+        return per_block_int8(
             q,
             k,
             km=None,
@@ -192,16 +169,16 @@ def _prepare_prequantized_inputs(
             BLKK=blk_k,
             tensor_layout=layout,
         )
-        workspaces = preprocess_delta_zero_dq(output, dout, v, layout)
-    return (
-        q_int8,
-        k_int8,
-        q_scale,
-        k_scale,
-        *workspaces,
-        1 if layout == "HND" else 0,
-        q.size(-1) ** -0.5,
-    )
+
+
+def _prepare_backward_workspaces(
+    v: torch.Tensor,
+    output: torch.Tensor,
+    dout: torch.Tensor,
+    layout: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.inference_mode():
+        return preprocess_delta_zero_dq(output, dout, v, layout)
 
 
 def _sage_kernel_only_backward(
@@ -254,6 +231,51 @@ def _sage_kernel_only_backward(
             bwd_block_n,
         )
         convert_dq(dq_accum, dq, "HND" if layout_i else "NHD")
+
+
+def _sage_prequantized_end_to_end_backward(
+    q_int8: torch.Tensor,
+    k_int8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    layout: str,
+    block_config: BlockConfig,
+) -> None:
+    with torch.inference_mode():
+        delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
+            v,
+            output,
+            dout,
+            layout,
+        )
+        _sage_kernel_only_backward(
+            q_int8,
+            k_int8,
+            q_scale,
+            k_scale,
+            v,
+            output,
+            dout,
+            lse,
+            delta,
+            dq_accum,
+            do_int8,
+            do_scale,
+            ds_q_factors,
+            ds_k_factors,
+            torch.empty_like(q),
+            torch.empty_like(k),
+            torch.empty_like(v),
+            1 if layout == "HND" else 0,
+            q.size(-1) ** -0.5,
+            block_config,
+        )
 
 
 def _backward_flops(batch_size: int, num_heads: int, seq_len: int, head_dim: int) -> int:
@@ -339,10 +361,15 @@ def _benchmark_case(
     rows: list[dict[str, object]] = []
     for block_config in candidates:
         output, lse = _prepare_sage_forward(q, k, v, layout)
+        q_int8, q_scale, k_int8, k_scale = _prepare_quantized_qk(q, k, layout, block_config)
 
         if include_end_to_end:
             sage_stats = _bench(
-                _sage_end_to_end_backward,
+                _sage_prequantized_end_to_end_backward,
+                q_int8,
+                k_int8,
+                q_scale,
+                k_scale,
                 q,
                 k,
                 v,
@@ -370,20 +397,14 @@ def _benchmark_case(
             )
 
         if include_kernel_only:
-            (
-                q_int8,
-                k_int8,
-                q_scale,
-                k_scale,
-                delta,
-                dq_accum,
-                do_int8,
-                do_scale,
-                ds_q_factors,
-                ds_k_factors,
-                layout_i,
-                sm_scale,
-            ) = _prepare_prequantized_inputs(q, k, v, output, dout, layout, block_config)
+            delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
+                v,
+                output,
+                dout,
+                layout,
+            )
+            layout_i = 1 if layout == "HND" else 0
+            sm_scale = q.size(-1) ** -0.5
             sage_stats = _bench(
                 _sage_kernel_only_backward,
                 q_int8,
@@ -502,10 +523,10 @@ def main() -> None:
     print("dS scale policy=precomputed separable predictor")
     print("TFLOPS use 8*batch*heads*head_dim*seq_len^2 effective dense backward FLOPs and median CUDA-event time")
     print(
-        "end_to_end includes Sage Q/K quantization and output allocation; kernel_only uses prequantized Q/K and reused dQ/dK/dV"
+        "end_to_end excludes Q/K quantization: backward-compatible Q/K INT8 tensors and scales are prepared outside timing; it includes preprocessing, output/workspace allocation, the main kernel, and dQ conversion"
     )
     print(
-        "Sage forward setup is not timed and uses the same block config as Sage backward; sage_speedup > 1 means Sage is faster"
+        "Sage forward setup is not timed and uses its own forward Q/K configuration; current benchmark preparation is a backward-format reuse proxy until forward/backward Q/K contracts are unified; sage_speedup > 1 means Sage is faster"
     )
     print(
         "kind,batch_size,num_heads,head_dim,seq_len,layout,block_config,backward_flops,"
