@@ -927,12 +927,28 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
   }
   __syncthreads();
 
+  const int32_t k_domain_base = n_cta_base / QuantBlockK;
+  const auto load_k_block_scale = [&]() {
+    const int32_t scale_index_unclamped = k_domain_base + n_domain;
+    const int32_t scale_index =
+      scale_index_unclamped < k_scale_extent ? scale_index_unclamped : k_scale_extent - 1;
+    return gKScale(scale_index);
+  };
+  float aligned_k_block_scale = 0.0f;
+  if constexpr (IsAligned)
+  {
+    aligned_k_block_scale = load_k_block_scale();
+  }
+
   for (int32_t m_pair_base = 0; m_pair_base < params.seq_len; m_pair_base += 2 * Traits::kBlockM)
   {
-    const float q_block_scale = gQScale(m_pair_base / QuantBlockQ);
-    const int32_t k_scale_index_unclamped = n_cta_base / QuantBlockK + n_domain;
-    const int32_t k_scale_index = k_scale_index_unclamped < k_scale_extent ? k_scale_index_unclamped : k_scale_extent - 1;
-    const float k_block_scale = gKScale(k_scale_index);
+    const int32_t q_block_index = m_pair_base / QuantBlockQ;
+    const float q_block_scale = gQScale(q_block_index);
+    float k_block_scale = aligned_k_block_scale;
+    if constexpr (!IsAligned)
+    {
+      k_block_scale = load_k_block_scale();
+    }
     constexpr auto QdO_pair_shape = cute::make_shape(
       cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
     if (warp_id < kDimBlocks)
@@ -1104,11 +1120,11 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
     }
     p_max_abs = warp_reduce_max(p_max_abs);
     const float p_scale = p_max_abs * kInt8ScaleInv + kInt8ScaleFloor;
-    const int32_t q_factor_index = m_pair_base / 32;
+    const int32_t q_factor_index = q_block_index;
     const int32_t q_factor_next = q_factor_index + 1 < dS_q_extent ? q_factor_index + 1 : q_factor_index;
     const float dO_l2_max = fmaxf(gdSQFactors[2 * q_factor_index], gdSQFactors[2 * q_factor_next]);
     const float delta_abs_max = fmaxf(gdSQFactors[2 * q_factor_index + 1], gdSQFactors[2 * q_factor_next + 1]);
-    const int32_t k_factor_unclamped = n_cta_base / 64 + n_domain;
+    const int32_t k_factor_unclamped = k_domain_base + n_domain;
     const int32_t k_factor_index = k_factor_unclamped < dS_k_extent ? k_factor_unclamped : dS_k_extent - 1;
     const float predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
       (dO_l2_max * gdSKFactors[k_factor_index] + delta_abs_max);
@@ -1197,6 +1213,8 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
 
     if (n_valid)
     {
+      const float dK_scale = dS_scale * q_block_scale;
+      const int32_t dO_scale_base = (m_pair_base / (2 * Traits::kBlockM)) * kDimBlocks;
       auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
       auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
       cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tdVP));
@@ -1215,7 +1233,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
         load_packed_mma_b_fragment(shared.QdO_mma_b.dO_i8_mma_b, tdVdO, dim_base / Traits::kBlockK, lane_id);
         cute::gemm(thr_mma_score, tdVP, tdVdO, dV_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
-        const float dO_scale = gdOScale[(m_pair_base / (2 * Traits::kBlockM)) * kDimBlocks + dim_block];
+        const float dO_scale = gdOScale[dO_scale_base + dim_block];
         const float dV_scale = p_scale * dO_scale;
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dV_acc); ++idx)
@@ -1236,7 +1254,7 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dK_acc); ++idx)
         {
-          dK_accum_frag(dim_block, idx) += static_cast<float>(dK_acc(idx)) * (dS_scale * q_block_scale);
+          dK_accum_frag(dim_block, idx) += static_cast<float>(dK_acc(idx)) * dK_scale;
         }
       }
     }
@@ -1302,13 +1320,13 @@ __global__ __launch_bounds__(32 * NumWarps, 1) void fused_mma_kernel_k128_8warp(
               lane_id);
             cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc);
           }
-          const int32_t domain_k_factor_unclamped = n_cta_base / 64 + domain;
+          const int32_t domain_k_factor_unclamped = k_domain_base + domain;
           const int32_t domain_k_factor_index =
             domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
           const float dQ_predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
             (dO_l2_max * gdSKFactors[domain_k_factor_index] + delta_abs_max);
           const float dQ_dS_scale = dQ_predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
-          const int32_t domain_k_scale_index_unclamped = n_cta_base / QuantBlockK + domain;
+          const int32_t domain_k_scale_index_unclamped = k_domain_base + domain;
           const int32_t domain_k_scale_index =
             domain_k_scale_index_unclamped < k_scale_extent ? domain_k_scale_index_unclamped : k_scale_extent - 1;
           const float dQ_scale = dQ_dS_scale * gKScale(domain_k_scale_index);
