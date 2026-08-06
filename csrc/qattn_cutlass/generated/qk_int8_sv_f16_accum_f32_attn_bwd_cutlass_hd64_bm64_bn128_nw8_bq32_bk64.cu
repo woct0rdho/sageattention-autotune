@@ -5,18 +5,24 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
-template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(
+template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
   const torch::stable::Tensor &key_scale,
   const torch::stable::Tensor &value,
   const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
+  const torch::stable::Tensor &dO,
   const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
+  const torch::stable::Tensor &delta,
+  const torch::stable::Tensor &dQ_accum,
+  const torch::stable::Tensor &dO_int8,
+  const torch::stable::Tensor &dO_scale,
+  const torch::stable::Tensor &dS_q_factors,
+  const torch::stable::Tensor &dS_k_factors,
+  const torch::stable::Tensor &dQ,
+  const torch::stable::Tensor &dK,
+  const torch::stable::Tensor &dV,
   const Params &params,
   double sm_scale);
 

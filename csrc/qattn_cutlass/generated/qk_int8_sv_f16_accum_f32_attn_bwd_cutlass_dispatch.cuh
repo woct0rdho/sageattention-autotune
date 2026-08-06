@@ -6,48 +6,24 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
-extern template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(
+extern template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &query,
   const torch::stable::Tensor &key,
   const torch::stable::Tensor &query_scale,
   const torch::stable::Tensor &key_scale,
   const torch::stable::Tensor &value,
   const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
+  const torch::stable::Tensor &dO,
   const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPowerOfTwoDs>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
-  const Params &params,
-  double sm_scale);
-
-extern template void launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPeriodicDs>(
-  const torch::stable::Tensor &query,
-  const torch::stable::Tensor &key,
-  const torch::stable::Tensor &query_scale,
-  const torch::stable::Tensor &key_scale,
-  const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
-  const torch::stable::Tensor &grad_output,
-  const torch::stable::Tensor &lse,
-  const torch::stable::Tensor &grad_query,
-  const torch::stable::Tensor &grad_key,
-  const torch::stable::Tensor &grad_value,
+  const torch::stable::Tensor &delta,
+  const torch::stable::Tensor &dQ_accum,
+  const torch::stable::Tensor &dO_int8,
+  const torch::stable::Tensor &dO_scale,
+  const torch::stable::Tensor &dS_q_factors,
+  const torch::stable::Tensor &dS_k_factors,
+  const torch::stable::Tensor &dQ,
+  const torch::stable::Tensor &dK,
+  const torch::stable::Tensor &dV,
   const Params &params,
   double sm_scale);
 
@@ -57,29 +33,25 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &key_scale,
                                   const torch::stable::Tensor &value,
                                   const torch::stable::Tensor &output,
-                                  const torch::stable::Tensor &grad_output,
+                                  const torch::stable::Tensor &dO,
                                   const torch::stable::Tensor &lse,
-                                  const torch::stable::Tensor &grad_query,
-                                  const torch::stable::Tensor &grad_key,
-                                  const torch::stable::Tensor &grad_value,
+                                  const torch::stable::Tensor &delta,
+                                  const torch::stable::Tensor &dQ_accum,
+                                  const torch::stable::Tensor &dO_int8,
+                                  const torch::stable::Tensor &dO_scale,
+                                  const torch::stable::Tensor &dS_q_factors,
+                                  const torch::stable::Tensor &dS_k_factors,
+                                  const torch::stable::Tensor &dQ,
+                                  const torch::stable::Tensor &dK,
+                                  const torch::stable::Tensor &dV,
                                   const Params &params,
                                   const double sm_scale)
 {
   if (params.head_dim == 64)
   {
-      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128 && params.quantization_policy == 0)
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128)
       {
-        launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kDynamic>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128 && params.quantization_policy == 1)
-      {
-        launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPowerOfTwoDs>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
-        return;
-      }
-      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128 && params.quantization_policy == 2)
-      {
-        launch_mma<64, 64, 128, 8, 32, 64, BwdQuantizationPolicy::kPeriodicDs>(query, key, query_scale, key_scale, value, output, grad_output, lse, grad_query, grad_key, grad_value, params, sm_scale);
+        launch_mma<64, 64, 128, 8, 32, 64>(query, key, query_scale, key_scale, value, output, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dQ, dK, dV, params, sm_scale);
         return;
       }
   }
