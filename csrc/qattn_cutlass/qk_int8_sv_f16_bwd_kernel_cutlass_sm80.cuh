@@ -217,7 +217,6 @@ struct SharedStorage2DWarp
   alignas(16) cute::ArrayEngine<cute::uint128_t, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutScorePair>> score_pair_i8;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> lse;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
-  float p_scale[Traits::kNumWarps];
 };
 
 template <typename Storage, typename Layout>
@@ -377,10 +376,10 @@ CUTE_HOST_DEVICE constexpr auto make_tiled_copy_C_warpcontiguousN(const CopyAtom
 
 template <int32_t Rows, int32_t VecCols, typename TiledCopy, typename Gmem, typename Smem>
 __device__ __forceinline__ void load_head_tile_with_contract(const TiledCopy tiled_copy,
-                                                              const Gmem gmem_vec,
-                                                              Smem smem,
-                                                              const int32_t row_base,
-                                                              const int32_t lane_id)
+                                                             const Gmem gmem_vec,
+                                                             Smem smem,
+                                                             const int32_t row_base,
+                                                             const int32_t lane_id)
 {
   constexpr auto vec_tile_shape = cute::make_shape(cute::Int<Rows>{}, cute::Int<VecCols>{});
   const auto tile_coord = cute::make_coord(row_base / Rows, cute::_0{});
@@ -444,14 +443,14 @@ template <typename Traits,
           typename SdOInt8Storage,
           typename SdOFp16Storage>
 __device__ __forceinline__ void load_q_dO_pair(const GQ gQ,
-                                                const GdOInt8 gdOInt8,
-                                                const GdO gdO,
-                                                SQStorage sQStorage,
-                                                SdOInt8Storage sdOInt8Storage,
-                                                SdOFp16Storage sdOFp16Storage,
-                                                const int32_t m_pair_base,
-                                                const int32_t loader_warp,
-                                                const int32_t lane_id)
+                                               const GdOInt8 gdOInt8,
+                                               const GdO gdO,
+                                               SQStorage sQStorage,
+                                               SdOInt8Storage sdOInt8Storage,
+                                               SdOFp16Storage sdOFp16Storage,
+                                               const int32_t m_pair_base,
+                                               const int32_t loader_warp,
+                                               const int32_t lane_id)
 {
   constexpr auto int8_pair_load_shape = cute::make_shape(
     cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
@@ -475,12 +474,12 @@ __device__ __forceinline__ void load_q_dO_pair(const GQ gQ,
 
 template <typename GLse, typename GDelta, typename SLse, typename SDelta>
 __device__ __forceinline__ void load_row_state_pair(const GLse gLse,
-                                                     const GDelta gDelta,
-                                                     SLse sLse,
-                                                     SDelta sDelta,
-                                                     const int32_t m_pair_base,
-                                                     const int32_t seq_len,
-                                                     const int32_t lane_id)
+                                                    const GDelta gDelta,
+                                                    SLse sLse,
+                                                    SDelta sDelta,
+                                                    const int32_t m_pair_base,
+                                                    const int32_t seq_len,
+                                                    const int32_t lane_id)
 {
   const int32_t row = m_pair_base + lane_id;
   if (row < seq_len)
@@ -580,12 +579,12 @@ __device__ __forceinline__ void store_dKV_fragment_coalesced(const Accum &accum_
 
 template <typename Traits, typename Accum, typename Gmem>
 __device__ __forceinline__ void accumulate_dQ_fragment_warp_shuffle(const Accum &accum_frag,
-                                                                     const float scale,
-                                                                     Gmem dst,
-                                                                     const int32_t row_base,
-                                                                     const int32_t dim_base,
-                                                                     const int32_t seq_len,
-                                                                     const int32_t lane_id)
+                                                                    const float scale,
+                                                                    Gmem dst,
+                                                                    const int32_t row_base,
+                                                                    const int32_t dim_base,
+                                                                    const int32_t seq_len,
+                                                                    const int32_t lane_id)
 {
   static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
 #pragma unroll
@@ -615,13 +614,13 @@ __device__ __forceinline__ int32_t dQ_stage_offset(const int32_t row, const int3
 
 template <bool IsAligned, typename Traits, typename Accum>
 __device__ __forceinline__ void accumulate_dQ_fragment_shared_contiguous(const Accum &accum_frag,
-                                                                          const float scale,
-                                                                          float *const smem_stage,
-                                                                          float *const dst,
-                                                                          const int32_t row_base,
-                                                                          const int32_t dim_base,
-                                                                          const int32_t seq_len,
-                                                                          const int32_t lane_id)
+                                                                         const float scale,
+                                                                         float *const smem_stage,
+                                                                         float *const dst,
+                                                                         const int32_t row_base,
+                                                                         const int32_t dim_base,
+                                                                         const int32_t seq_len,
+                                                                         const int32_t lane_id)
 {
   static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
 #pragma unroll
@@ -657,12 +656,12 @@ __device__ __forceinline__ void accumulate_dQ_fragment_shared_contiguous(const A
 
 template <bool IsAligned, typename Traits, typename Accum>
 __device__ __forceinline__ void accumulate_dQ_float_fragment_shared_contiguous(const Accum &accum_frag,
-                                                                                float *const smem_stage,
-                                                                                float *const dst,
-                                                                                const int32_t row_base,
-                                                                                const int32_t dim_base,
-                                                                                const int32_t seq_len,
-                                                                                const int32_t lane_id)
+                                                                               float *const smem_stage,
+                                                                               float *const dst,
+                                                                               const int32_t row_base,
+                                                                               const int32_t dim_base,
+                                                                               const int32_t seq_len,
+                                                                               const int32_t lane_id)
 {
   static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
 #pragma unroll
@@ -704,22 +703,22 @@ template <int32_t HeadDim,
           int32_t QuantBlockK,
           bool IsAligned>
 __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
-                                                                               const int8_t *__restrict__ const K,
-                                                                               const float *__restrict__ const QScale,
-                                                                               const float *__restrict__ const KScale,
-                                                                               const half *__restrict__ const V,
-                                                                               const half *__restrict__ const dO,
-                                                                               const int8_t *__restrict__ const dOInt8,
-                                                                               const float *__restrict__ const dOScale,
-                                                                               const float *__restrict__ const dSQFactors,
-                                                                               const float *__restrict__ const dSKFactors,
-                                                                               const float *__restrict__ const Lse,
-                                                                               const float *__restrict__ const Delta,
-                                                                               float *__restrict__ const dQAccum,
-                                                                               half *__restrict__ const dK,
-                                                                               half *__restrict__ const dV,
-                                                                               const Params params,
-                                                                               const float sm_scale)
+                                                             const int8_t *__restrict__ const K,
+                                                             const float *__restrict__ const QScale,
+                                                             const float *__restrict__ const KScale,
+                                                             const half *__restrict__ const V,
+                                                             const half *__restrict__ const dO,
+                                                             const int8_t *__restrict__ const dOInt8,
+                                                             const float *__restrict__ const dOScale,
+                                                             const float *__restrict__ const dSQFactors,
+                                                             const float *__restrict__ const dSKFactors,
+                                                             const float *__restrict__ const Lse,
+                                                             const float *__restrict__ const Delta,
+                                                             float *__restrict__ const dQAccum,
+                                                             half *__restrict__ const dK,
+                                                             half *__restrict__ const dV,
+                                                             const Params params,
+                                                             const float sm_scale)
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
   using Storage = SharedStorage2DWarp<Traits>;
