@@ -3,11 +3,11 @@ import importlib
 import torch
 import torch.nn.functional as F
 
+from .triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
-_BWD_QUANTIZATION_POLICY_IDS = {"dynamic": 0, "power2_ds": 1, "periodic_ds": 2}
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -25,6 +25,12 @@ def _bwd_fake_impl(
     output: torch.Tensor,
     grad_output: torch.Tensor,
     lse: torch.Tensor,
+    delta: torch.Tensor,
+    dq_accum: torch.Tensor,
+    do_int8: torch.Tensor,
+    do_scale: torch.Tensor,
+    ds_q_factors: torch.Tensor,
+    ds_k_factors: torch.Tensor,
     grad_query: torch.Tensor,
     grad_key: torch.Tensor,
     grad_value: torch.Tensor,
@@ -34,7 +40,6 @@ def _bwd_fake_impl(
     blk_k: int,
     bwd_block_m: int,
     bwd_block_n: int,
-    quantization_policy: int,
 ) -> None:
     return None
 
@@ -48,7 +53,6 @@ def _sageattn_cutlass_bwd_configured(
     lse: torch.Tensor,
     tensor_layout: str,
     config: tuple[int, int, int, int],
-    quantization_policy: str = "dynamic",
 ) -> CutlassSageBwdResult:
     if not all(tensor.is_cuda for tensor in (q, k, v, output, grad_output, lse)):
         raise ValueError("Input tensors must be CUDA tensors.")
@@ -83,20 +87,19 @@ def _sageattn_cutlass_bwd_configured(
         raise ValueError("tensor_layout must be 'NHD' or 'HND'.")
     if lse.shape != (q.size(0), num_heads, seq_len):
         raise ValueError("lse must have shape (batch, heads, seq_len).")
-    if quantization_policy not in _BWD_QUANTIZATION_POLICY_IDS:
-        supported = ", ".join(_BWD_QUANTIZATION_POLICY_IDS)
-        raise ValueError(f"quantization_policy must be one of: {supported}.")
-    if quantization_policy != "dynamic" and config != _BWD_CONFIG:
-        raise ValueError("Approximate dS quantization policies are only built for the 64x128 backward CTA.")
-
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
     output = output.contiguous()
     grad_output = grad_output.contiguous()
     lse = lse.contiguous()
+    delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = preprocess_delta_zero_dq(
+        output,
+        grad_output,
+        v,
+        tensor_layout,
+    )
     blk_q, blk_k, bwd_block_m, bwd_block_n = config
-    quantization_policy_i = _BWD_QUANTIZATION_POLICY_IDS[quantization_policy]
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
@@ -117,6 +120,12 @@ def _sageattn_cutlass_bwd_configured(
         output,
         grad_output,
         lse,
+        delta,
+        dq_accum,
+        do_int8,
+        do_scale,
+        ds_q_factors,
+        ds_k_factors,
         grad_query,
         grad_key,
         grad_value,
@@ -126,8 +135,8 @@ def _sageattn_cutlass_bwd_configured(
         blk_k,
         bwd_block_m,
         bwd_block_n,
-        quantization_policy_i,
     )
+    convert_dq(dq_accum, grad_query, tensor_layout)
     return grad_query[..., :head_dim], grad_key[..., :head_dim], grad_value[..., :head_dim]
 
 

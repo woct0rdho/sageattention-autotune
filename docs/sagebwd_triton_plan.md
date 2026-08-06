@@ -81,7 +81,7 @@ q, k -> per_block_int8 -> q_int8, q_scale, k_int8, k_scale
 q_int8, k_int8, v, scales -> Triton forward -> out, lse
 ```
 
-The forward pass saves the quantized tensors and scales for backward. Shared quantization uses `max(abs(x)) / 127.5 + 1e-7` with PTX round-to-nearest conversion and no extra clamp, because local accuracy checks showed this gives lower practical quantization error than clamped `127.0` variants.
+The forward pass saves the quantized tensors and scales for backward. Shared quantization uses `max(abs(x)) * 0x1.010122p-7 + 2^-126` with PTX round-to-nearest conversion and no extra clamp. The reciprocal corresponds to `1 / (127.5 - 2^-12)` rounded to the selected FP32 value; the power-of-two floor avoids a zero scale and remains suitable for future BF16 support.
 
 ### Backward Preprocess
 
