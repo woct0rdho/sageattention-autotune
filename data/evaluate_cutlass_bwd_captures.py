@@ -5,8 +5,6 @@ not values exported by the kernel. Sequence lengths above a capture's source len
 are deterministic tiled controls and are labeled as such in both CSV outputs.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import math
