@@ -12,7 +12,7 @@ QBlock=32, KBlock=64, CTA M64xN128, eight warps
 
 The old filename/module `sm80` is a legacy identifier. `setup.py` emits only `compute_86,sm_86`. The installed FlashAttention 2.9.1 wheel remains the reference implementation; a targeted SM80/SM86 source probe showed no material architecture-specific advantage for its relevant specialization.
 
-The retained source includes the scalar/index hoists, four-barrier schedule, packed-K reuse across dQ M halves, single K-scale load site, and dead shared P-scale cleanup. It contains none of the rejected dimension-owned or compact plain-scratch implementations.
+The retained source includes the scalar/index hoists, four-barrier schedule, packed-K reuse across dQ M halves, direct producer-local P/dS register handoff, single K-scale load site, and dead shared P-scale cleanup. It contains none of the rejected dimension-owned or compact plain-scratch implementations.
 
 ### Supported Contract
 
@@ -59,9 +59,11 @@ initial Q/dO pair and LSE/Delta publication
   -> initial-state CTA barrier
 for each M32 pair:
   each N16 warp computes score, dP, P, and dS
+  producer C fragments are transposed directly into dV/dK MMA-A registers
   Q/dO producer warps publish four packed MMA-B fragments each
-  dS is stored canonically for dK and mirrored by N32 pair for dQ
+  dS is mirrored by N32 pair for the cross-warp dQ consumer
     -> pre-dK/dV CTA barrier
+  direct P/dS registers remain warp-local across the barrier
   each N16 warp accumulates owned dK/dV across all four D16 blocks
   loader warps prefetch the next Q/dO pair and row state
   even N-pair warps load each packed K fragment once and reuse it for both dQ M16 halves
@@ -70,7 +72,7 @@ for each M32 pair:
 final dK/dV epilogues reuse the dead dS mirror slots
 ```
 
-There are four static CTA barriers. The resident-V region is aliased by the Q/dO packet publication only after V fragments have been captured in registers. There is no post-dK barrier before dQ. The end-of-iteration barrier both publishes the next asynchronous Q/dO/row-state load and prevents the next iteration from overwriting shared score and packet storage still in use.
+There are four static CTA barriers. The resident-V region is aliased by the Q/dO packet publication only after V fragments have been captured in registers. The pre-dK/dV barrier publishes the Q/dO packets and mirrored dS; P and dS for dV/dK no longer cross shared memory. There is no post-dK barrier before dQ. The end-of-iteration barrier both publishes the next asynchronous Q/dO/row-state load and prevents the next iteration from overwriting shared mirror, packet, and dQ staging storage still in use.
 
 The current backward wrapper still quantizes Q/K on each call with `per_block_int8`. The backward benchmark's end-to-end mode deliberately prepares those backward-compatible Q/K INT8 tensors and scales outside the timed region, modeling the intended forward-owned reuse without claiming that the current forward artifacts are already compatible. The timed backward path includes Triton preprocessing, workspace/output allocation, the CUTLASS main kernel, and dQ conversion.
 
@@ -94,7 +96,6 @@ No `O(N^2)` scale table is allocated. The predictor work is `O(N*D)` and the V s
 ## Reduction Audit
 
 The Triton reductions follow the normal Triton reduction contract and are shaped intentionally:
-
 - `tl.sum(..., axis=1)` reduces each `[BLOCK_M, HEAD_DIM]` tile to one scalar per row for Delta and dOutput L2 norms.
 - `tl.sum(..., axis=1)` similarly reduces each `[BLOCK_N, HEAD_DIM]` V tile to row L2 norms.
 - `tl.max` over the resulting row vector produces one Q32 or K64 summary value.
@@ -114,7 +115,6 @@ python -m pytest -q tests/test_sagebwd_cutlass.py
 ```
 
 The matrix covers NHD/HND and aligned/tail sequence lengths 64/65 for the single active configuration. During integration, two correctness issues were fixed:
-
 - Triton dQ conversion had NHD/HND sequence and head strides reversed.
 - Tail CTAs retain dQ ownership across the valid N microtiles; invalid N microtiles must not be treated as independent dQ dimension owners.
 
@@ -126,6 +126,8 @@ python build/profile_sagebwd_once.py sage --head-dim 64 --seq-len 513 --num-head
 ```
 
 Compute Sanitizer Racecheck and Synccheck pass for NHD/HND at aligned length 512 and odd-tail length 513. Racecheck reports `0 hazards displayed (0 errors, 0 warnings)` and Synccheck reports `ERROR SUMMARY: 0 errors` in all four runs. The validation uses `data/racecheck_cutlass_bwd_kernel_only.py`, which does not launch Triton kernels and filters instrumentation with `kernel_substring=fused_mma_kernel_k128_8warp`; ordinary PyTorch setup is outside the checked kernel filter. The earlier whole-process invocation timed out because it also tracked PyTorch setup and Triton compilation/autotuning/runtime kernels; it was not evidence of a CUTLASS deadlock.
+
+For the retained register handoff, candidate/control captures on NHD/HND at sequence 513 and 4096 make dK and dV bitwise identical. The unchanged dQ path differs in 8-297 fp16 elements by at most `6.10e-5`, consistent with cross-run floating accumulation order. The standalone proof in `tests/cuda/test_qattn_cutlass_bwd_score_c_to_a.cu` matches all 512 lane bytes exactly.
 
 The long-shape promotion gates remain:
 
@@ -140,7 +142,7 @@ For diffusion-training data, cosine and gradient direction are primary. Relative
 
 ## Fresh Timing
 
-These are the latest retained-control CUDA-event medians on an NVIDIA GeForce RTX 3080 Ti Laptop GPU, batch 1, 16 heads, head dimension 64, with 15 warmups and 50 serial repeats. They were collected as the control in the compact-scratch candidate/control/candidate sequence. Removing the final trailing 32-byte unused shared field left the tail and aligned instruction streams exactly identical to that control, so these rows remain the current timing baseline.
+These absolute CUDA-event medians were collected on an NVIDIA GeForce RTX 3080 Ti Laptop GPU, batch 1, 16 heads, and head dimension 64 as the pre-register-handoff control. They remain a useful throughput reference, but the active register handoff was promoted from the interleaved ratios below rather than by treating this older absolute table as an exact current timing measurement.
 
 `kernel_only` includes the CUTLASS launch and Triton dQ conversion after prequantized Q/K and precomputed workspaces. `end_to_end` follows the new contract: it reuses prequantized backward-format Q/K and includes Triton preprocessing, workspace/output allocation, the CUTLASS launch, and dQ conversion. It excludes Q/K quantization and the forward pass.
 
@@ -151,12 +153,20 @@ These are the latest retained-control CUDA-event medians on an NVIDIA GeForce RT
 | HND | 4096 | 4.5014 | 4.1364 | 3.9429 | 1.088 | 1.142 |
 | HND | 8192 | 17.3041 | 15.4056 | 15.2985 | 1.123 | 1.131 |
 
-The retained path is faster than the same-run Flash backward control by `7.3-12.3%` end to end and `13.1-14.2%` in kernel-only mode across these four rows. Absolute laptop timings remain clock- and temperature-sensitive; candidate promotion still requires interleaved controls or same-run Flash-normalized ratios rather than a sub-percent comparison against this table alone.
+Two case-local ABBA blocks per layout/length used ten warmups and 40 repeats per run. Every raw candidate/control latency ratio favored the register handoff:
+
+| Layout | Seq | End-to-end candidate/control | Kernel-only candidate/control |
+|---|---:|---:|---:|
+| NHD | 4096 | 0.9947 | 0.9989 |
+| NHD | 8192 | 0.9922 | 0.9893 |
+| HND | 4096 | 0.9957 | 0.9948 |
+| HND | 8192 | 0.9956 | 0.9916 |
+
+The eight-row raw geometric mean is `0.9941x` and the median is `0.9947x`. Flash normalization was invalid for one NHD-4096 block because its Flash control moved by about 15%, but the normalized median across all rows still favors the handoff at `0.9924x`. A matched NCU launch independently measures `0.9940x` candidate/control duration. The pre-handoff control was already faster than same-run Flash by `7.3-12.3%` end to end and `13.1-14.2%` in kernel-only mode; absolute laptop timings remain clock- and temperature-sensitive.
 
 ## Predictor Evidence
 
 The predictor experiments use two independent SDXL-derived sequence-4096 captures with ten heads and sigma indices `300/700/900`. They established:
-
 - A true pre-forward predictor is not viable. Same-timestep dOutput RMS differed by approximately `28x`; same-RMS random dOutput still changed block scales by p99 ratios up to `31.5x` and a maximum around `642x`.
 - The pre-backward separable predictor is the useful asymptotic class. In the simulator, using dequantized Q/K and exact-dS references to isolate scale-policy error, the base formula measured mean/min dQ cosine `0.996286/0.993382`, dK `0.998667/0.994683`, mean/max dQ relative error `7.73%/11.50%`, and dK `4.10%/10.31%` on both captures and all ten heads.
 - A dOutput-max-derived approximation measured mean/min dQ cosine `0.996062/0.992853`, dK `0.998681/0.994846`, mean/max dQ relative error `8.00%/11.95%`, and dK `4.10%/10.15%`; peak saturation was below `64 ppm` in that experiment.
@@ -166,6 +176,11 @@ The predictor experiments use two independent SDXL-derived sequence-4096 capture
 - Rare predictor misses are real but do not explain the accuracy ranking alone. The aggregate maximum true-dS/predicted-dS ratio reaches `30.04x`; however, the worst gradient record clips only approximately `10 ppm`, while the other sigma-900 record clips approximately `29 ppm`. Across all shape controls, aggregate P-scale medians span `4.48e-6` to `7.73e-5`, dS-scale medians span `2.10e-8` to `6.41e-5`, and the evaluator emits fixed log2 histograms plus min/p01/p10/p50/p90/p99/p999/max percentiles.
 - The staged FP32 reconstruction matches the real predicted-scale kernel within `0.08%` relative error at exact sequence 4096. Q/K reconstruction alone and exact-max dS quantization each pass all six aggregate and all 60 per-head strict gates; predictor-scaled dS falls to four of six and 42 of 60, exactly matching the real kernel. On the two sigma-900 aggregates, Q/K reconstruction gives dQ/dK relative error `1.15%/0.75%` and `1.14%/1.21%`; exact-max dS gives `1.53%/0.79%` and `2.16%/2.82%`; prediction raises them to `9.58%/3.19%` and `11.88%/19.06%`. P and dOutput quantization remain secondary and dV passes every aggregate.
 - A scalar guard sweep from `0.25x` through `4.0x` does not pass either sigma-900 aggregate; the best setting passes only five of 20 heads. Multiplying the bound by the already-computed P maximum improves the best point to nine of 20 heads and one of two aggregates, but no coefficient passes both. Lower scales trade zero rate for hundreds to thousands of clipping ppm, while higher scales increase zeros and dK error. Neither scalar-only formulation is promoted.
+- A second-order Q32/K64 sketch is materially better calibrated than the retained separable bound. The tested 2x4 formulation summarizes Q/K and dOutput/V centroids, isotropic RMS radii, mean LSE, and Delta dispersion, then evaluates eight centroid pairs per 2,048-value dS block. Its raw predicted/true scale ratio is `0.484x/1.095x/1.851x` at p10/p50/p90, versus `2.024x/4.530x/8.582x` for the active guarded predictor. A `3x` sketch guard improves exact-4096 strict passes from four of six aggregates and 42 of 60 heads to four of six and 47 of 60; the two sigma-900 dQ/dK errors become `7.21%/3.02%` and `6.67%/10.25%`. The calibration gain is real, but both hard aggregates still fail.
+- Sparse exact representatives protect the sketch's miss tail but do not reach exact-scale accuracy. Selecting eight Q rows and eight K rows from LSE/dOutput/Delta and K/V norm features evaluates 64 of 2,048 pairs. `max(1.5 * sketch, 4 * sparse_max)` reaches five of six aggregates and 52 of 60 heads; its sigma-900 dQ/dK errors are `5.69%/2.95%` and `5.24%/7.84%`. Expanding to 16x16 representatives, 256 of 2,048 pairs, still reaches only five of six and 52 of 60, with the remaining dK error `6.98%`. Even an oracle that replaces the 32 worst-predicted K64 scales out of 64 per Q block reaches only five of six aggregates, although it reaches 58 of 60 heads. The remaining error is distributed rather than confined to a small top-K set.
+- Held-out log-scale regression confirms that the sketch features contain useful information without establishing a production policy. Training on one capture and evaluating the other, an eight-feature model using the retained bound, 2x4/4x8 moments, and 32/64-pair sparse lower bounds produces p10/p50/p90 predicted/true ratios `0.591x/1.025x/1.424x` and p90 absolute log2 error `0.819`, versus `3.101` for the active predictor. Mean guards and conditional `0.65-0.90` quantile models still reach at most five of six aggregates in reconstructed gradients. Two captures are also insufficient evidence for learned coefficients, so no learned runtime dependency or coefficient set is promoted.
+- Generic 8/16/32-dimensional random projections are rejected for the score term. Projection error is exponentiated by softmax; all tested guards pass zero of six aggregates, and the unguarded maximum dS zero rates are approximately `84.9%`, `67.4%`, and `46.6%`. Random projections may still summarize the linear dOutput/V residual, but they are not a viable approximation to QK logits here.
+- The sketch cost is much lower than exact pairwise preprocessing but is not strictly linear. A 2x4 centroid combine evaluates `8/2048 = 0.39%` of the exact block-pair count; 8x8 and 16x16 sparse representatives evaluate `3.125%` and `12.5%`. Materializing one FP32 Q32-by-K64 scale table for sequence 8192 and 16 heads requires approximately 2 MiB. A future candidate must count that table, the block-pair combine, and selection overhead in end-to-end timing rather than describing it as the current `O(N*D)` predictor.
 - Restoring exact on-the-fly K64 dS maxima passes all six exact-4096 aggregates and all 60 heads, but loses every timing row. Averaging the two exact-scale runs around the predicted control gives `31.52-34.12` end-to-end and `33.16-34.91` kernel-only TFLOPS, versus `32.26-35.15` and `33.86-35.96` for prediction. Raw exact-scale medians regress `1.5-3.6%`. Exact scaling remains faster than same-run Flash by `1.063-1.084x` end to end and `1.092-1.140x` kernel-only, but the predictor reaches `1.090-1.134x` and `1.122-1.187x`.
 
 The obsolete block-omission experiment is no longer part of the maintained data path.
@@ -186,16 +201,14 @@ Each K128 iteration reconstructs P and dS around the int8/fp16 MMA results. The 
 
 ### Shared-memory handoffs
 
-The active path materializes and moves several fragments through shared memory:
-
-- P and dS stores into the score-pair staging area.
+The producer-local canonical P/dS score-pair handoff is removed. The active path still materializes several fragments through shared memory:
 - dS mirror stores into `dS_dKV` so the dQ path can consume the same reconstructed values.
 - Packed Q/dO fragment stores and later loads for the dK/dV MMAs.
 - Packed K fragment stores and later loads for the dQ MMAs.
 - Shared dQ transpose/staging before the global atomic accumulation.
 - dK/dV epilogue staging before coalesced global stores.
 
-These stores and reloads are the leading candidates for the historical shared-store-wavefront excess. The global dQ reduction sectors already match Flash, so changing global dQ ownership without first reducing the shared staging is unlikely to address the measured gap.
+The matched sequence-8192 NCU capture confirms that the register handoff reduces shared-store instructions from `110,428,160` to `43,319,296`, store wavefronts from `112,284,831` to `44,650,061`, load wavefronts from `302,383,104` to `285,605,888`, and LDSM executions from `48,300,032` to `44,105,728`. Remaining packet, mirror, dQ, and epilogue staging are now the shared-memory candidates. The global dQ reduction sectors already match Flash, so changing global dQ ownership without first attributing those remaining stages is unlikely to address the measured gap.
 
 ### Scalar scale application and fragment plumbing
 
@@ -211,11 +224,11 @@ This section records the decisions behind the current source and prevents closed
 - The resource audit reports 243 registers per thread for tail and aligned variants, zero stack/local spill, and 57,600 bytes of dynamic shared storage. `__maxnreg__(243)` is the explicit register boundary. The historical 57,632-byte NCU image still correctly establishes one resident block, 16.7% theoretical occupancy, and approximately 0.40 eligible warps per cycle; the final 32-byte cleanup does not change occupancy.
 - Sequence-8192 profiling measured 53.49% SM/compute throughput, 3.10% DRAM throughput, 29.95% tensor-pipeline throughput, 54.56% L1 throughput, 22.30% L2 throughput, 3% excessive shared wavefronts, and 16.12% L1 sector utilization. Source-line attribution remains incomplete because the standalone source-page export produced no rows in the current Windows Nsight Compute build.
 - The barrier audit established four dependency boundaries. Removing the startup K/V publication barrier produced 4,096 Racecheck hazards between asynchronous shared writes and cross-warp `LDSM` reads. The pre-dK/dV barrier publishes Q/dO packets and dS. The post-dK barrier before dQ is safely removed, and the end barrier protects next-pair Q/dO and row-state publication.
-- The canonical dS audit established that dK already consumes the score-pair representation, while dQ needs one K32 MMA-A fragment assembled from two N16 producer slots. The current `LDSM.x4` atom cannot span the 1 KiB-separated slots under CuTe's vectorization contract, and the initial C-fragment/register shuffle mismatched all 32 lanes.
+- The historical canonical dS audit established that dQ needs one K32 MMA-A fragment assembled from two N16 producer slots. The current `LDSM.x4` atom cannot span the 1 KiB-separated mirror slots under CuTe's vectorization contract, and the initial scalar C-fragment/register shuffle mismatched all 32 lanes.
 - The canonical two-source proof was corrected before promotion. The first standalone probe accidentally applied `make_transposed_tensor` to both the canonical score-pair destination and the mirror reference; production intentionally stores canonical dS transposed and the dQ mirror non-transposed. With the exact production orientations and source-distinct pseudorandom fragments, neither normal nor `.trans` `LDSM.x2` plus any uniform lane shift matched the MMA-A reference.
-- Exhaustive low-instruction mapping checks closed the direct x2 formulation. None of 3,840 lane-bit-permutation/XOR address maps matched either M half. Byte-signature mapping showed that a normal load scatters each eight-byte target across eight source lanes, while a transposed load scatters it across four. A modeled hardware register transpose requires at least three `movmatrix`, two lane-permutation, and two local-byte-permutation stages per source fragment. That is not a competitive replacement for the mirror stores. The defective production candidate was reverted without timing; this closes only the tested gather formulation, not every possible mirror-elimination ownership design.
-- The retained-image attribution gate was not triggered because no canonical-handoff candidate survived fragment correctness. Refresh event, instruction, shared-bank, synchronization, scheduler, and L1/shared counters after the next viable handoff rather than profiling a known-invalid image.
-- After reverting the invalid gather candidate, the native SM86 extension was rebuilt from the retained source and the focused NHD/HND sequence-64/65 matrix passed all four cases. The production kernel has no worktree diff, so subsequent telemetry uses the retained control image.
+- Exhaustive low-instruction mapping checks closed the direct two-source x2 mirror formulation. None of 3,840 lane-bit-permutation/XOR address maps matched either M half. Byte-signature mapping showed that a normal load scatters each eight-byte target across eight source lanes, while a transposed load scatters it across four. A modeled hardware register transpose requires at least three `movmatrix`, two lane-permutation, and two local-byte-permutation stages per source fragment. That remains noncompetitive for eliminating the cross-warp dQ mirror, but it does not apply to the producer-local C-pair handoff used by dV/dK.
+- A separate producer C-pair proof found the exact four-stage bit network `MOVM -> lane rotate -> byte 1/2 swap -> MOVM`. Coordinate-tagged data match all 512 bytes of the canonical MMA-A fragment. Integrating that mapping removes the canonical P/dS stores and reloads while retaining the dQ mirror and four-barrier ownership schedule.
+- Matched sequence-8192 retained-image attribution shows `0.9940x` profiled duration, `0.9132x` LDSM execution, `0.9445x` shared-load wavefronts, and `0.3976x` shared-store wavefronts versus the saved pre-handoff control. Shared-store bank conflicts fall `12.8%`, eligible warps rise from `0.42` to `0.43` per cycle, and tensor instructions are identical. Total executed instructions rise `2.1%` because of the register transpose, while the measured latency still improves.
 - The long-shape telemetry and error-decomposition audit is complete. `data/evaluate_cutlass_bwd_captures.py` now reports aggregate and per-head gradient cosine, relative error, maximum absolute error, finite and strict-gate status, Q/K/dOutput/P/dS INT8 zero rates, P/dS endpoint saturation and clipping, P/dS scale percentiles, true-dS/predicted-dS percentiles, and fixed log2 histograms. It also compares Q/K reconstruction, exact-max dS, predicted dS, local P quantization, dOutput quantization, and the real INT8 kernel. Its default matrix covers both captures and 512/513/4096/8192 with explicit `slice`, `exact`, and `tiled` provenance labels.
 - The packet and lifetime audit found no free compaction margin. Q/dO/K packet allocations exactly match their fragment counts; the K packet is `16 fragments * 4 words * 32 lanes * 4 bytes = 8,192 bytes`. Lowering shared storage alone cannot create a second resident block, so double buffering requires a proven dead region or a different ownership schedule.
 
@@ -231,6 +244,7 @@ This section records the decisions behind the current source and prevents closed
 - Scale/index hoist candidate. The active kernel now caches the CTA-invariant K-domain index, reuses the Q-block index for predictor metadata, caches the dK scale product and dOutput scale-index base, and specializes K-scale lifetime so only aligned launches retain the CTA-invariant scale across M-pairs. With `-lineinfo` on native SM86, aligned static SASS falls from 2096 to 2088 instructions while the tail function is instruction-identical to baseline; registers remain 243 aligned and 227 tail with zero stack/local memory. On identical NHD/HND inputs at sequence 513/4096, dK/dV are bitwise identical and dQ differs only in 7-314 FP16 elements by at most `6.10e-5` with relative L2 below `1e-5`. Kernel-only timing moved by less than the laptop GPU clock variation in the paired candidate/baseline runs, so this is retained as a low-risk control rather than a promotion-quality speedup claim.
 - Post-dK barrier removal. The synchronization point between dK/dV accumulation and dQ staging is removed. Native SM86 SASS now has four static CTA barriers instead of five; relative to the five-barrier scale/index-hoist build, tail SASS is seven instructions shorter and aligned SASS removes one `BAR.SYNC.DEFER_BLOCKING` while adding one `NOP`. `__maxnreg__(243)` preserves the 227-register tail and 243-register aligned allocations with zero stack/local spill. Racecheck and Synccheck pass NHD/HND at sequence lengths 512 and 513. Paired kernel-only timing at 4096/8192 was mixed and within laptop clock/thermal drift, so the cleanup is retained without a performance-win claim.
 - Packed-K dQ reuse. The dQ phase now loads each packed K fragment once per even warp and consumes it for both M16 halves, rather than reloading it for each half. It also computes each K-domain predictor scale once per pair. Native SM86 SASS falls by 16 `LDS` instructions and 22/13 total instructions in tail/aligned variants; the static CTA barrier count remains four in the retained image. Both variants use 243 registers with zero stack/local spill. Racecheck and Synccheck pass NHD/HND at 512/513. Paired new-contract timing is clock-sensitive in absolute milliseconds, but same-run Flash-normalized ratios improved by approximately `0.7-1.2%` for NHD and `0.7-3.2%` for HND across 4096/8192 kernel-only and end-to-end rows, so the change is retained.
+- Direct producer P/dS register handoff. Each warp converts its two M16 producer C fragments into the N16xM32 MMA-A fragments used by dV and dK with a proven `MOVM`, lane-rotation, byte-permutation, `MOVM` network. The dQ mirror remains shared because it is cross-warp. Relative to the saved control, each specialization removes 32 static `STS` and two `LDSM` instructions and adds 16 `MOVM` and eight `SHFL`; tail PRMT count falls by four while aligned PRMT count rises by 28. Both variants remain at 243 registers, 57,600 bytes shared, four static CTA barriers, and zero stack/local spill. Focused tests pass; dK/dV are bitwise identical; Racecheck and Synccheck pass NHD/HND at 512/513. All eight ABBA timing rows improve, with `0.9941x` aggregate raw latency, and matched NCU reports `0.9940x` duration with about 60% fewer shared-store instructions and wavefronts. The handoff is retained.
 - Single K-scale load site. Both aligned and tail specializations now call `load_k_block_scale()` at one source location inside the M-pair loop. Resources remain 243 registers with zero stack/local spill and tail SASS is unchanged; ptxas emits eight additional aligned instructions compared with the manually split lifetime. Short paired timing was mixed, so this is retained as source simplification without a speedup claim. Revisit only after the larger shared-memory handoffs are resolved.
 - Dead shared P-scale publication removal. `SharedStorage2DWarp::p_scale` was an unreferenced trailing eight-float array; the active local `p_scale` arithmetic is unchanged. Removing the field reduces shared storage from 57,632 to 57,600 bytes. Tail and aligned native-SM86 instruction streams are exactly identical to the control, resources remain 243 registers with zero stack/local spill, and the focused four-case matrix passes. This is retained as a resource cleanup without a latency claim.
 
@@ -242,6 +256,8 @@ This section records the decisions behind the current source and prevents closed
 - Power-of-two dS scaling. Rejected as a maintained implementation. It provided only approximately `0.6-1.0%` gains and its specialization/dispatch was removed.
 - Periodic dS scaling. Rejected on accuracy despite approximately `4.3-5.1%` main-kernel gains; its specialization/dispatch was removed.
 - Sparse dS. Rejected as the primary path. Oracle selection needed approximately `90%` block retention and still reached worst dQ/dK relative errors of `11.39%/21.39%`.
+- Tested preprocess-only second-order/sparse scale formulations. A 2x4 centroid/RMS sketch improves calibration and a 64-pair sparse correction reaches five of six aggregates and 52 of 60 heads, but neither it, 256-pair sampling, held-out mean/quantile regression, nor exact correction of the 32 worst scales clears all six aggregates. These exact formulations are not promoted. Keep the broader block-sketch design open only if a new feature supplies missing softmax-concentration information and first passes reconstruction without a CUDA integration.
+- Random-projection QK scale prediction. Rejected because softmax exponentiates sketch error; 8/16/32-dimensional variants pass zero of six aggregate controls and create excessive dS zeros.
 - True pre-forward prediction. Rejected because same-timestep dOutput RMS differed by approximately `28x`; same-RMS random dOutput produced p99 scale ratios up to `31.5x` and a maximum around `642x`.
 - Runtime dS-policy switching. Rejected in favor of one unconditional predictor; dynamic, power-of-two, and periodic IDs and the `PREDICT_DS_SCALE` toggle are no longer part of the active API or source.
 - Exact on-the-fly K64 dS scaling as an unchanged default replacement. The current-source control restored one `abs(dS)` warp reduction, eight shared scale slots, and one CTA barrier per M32 pair. It passed focused correctness, all 60 exact-4096 per-head strict gates, and the full 512/513 NHD/HND Racecheck/Synccheck matrix. It remained spill-free at 243/231 tail/aligned registers and 57,632 bytes shared; aligned SASS shortened from 2,088 to 2,064 instructions, but barriers rose from four to five and `REDUX.MAX` from two to three. Candidate/control/candidate timing regressed every 4096/8192 NHD/HND kernel-only and end-to-end row by `1.5-3.6%`, so the unchanged synchronization protocol is closed as a performance candidate despite its accuracy value.
@@ -257,9 +273,11 @@ The next cycle remains backward-only and uses QBlock=32, KBlock=64, CTA M64xN128
 
 ### Immediate sequence
 
-- Keep the fixed predictor as the performance reference and exact-max reconstruction as the accuracy oracle. Do not retry a scalar guard or simple P-max multiplier; any new predictor must approach the exact-max stage's 60-of-60 per-head result without adding the rejected per-M32 CTA barrier.
-- Resume direct `rP`/`rdS` producer-register handoff only after a standalone producer-to-MMA-A fragment proof. The implementation must remove canonical P/dS stores and reloads while preserving the retained dS mirror for dQ, stay spill-free, and keep the four-barrier schedule. The rejected canonical gather and ordinary mirror-only dK load are not fallbacks.
-- Refresh retained-image attribution only after that handoff or another telemetry-driven candidate survives correctness and short timing. Capture event time, executed instructions, registers, shared load/store wavefronts and conflicts, synchronization stalls, eligible warps, and L1/shared throughput. Long-format NCU CSV parsing must skip the two `==PROF==` preamble lines and pivot by `Metric Name`. The exact-scale control was not profiled because governing event timing already rejected it.
+- Keep the fixed predictor as the performance reference and exact-max reconstruction as the accuracy oracle. Do not retry a scalar guard, simple P-max multiplier, generic QK random projection, or the tested 2x4-plus-row-sample formulations. Before CUDA integration, any new predictor must clear all six exact-4096 aggregates and approach the exact-max stage's 60-of-60 per-head result on held-out captures.
+- Use the retained producer-register handoff and its matched NCU capture as the new native baseline. Do not restore canonical P/dS score-pair stores or treat the score-pair allocation as free storage; each slot is still reused by the dQ transpose stage.
+- Attribute the remaining shared traffic by source stage before changing ownership again. Rank the dS mirror, packed Q/dO publication, packed-K publication, dQ transpose, and dK/dV epilogue using executed store/load counts and wavefront/conflict counters. Promote only a candidate that stays spill-free, preserves four proven barriers, and improves both timing modes under ABBA controls.
+- Keep direct dQ-mirror elimination deferred until a producer-to-consumer proof beats the known three-MOVM/two-lane/two-byte reconstruction cost. The completed producer-local dV/dK handoff does not make that cross-warp mapping cheaper.
+- If predictor work resumes, target missing softmax-concentration information rather than a larger generic guard. The strongest remaining hypothesis is a forward-owned row concentration statistic or compact top-block summary that the forward softmax can emit in `O(N)` storage; a preprocess-only alternative needs a new block-conditioned score feature that beats the tested centroid and 16x16 samples. Account explicitly for a Q32-by-K64 scale table and block-pair combine in end-to-end timing.
 
 ### Deferred
 

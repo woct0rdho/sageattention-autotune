@@ -6,8 +6,6 @@ application-only`` and ``--kernel-name`` matching the CUTLASS kernel so that
 PyTorch setup kernels are not instrumented as part of the checked region.
 """
 
-from __future__ import annotations
-
 import argparse
 import importlib
 

@@ -342,6 +342,39 @@ __device__ __forceinline__ int8_t round_to_int8(const float value)
   return static_cast<int8_t>(result);
 }
 
+// Proven C-to-A bit network: MOVM, rotate the five-bit lane ID, swap bytes 1/2, MOVM.
+__device__ __forceinline__ uint32_t transpose_score_c_word_to_mma_a(
+  const uint32_t source,
+  const int32_t lane_id)
+{
+  uint32_t moved;
+  cute::SM75_U32x1_MOVM_T::copy(source, moved);
+  const int32_t source_lane = (lane_id >> 2) | ((lane_id & 3) << 3);
+  moved = __shfl_sync(0xffffffffu, moved, source_lane);
+  moved = __byte_perm(moved, 0u, 0x3120u);
+  uint32_t result;
+  cute::SM75_U32x1_MOVM_T::copy(moved, result);
+  return result;
+}
+
+template <int32_t Half, typename CFragment, typename AFragment>
+__device__ __forceinline__ void transpose_score_c_fragment_to_mma_a(
+  const CFragment &source,
+  AFragment &destination,
+  const int32_t lane_id)
+{
+  static_assert(Half == 0 || Half == 1, "Score C-to-A transpose selects one M16 half");
+  auto source_words = cute::recast<uint32_t>(source);
+  auto destination_words = cute::recast<uint32_t>(destination);
+  static_assert(cute::size(source_words) == 2, "Score C fragment must contain two packed words");
+  static_assert(cute::size(destination_words) == 4, "Score MMA-A fragment must contain four packed words");
+#pragma unroll
+  for (int32_t word = 0; word < 2; ++word)
+  {
+    destination_words(2 * Half + word) = transpose_score_c_word_to_mma_a(source_words(word), lane_id);
+  }
+}
+
 // 127.5 - 2**-12 leaves a round-to-nearest margin without changing the scale materially.
 inline constexpr float kInt8ScaleInv = 0x1.010122p-7f;
 inline constexpr float kInt8ScaleFloor = 0x1.0p-126f;
@@ -1121,12 +1154,12 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     const float dS_scale = predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
     const float inv_p_scale = 1.0f / p_scale;
     const float inv_dS_scale = 1.0f / dS_scale;
-    constexpr auto transposed_store_shape = cute::make_shape(
-      cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockM>{});
     constexpr auto score_store_shape = cute::make_shape(
       cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockN>{});
     constexpr auto dS_tile_shape = cute::make_shape(
       cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
+    auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
+    auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
     {
       auto rP = cute::make_fragment_like<int8_t>(acc_score_0);
       auto rdS = cute::make_fragment_like<int8_t>(acc_score_0);
@@ -1147,14 +1180,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
         rP(idx) = p_i8;
         rdS(idx) = dS_i8;
       }
-      auto sPTile = cute::local_tile(sPPair, transposed_store_shape, cute::make_coord(cute::_0{}, cute::_0{}));
-      auto sdSTile = cute::local_tile(sdSPair, transposed_store_shape, cute::make_coord(cute::_0{}, cute::_0{}));
-      auto sP = make_transposed_tensor(sPTile);
-      auto sdS = make_transposed_tensor(sdSTile);
-      auto tCrP = thr_copy_score_c.retile_S(rP);
+      transpose_score_c_fragment_to_mma_a<0>(rP, tdVP, lane_id);
+      transpose_score_c_fragment_to_mma_a<0>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
-      cute::copy(tiled_copy_score_c, tCrP, thr_copy_score_c.partition_D(sP));
-      cute::copy(tiled_copy_score_c, tCrdS, thr_copy_score_c.partition_D(sdS));
       const int32_t dS_slot = 2 * n_pair;
       auto sWarpScratchStorage = make_smem_tensor(
         shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
@@ -1183,14 +1211,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
         rP(idx) = p_i8;
         rdS(idx) = dS_i8;
       }
-      auto sPTile = cute::local_tile(sPPair, transposed_store_shape, cute::make_coord(cute::_0{}, cute::_1{}));
-      auto sdSTile = cute::local_tile(sdSPair, transposed_store_shape, cute::make_coord(cute::_0{}, cute::_1{}));
-      auto sP = make_transposed_tensor(sPTile);
-      auto sdS = make_transposed_tensor(sdSTile);
-      auto tCrP = thr_copy_score_c.retile_S(rP);
+      transpose_score_c_fragment_to_mma_a<1>(rP, tdVP, lane_id);
+      transpose_score_c_fragment_to_mma_a<1>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
-      cute::copy(tiled_copy_score_c, tCrP, thr_copy_score_c.partition_D(sP));
-      cute::copy(tiled_copy_score_c, tCrdS, thr_copy_score_c.partition_D(sdS));
       const int32_t dS_slot = 2 * n_pair + 1;
       auto sWarpScratchStorage = make_smem_tensor(
         shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
@@ -1206,10 +1229,6 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     {
       const float dK_scale = dS_scale * q_block_scale;
       const int32_t dO_scale_base = (m_pair_base / (2 * Traits::kBlockM)) * kDimBlocks;
-      auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
-      auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
-      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tdVP));
-      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tdKdS));
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
