@@ -10,7 +10,7 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import _BWD_CONFIG
+from sageattention.cutlass_bwd import _BWD_CONFIGS
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
@@ -37,7 +37,7 @@ def _parse_block_config(value: str) -> BlockConfig:
 
 
 def _parse_block_configs(values: list[str] | None) -> tuple[BlockConfig, ...]:
-    supported_configs = (_BWD_CONFIG,)
+    supported_configs = _BWD_CONFIGS
     configs = supported_configs if not values else tuple(_parse_block_config(value) for value in values)
     unsupported = tuple(config for config in configs if config not in supported_configs)
     if unsupported:
@@ -158,8 +158,8 @@ def _prepare_quantized_qk(
     block_config: BlockConfig,
 ) -> PreparedQuantizedQK:
     blk_q, blk_k, _, _ = block_config
-    # Transitional proxy for forward-owned reuse: keep the backward-compatible
-    # Q/K representation outside the timed backward region.
+    # Keep the forward-compatible Q32/K64 Q/K representation outside the timed
+    # backward region until the public forward saves and routes these tensors.
     with torch.inference_mode():
         return per_block_int8(
             q,
@@ -211,7 +211,6 @@ def _sage_kernel_only_backward(
             q_scale,
             k_scale,
             v,
-            output,
             dout,
             lse,
             delta,
@@ -220,7 +219,6 @@ def _sage_kernel_only_backward(
             do_scale,
             ds_q_factors,
             ds_k_factors,
-            dq,
             dk,
             dv,
             layout_i,
@@ -473,8 +471,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch size must be positive")
     if any(value <= 0 for value in (*args.num_heads, *args.seq_lens)):
         raise ValueError("number of heads and sequence lengths must be positive")
-    if any(head_dim not in (64, 128) for head_dim in args.head_dims):
-        raise ValueError("head dimensions must be 64 or 128")
+    if any(head_dim != 64 for head_dim in args.head_dims):
+        raise ValueError("CUTLASS backward currently supports head dimension 64 only")
     if args.warmup < 0 or args.repeats <= 0:
         raise ValueError("warmup must be non-negative and repeats must be positive")
 
@@ -486,7 +484,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-heads", nargs="+", type=int, default=[16, 32])
     parser.add_argument("--seq-lens", nargs="+", type=int, default=[4096, 8192])
-    parser.add_argument("--head-dims", nargs="+", type=int, default=[64, 128])
+    parser.add_argument("--head-dims", nargs="+", type=int, default=[64])
     parser.add_argument("--layout", choices=["HND", "NHD"], default="NHD")
     parser.add_argument(
         "--block-configs",
@@ -521,12 +519,14 @@ def main() -> None:
     )
     print(f"block_configs={[_format_block_config(config) for config in block_configs]}")
     print("dS scale policy=precomputed separable predictor")
+    print("K quantization policy=raw K (smooth_k=False)")
+    print("FlashAttention baseline=library-selected best available kernel")
     print("TFLOPS use 8*batch*heads*head_dim*seq_len^2 effective dense backward FLOPs and median CUDA-event time")
     print(
         "end_to_end excludes Q/K quantization: backward-compatible Q/K INT8 tensors and scales are prepared outside timing; it includes preprocessing, output/workspace allocation, the main kernel, and dQ conversion"
     )
     print(
-        "Sage forward setup is not timed and uses its own forward Q/K configuration; current benchmark preparation is a backward-format reuse proxy until forward/backward Q/K contracts are unified; sage_speedup > 1 means Sage is faster"
+        "Sage forward setup is not timed and uses the head-64 Q32/K64 artifact domain; its saved tensors are still discarded, so benchmark preparation remains a reuse proxy until forward state is routed into backward; sage_speedup > 1 means Sage is faster"
     )
     print(
         "kind,batch_size,num_heads,head_dim,seq_len,layout,block_config,backward_flops,"

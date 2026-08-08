@@ -12,7 +12,6 @@ extern template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &query_scale,
   const torch::stable::Tensor &key_scale,
   const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
   const torch::stable::Tensor &dO,
   const torch::stable::Tensor &lse,
   const torch::stable::Tensor &delta,
@@ -21,7 +20,6 @@ extern template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &dO_scale,
   const torch::stable::Tensor &dS_q_factors,
   const torch::stable::Tensor &dS_k_factors,
-  const torch::stable::Tensor &dQ,
   const torch::stable::Tensor &dK,
   const torch::stable::Tensor &dV,
   const Params &params,
@@ -32,7 +30,6 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &query_scale,
                                   const torch::stable::Tensor &key_scale,
                                   const torch::stable::Tensor &value,
-                                  const torch::stable::Tensor &output,
                                   const torch::stable::Tensor &dO,
                                   const torch::stable::Tensor &lse,
                                   const torch::stable::Tensor &delta,
@@ -41,7 +38,6 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &dO_scale,
                                   const torch::stable::Tensor &dS_q_factors,
                                   const torch::stable::Tensor &dS_k_factors,
-                                  const torch::stable::Tensor &dQ,
                                   const torch::stable::Tensor &dK,
                                   const torch::stable::Tensor &dV,
                                   const Params &params,
@@ -51,7 +47,7 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
   {
       if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 128)
       {
-        launch_mma<64, 64, 128, 8, 32, 64>(query, key, query_scale, key_scale, value, output, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dQ, dK, dV, params, sm_scale);
+        launch_mma<64, 64, 128, 8, 32, 64>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale);
         return;
       }
   }

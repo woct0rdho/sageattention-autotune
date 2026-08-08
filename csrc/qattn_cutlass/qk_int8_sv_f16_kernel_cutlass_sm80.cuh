@@ -122,18 +122,6 @@ __device__ __forceinline__ auto make_lse_view(T *const base_ptr,
   return cute::make_tensor(cute::make_gmem_ptr(base_ptr), lse_layout);
 }
 
-template <int32_t NumWarps, int32_t ValuesPerWarp>
-__device__ __forceinline__ auto make_scale_view(const float *__restrict__ scales,
-                                                const int32_t batch_id,
-                                                const int32_t head_id,
-                                                const int32_t num_heads,
-                                                const int32_t num_blocks)
-{
-  const auto scale_layout = cute::make_layout(cute::make_shape(num_blocks, cute::Int<NumWarps>{}, cute::Int<ValuesPerWarp>{}), cute::LayoutRight{});
-  const int32_t head_stride = cute::cosize(scale_layout);
-  return cute::make_tensor(cute::make_gmem_ptr(scales + (batch_id * num_heads + head_id) * head_stride), scale_layout);
-}
-
 template <typename Tensor>
 __device__ __forceinline__ auto select_head_batch(Tensor tensor, const int32_t head_id, const int32_t batch_id)
 {
@@ -430,22 +418,35 @@ __device__ __forceinline__ void store_register_to_shared(const Out &out, Smem sm
 
 // Softmax
 
-template <typename Scale, typename Thread>
-__device__ __forceinline__ float load_q_scale(const Scale &q_scales,
-                                              const int32_t block_q,
+template <int32_t CTA_Q, int32_t WARP_Q, typename Thread>
+__device__ __forceinline__ float load_q_scale(const float *__restrict__ const scales,
+                                              const int32_t batch_id,
+                                              const int32_t head_id,
+                                              const int32_t num_heads,
+                                              const int32_t qo_len,
+                                              const int32_t cta_block,
                                               const Thread thread)
 {
-  const float scale = thread.lane.quad_lane == 0 ? q_scales(block_q, thread.warp.q, thread.lane.quad) : 0.0f;
-  return __shfl_sync(kFullWarpMask, scale, thread.lane.quad * 4);
+  constexpr int32_t quant_block_q = 32;
+  static_assert(CTA_Q % quant_block_q == 0 && quant_block_q % WARP_Q == 0, "Q32 scales must align with CTA and warp row ownership");
+  const int32_t num_scale_blocks = cute::ceil_div(qo_len, quant_block_q);
+  const int32_t row = cta_block * CTA_Q + thread.warp.q * WARP_Q;
+  const int32_t scale_block = min(row / quant_block_q, num_scale_blocks - 1);
+  return scales[(batch_id * num_heads + head_id) * num_scale_blocks + scale_block];
 }
 
-template <typename Scale, typename Thread>
-__device__ __forceinline__ float load_k_scale(const Scale &k_scales,
-                                              const int32_t block_k,
-                                              const Thread thread)
+template <int32_t CTA_K, int32_t WARP_K>
+__device__ __forceinline__ float load_k_scale(const float *__restrict__ const scales,
+                                              const int32_t batch_id,
+                                              const int32_t head_id,
+                                              const int32_t num_heads,
+                                              const int32_t kv_len,
+                                              const int32_t cta_block)
 {
-  const float scale = thread.lane.quad == 0 ? k_scales(block_k, thread.warp.k, thread.lane.quad_lane) : 0.0f;
-  return __shfl_sync(kFullWarpMask, scale, thread.lane.quad_lane);
+  constexpr int32_t quant_block_k = 64;
+  static_assert(quant_block_k % CTA_K == 0 && WARP_K == CTA_K, "K64 scales must align with CTA and warp column ownership");
+  const int32_t num_scale_blocks = cute::ceil_div(kv_len, quant_block_k);
+  return scales[(batch_id * num_heads + head_id) * num_scale_blocks + cta_block * CTA_K / quant_block_k];
 }
 
 template <int32_t CtaRows, int32_t WarpRows, typename Score, typename Thread>
@@ -739,8 +740,6 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel(const int8_t *__restrict__ 
   const int32_t num_kv_heads = num_qo_heads / num_kv_groups;
   const int32_t qo_head_id = blockIdx.y;
   const int32_t kv_head_id = qo_head_id / num_kv_groups;
-  const int32_t num_q_blocks = gridDim.x;
-  const int32_t num_k_blocks = cute::ceil_div(kv_len, CTA_K);
   const int32_t q_block_id = blockIdx.x;
 
   // Global tensors
@@ -749,9 +748,6 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel(const int8_t *__restrict__ 
   constexpr auto K_cta_tiler = Traits::k_cta_tiler();
   constexpr auto V_cta_tiler = Traits::v_cta_tiler();
   constexpr auto O_cta_tiler = Traits::o_cta_tiler();
-
-  const auto q_scales = make_scale_view<Traits::num_warps_q, 8>(Q_scale, batch_id, qo_head_id, num_qo_heads, num_q_blocks);
-  const auto k_scales = make_scale_view<Traits::num_warps_k, 4>(K_scale, batch_id, kv_head_id, num_kv_heads, num_k_blocks);
 
   const auto Q_logical_full = make_logical_gmem_view<head_dim>(Q, qo_len, num_qo_heads, num_batches, stride_seq_q, stride_h_q, stride_bz_q);
   const auto K_logical_full = make_logical_gmem_view<head_dim>(K, kv_len, num_kv_heads, num_batches, stride_seq_k, stride_h_k, stride_bz_k);
@@ -815,8 +811,8 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel(const int8_t *__restrict__ 
 
   const int32_t num_iterations = cute::ceil_div(kv_len, CTA_K);
 
-  const float q_scale = load_q_scale(q_scales, q_block_id, thread);
-  float k_scale = load_k_scale(k_scales, cute::_0{}, thread);
+  const float q_scale = load_q_scale<CTA_Q, WARP_Q>(Q_scale, batch_id, qo_head_id, num_qo_heads, qo_len, q_block_id, thread);
+  float k_scale = load_k_scale<CTA_K, WARP_K>(K_scale, batch_id, kv_head_id, num_kv_heads, kv_len, 0);
   float dequant_scale = q_scale * k_scale;
 
   load_global_to_shared_predicated(K_gmem, K_smem_load, K_cta_tiler, cute::_0{}, thread, kv_len);
@@ -835,7 +831,7 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel(const int8_t *__restrict__ 
     __syncthreads();
 
     load_global_to_shared(K_gmem, K_smem_load, K_cta_tiler, iter, thread);
-    k_scale = load_k_scale(k_scales, iter, thread);
+    k_scale = load_k_scale<CTA_K, WARP_K>(K_scale, batch_id, kv_head_id, num_kv_heads, kv_len, iter);
     dequant_scale = q_scale * k_scale;
 
     cute::cp_async_wait<1>();
@@ -857,7 +853,7 @@ __global__ void qk_int8_sv_f16_accum_f32_attn_kernel(const int8_t *__restrict__ 
     __syncthreads();
 
     load_global_to_shared_predicated(K_gmem, K_smem_load, K_cta_tiler, num_iterations - 1, thread, kv_len);
-    k_scale = load_k_scale(k_scales, num_iterations - 1, thread);
+    k_scale = load_k_scale<CTA_K, WARP_K>(K_scale, batch_id, kv_head_id, num_kv_heads, kv_len, num_iterations - 1);
     dequant_scale = q_scale * k_scale;
 
     cute::cp_async_wait<1>();

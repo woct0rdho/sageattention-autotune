@@ -9,7 +9,7 @@
 - Optional LSE output for backward consumers.
 - Fixed-length dense tensors only.
 - Supported tensor layouts: `HND` and `NHD` via the same stride handling as the existing CUDA qattn path.
-- Head dims: `64` and `128` only.
+- Head dims: `64` and `128` only. Both use the canonical Q32/K64 per-block artifact.
 - Block configs:
   - `(blk_q=128, blk_k=64, warp_q=32, warp_k=64)`
   - `(blk_q= 64, blk_k=64, warp_q=32, warp_k=64)`
@@ -19,10 +19,10 @@
 
 ## Current Implementation
 
-The wrapper deliberately reuses the existing Triton `per_thread_int8` quantization layout instead of introducing a new quantized layout. The wrapper does:
+The maintained wrapper uses the canonical Triton `per_block_int8` layout with `QBlock=32` and `KBlock=64` for both supported head dimensions. The CTA/warp execution configuration remains independently selectable. The wrapper does:
 
 ```text
-q, k -> per_thread_int8 -> q_int8, q_scale, k_int8, k_scale
+head_dim in {64,128}: q, k -> per_block_int8(Q32,K64) -> q_int8, q_scale, k_int8, k_scale
 q_int8, k_int8, v, scales -> qattn kernel -> output[, lse]
 ```
 
@@ -48,55 +48,36 @@ The core MMA instructions execute the same logical QK `m16n16k32` and PV `m16n16
 
 ## Benchmark Snapshot
 
-```text
-python bench/bench_qattn_cutlass.py --mode kernel-only --layout NHD --seq-lens 2048 4096 8192 --num-heads 16 32 --head-dims 64 128 --repeats 50 --warmup 10 --smooth-k --csv $Env:TEMP/qattn_cutlass_kernel_baseline.csv
-```
+The maintained benchmark always uses raw K (`smooth_k=False`). FlashAttention is called through normal `flash_attn_func` dispatch without a Sage block-size constraint, so each Sage execution configuration is compared with FlashAttention's library-selected kernel. Effective forward throughput uses `4 * batch * heads * head_dim * seq_len^2` FLOPs for QK and PV and the median CUDA-event time.
 
-The script measures two levels:
-- `end_to_end`: Python wrapper including Q/K quantization, output allocation, and attention kernel.
-- `kernel_only`: prequantized Q/K and preallocated output, measuring only the existing CUDA attention kernel versus the new CUTLASS attention kernel.
+The final grid used batch 1, 25 warmups, and 100 repeats on an NVIDIA GeForce RTX 3080 Ti Laptop GPU. `end_to_end` includes Q32/K64 Q/K quantization, output allocation, and the CUTLASS attention kernel. `kernel_only` uses prequantized Q/K and a preallocated output. The table selects the lowest CUTLASS median independently for each shape and mode; Flash is measured once per shape with its unconstrained dispatch.
 
-The kernel-only result is the more reliable optimization signal because both paths share the same quantization producer. The benchmark reports median time as the primary `cuda_ms` / `cutlass_ms` columns, with mean and stdev retained as context in `cuda_mean_ms` / `cutlass_mean_ms` and `*_stdev_ms`.
+| Layout | Heads | Head dim | Seq | Flash TFLOPS | Sage end-to-end TFLOPS | End-to-end speedup | End-to-end config | Sage kernel-only TFLOPS | Kernel-only speedup | Kernel-only config |
+|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|
+| NHD | 16 | 64 | 4096 | 39.302 | 49.545 | 1.261x | `128x64x32x64` | 56.303 | 1.433x | `128x64x32x64` |
+| NHD | 16 | 64 | 8192 | 41.660 | 57.108 | 1.371x | `128x32x32x32` | 59.487 | 1.428x | `128x32x32x32` |
+| NHD | 16 | 128 | 4096 | 42.333 | 56.998 | 1.346x | `128x64x32x64` | 59.881 | 1.415x | `128x64x32x64` |
+| NHD | 16 | 128 | 8192 | 43.079 | 60.067 | 1.394x | `128x64x32x64` | 61.788 | 1.434x | `128x64x32x64` |
+| NHD | 32 | 64 | 4096 | 40.814 | 53.082 | 1.301x | `128x32x32x32` | 56.776 | 1.391x | `128x64x32x64` |
+| NHD | 32 | 64 | 8192 | 41.469 | 55.545 | 1.339x | `128x64x32x64` | 57.478 | 1.386x | `128x32x32x32` |
+| NHD | 32 | 128 | 4096 | 41.089 | 55.594 | 1.353x | `128x64x32x64` | 59.011 | 1.436x | `128x64x32x64` |
+| NHD | 32 | 128 | 8192 | 41.783 | 57.927 | 1.386x | `128x32x32x32` | 60.941 | 1.458x | `128x64x32x64` |
+| HND | 16 | 64 | 4096 | 39.246 | 48.630 | 1.239x | `128x32x32x32` | 55.485 | 1.414x | `128x64x32x64` |
+| HND | 16 | 64 | 8192 | 40.568 | 56.849 | 1.401x | `128x32x32x32` | 59.692 | 1.471x | `128x32x32x32` |
+| HND | 16 | 128 | 4096 | 41.491 | 56.421 | 1.360x | `128x64x32x64` | 58.015 | 1.398x | `128x64x32x64` |
+| HND | 16 | 128 | 8192 | 41.123 | 59.593 | 1.449x | `128x64x32x64` | 61.805 | 1.503x | `128x64x32x64` |
+| HND | 32 | 64 | 4096 | 40.833 | 53.030 | 1.299x | `128x32x32x32` | 57.604 | 1.411x | `128x32x32x32` |
+| HND | 32 | 64 | 8192 | 41.813 | 55.994 | 1.339x | `128x32x32x32` | 58.129 | 1.390x | `128x64x32x64` |
+| HND | 32 | 128 | 4096 | 41.191 | 56.240 | 1.365x | `128x64x32x64` | 59.705 | 1.449x | `128x64x32x64` |
+| HND | 32 | 128 | 8192 | 42.111 | 59.550 | 1.414x | `128x64x32x64` | 60.075 | 1.427x | `128x32x32x32` |
 
-The benchmark below predates the latest CuTe-style helper cleanup, including the softmax loop-removal pass. No new benchmark has been run for those migrations because the validation policy is correctness-only unless benchmarking is requested.
+Best-config end-to-end speedup is `1.239-1.449x` with a `1.350x` geometric mean. Kernel-only speedup is `1.386-1.503x` with a `1.427x` geometric mean. End-to-end Sage throughput spans `48.630-60.067 TFLOPS`; kernel-only throughput spans `55.485-61.805 TFLOPS`.
 
-Latest standard kernel-only run:
-
-```text
-python bench/bench_qattn_cutlass.py --mode kernel-only --layout NHD --seq-lens 2048 4096 8192 --num-heads 16 32 --head-dims 64 128 --repeats 50 --warmup 10 --smooth-k --csv $Env:TEMP/qattn_cutlass_after_cute_helpers.csv
-```
-
-Best-config median summary from `$Env:TEMP/qattn_cutlass_after_cute_helpers.csv`:
-
-| Num heads | Head dim | Seq len | Best CUDA median ms | Best CUTLASS median ms | Best CUTLASS config | CUTLASS / CUDA |
-|---:|---:|---:|---:|---:|---:|---:|
-| 16 | 64 | 2048 | 0.4639 | 0.4567 | `(128,64,32,64)` | 0.985 |
-| 16 | 64 | 4096 | 1.2257 | 1.2114 | `(128,64,32,64)` | 0.988 |
-| 16 | 64 | 8192 | 4.8731 | 4.8461 | `(128,64,32,64)` | 0.994 |
-| 16 | 128 | 2048 | 0.5908 | 0.6036 | `(128,64,32,64)` | 1.022 |
-| 16 | 128 | 4096 | 2.1683 | 2.1422 | `(128,64,32,64)` | 0.988 |
-| 16 | 128 | 8192 | 8.5350 | 8.3379 | `(128,64,32,64)` | 0.977 |
-| 32 | 64 | 2048 | 0.6041 | 0.6025 | `(128,64,32,64)` | 0.997 |
-| 32 | 64 | 4096 | 2.3843 | 2.3244 | `(128,64,32,64)` | 0.975 |
-| 32 | 64 | 8192 | 9.4387 | 9.1587 | `(128,64,32,64)` | 0.970 |
-| 32 | 128 | 2048 | 1.1335 | 1.1356 | `(128,64,32,64)` | 1.002 |
-| 32 | 128 | 4096 | 4.3345 | 4.2726 | `(128,64,32,64)` | 0.986 |
-| 32 | 128 | 8192 | 17.1561 | 16.8873 | `(128,64,32,64)` | 0.984 |
-
-Average best CUTLASS / best CUDA across this grid: `0.989`.
-
-Notes:
-- Full per-config data is kept in the CSV rather than copied into this plan.
-- Timing variance on the local laptop GPU is visible, so repeat A/B runs and NCU profiles should guide major decisions.
-
-Summary:
-- The CUTLASS path is at parity or slightly faster by best config across the standard `smooth_k=True` kernel-only grid.
-- Config choice matters, especially for `head_dim=64` short sequences.
-- Further micro-optimizations should be kept only when the median A/B result is robust across `seq_len in {2048,4096,8192}` and `head_dim in {64,128}`.
+Full per-config results are in `build/bench_qattn_cutlass_rawk_NHD_4096_8192.csv` and `build/bench_qattn_cutlass_rawk_HND_4096_8192.csv`. Absolute laptop timings remain clock- and temperature-sensitive, so sub-percent kernel changes still require paired same-build controls.
 
 ## Comparison with SageAttention CUDA Kernel
 
-The CUTLASS kernel intentionally mirrors the CUDA kernel's main architecture for the overlapping fp16, non-causal, fp32-PV path: same CTA/warp tiling choices, same `m16n16k32` QK and `m16n16k16` PV tensor-core shapes, same single shared-memory Q/K/V staging buffer overlaid with the O staging buffer, same K/V software pipeline, same warp-broadcasted Q/K scales, same CUDA-core denominator strategy, and the same shared-memory epilogue pattern. The remaining differences below are architectural or scheduling choices that can affect performance, not just CuTe-vs-CUDA code style.
+The CUTLASS kernel intentionally mirrors the CUDA kernel's main architecture for the overlapping fp16, non-causal, fp32-PV path: same CTA/warp tiling choices, same `m16n16k32` QK and `m16n16k16` PV tensor-core shapes, same single shared-memory Q/K/V staging buffer overlaid with the O staging buffer, same K/V software pipeline, same CUDA-core denominator strategy, and the same shared-memory epilogue pattern. CUTLASS now uses fixed Q32/K64 scale domains for both head dimensions, while the CUDA path retains its execution-tile-dependent per-thread metadata. The remaining differences below are architectural or scheduling choices that can affect performance, not just CuTe-vs-CUDA code style.
 
 ### Global-memory copy tiling matches the scoped CUDA path
 
@@ -140,7 +121,7 @@ FlashAttention has split-KV forward variants with a combine kernel, and newer ke
 
 ### Quantized QK changes the bottleneck
 
-Several differences are justified by int8 Q/K rather than missing FlashAttention optimizations. The qattn path uses `m16n16k32` int8 QK MMA, int32 score accumulators, per-thread Q/K scale loads, dequant scaling, and int8-specific shared-memory packing. FlashAttention's fp16/bf16 SM80 path uses fp16/bf16 QK MMA and has no per-tile dequant scales. The int8 path has lower Q/K bandwidth and faster QK math, but pays extra scalar conversion/scale work and can become more sensitive to score-fragment size, softmax, denominator accumulation, and PV scheduling. That is why larger FA-style K tiles or Q-in-register caching need separate int8 benchmarks instead of direct adoption.
+Several differences are justified by int8 Q/K rather than missing FlashAttention optimizations. The qattn path uses `m16n16k32` int8 QK MMA, int32 score accumulators, fixed Q32/K64 scale loads, dequant scaling, and int8-specific shared-memory packing. FlashAttention's fp16/bf16 SM80 path uses fp16/bf16 QK MMA and has no per-tile dequant scales. The int8 path has lower Q/K bandwidth and faster QK math, but pays extra scalar conversion/scale work and can become more sensitive to score-fragment size, softmax, denominator accumulation, and PV scheduling. That is why larger FA-style K tiles or Q-in-register caching need separate int8 benchmarks instead of direct adoption.
 
 ### Denominator strategy is int8-path specific
 
@@ -154,7 +135,7 @@ FlashAttention tracks row sums as part of its online softmax state and normalize
 - CUDA-core denominator: kept after tensor-core denominator testing showed slower runtime on the local sm86 target.
 - Block config expansion: added `(128,32,32,32)` and `(128,64,16,64)` after fixing dynamic shared-memory sizing to `max(Q+K+V, O)`.
 - Q-tile warp sync: kept replacing the post-Q-load CTA barrier with `__syncwarp()`. Standard median A/B showed `22` wins, `2` tiny losses, and average CUTLASS delta `-2.24%`.
-- Scale-load broadcast layout: kept a static scale-load policy where Q scale is loaded once per 4-lane row group and K scale once per 4-lane K group, then broadcast with warp shuffles. Correctness passed (`pytest -q tests/test_sageattn_cutlass.py`, `32 passed` at the time). The all-config NHD grid was mixed (`+1.01%` average over every config), but the default `(128,64,32,64)` config had significant wins on several target shapes and a selective default-config policy would improve best-config median by `-0.74%` with no significant losses. Kept always-on per the quant-layout exploration policy. Revisit with an explicit toggle only if later data shows decisive regressions.
+- Fixed Q32/K64 scale path: head dimensions 64 and 128 consume the same flat per-block artifact. Q scale indexing follows Q32 row ownership, K scale indexing follows K64 column ownership, and neither depends on the selected CTA/warp execution tile. The legacy per-thread scale view, runtime scale mode, and warp-broadcast load path have been removed from CUTLASS.
 
 ### Completed but Reverted Experiments
 
@@ -162,10 +143,10 @@ FlashAttention tracks row sums as part of its online softmax state and normalize
 - Fused denominator accumulation: folded `accumulate_d` into score exponentiation. Correctness passed, but median timing regressed (`+1.34%`, `17` losses, `6` wins, `1` tie), likely from extra register/live-range pressure and changed scheduling.
 - Earlier next-K prefetch: moved next-K `cp.async` before score postprocessing. Reverted despite one large outlier win because it won only `7/24` cases and regressed multiple long-sequence configs.
 - Q/output full-tile fast path: skipped predicated Q load and output bounds branch when `qo_len % CTA_Q == 0`. Reverted because the average was flat (`+0.01%`) with mixed results and a large short-sequence regression.
-- Compile-time Q/K/V full-tile specialization: added a separate `FullTiles=true` instantiation selected when both `qo_len % CTA_Q == 0` and `kv_len % CTA_K == 0`, removing Q/K/V load predicates, final K mask, and output bounds checks from that binary. Correctness passed (`pytest -q tests/test_sageattn_cutlass.py`, `18 passed` at the time), but timing was mixed and not robust: a 12-case `smooth_k=True` NHD main-config run showed `7` wins, `5` losses, and average `-1.81%` only because of one large 4096x64 outlier. A repeat focused 4096x64 run was flat/slower (`1.5703 ms` vs earlier best `1.2626 ms`). Reverted.
+- Compile-time Q/K/V full-tile specialization: added a separate `FullTiles=true` instantiation selected when both `qo_len % CTA_Q == 0` and `kv_len % CTA_K == 0`, removing Q/K/V load predicates, final K mask, and output bounds checks from that binary. Correctness passed (`pytest -q tests/test_sageattn_cutlass.py`, `18 passed` at the time), but timing was mixed and not robust: a 12-case historical centered-K NHD main-config run showed `7` wins, `5` losses, and average `-1.81%` only because of one large 4096x64 outlier. A repeat focused 4096x64 run was flat/slower (`1.5703 ms` vs earlier best `1.2626 ms`). Reverted.
 - Direct final K-mask base: replaced loop-carried `K_idx_lane_base += CTA_K` bookkeeping with a direct final-tile base expression in this non-causal kernel. Correctness passed, but focused timing was tied (`1.2640 ms` vs `1.2626 ms`) and the 12-case main-config run had `5` wins, `7` losses. The average looked faster only because of the same noisy 4096x64 case. Reverted.
-- Tail-tile dequant-scale movement: removed per-element `* dequant_scale` from the second-last and last score-conversion loops and passed `original_sm_scale * dequant_scale` into `update_mdo`, matching the middle-loop math. Correctness passed, but immediate A/B on the 12-case `smooth_k=True` NHD main-config grid regressed on average (`+0.49%`, `5` wins, `6` losses, `1` tie), despite an earlier non-paired run looking mildly favorable. Reverted.
-- Extra `(64,32,32,32)` config: compiled and exposed the smaller-CTA candidate, and expanded the focused launch test (`19 passed`). The standard benchmark could not use the CUDA comparison path because the existing CUDA kernel does not support this config, so a temporary CUTLASS-only timing script was used. It was slower than existing configs across nearly all standard shapes (e.g. `head_dim=128, seq_len=2048, heads=16` at `0.7086 ms` vs existing best around `0.606-0.629 ms`. `head_dim=64, seq_len=8192, heads=16` at `5.79 ms` vs existing best around `4.85-4.96 ms`). Reverted to avoid extra compile cost.
+- Tail-tile dequant-scale movement: removed per-element `* dequant_scale` from the second-last and last score-conversion loops and passed `original_sm_scale * dequant_scale` into `update_mdo`, matching the middle-loop math. Correctness passed, but immediate A/B on the 12-case historical centered-K NHD main-config grid regressed on average (`+0.49%`, `5` wins, `6` losses, `1` tie), despite an earlier non-paired run looking mildly favorable. Reverted.
+- Extra `(64,32,32,32)` config: compiled and exposed the smaller-CTA candidate, and expanded the focused launch test (`19 passed`). The standard benchmark used a temporary CUTLASS-only timing script for this config. It was slower than existing configs across nearly all standard shapes (e.g. `head_dim=128, seq_len=2048, heads=16` at `0.7086 ms` vs existing best around `0.606-0.629 ms`. `head_dim=64, seq_len=8192, heads=16` at `5.79 ms` vs existing best around `4.85-4.96 ms`). Reverted to avoid extra compile cost.
 - `num_kv_groups == 1` specialization: added a `KvGroupsOne` template and launcher dispatch to remove runtime grouped-query divisions for standard MHA. Correctness passed, but a paired 8-case long-sequence grid regressed on average (`+0.30%`, `2` wins, `6` losses), with notable losses for `head_dim=128`. Reverted because the extra binary variants were not justified.
 - Direct final K/V load predicate base: computed final predicated K/V preload base indices once and removed loop-carried `K_load_idx_lane_base += CTA_K` / `V_load_idx_lane_base += CTA_K` updates. Correctness passed, but paired long-sequence timing regressed (`+1.74%`, `2` wins, `6` losses). Reverted.
 - Mixed NHD input with HND-packed Q/K quantized storage: Triton emitted Q/K int8 as `(B,H,N,D)` while V/O stayed NHD, and the CUTLASS launcher accepted a mixed-layout code. Correctness was bit-identical, but paired kernel-only timing was noise-level: first 12-case NHD grid averaged `-2.27%` only due to a large outlier, while the repeat averaged just `-0.18%` with several losses and per-case stddevs larger than the median deltas. Reverted because the speedup did not justify the extra quantizer/launcher complexity.
@@ -198,12 +179,12 @@ FlashAttention tracks row sums as part of its online softmax state and normalize
 
 ## Benchmark Workflow
 
-Use fixed shapes and prequantized kernel-only comparisons while optimizing.
+Use fixed raw-K shapes. Treat end-to-end timing against unconstrained FlashAttention dispatch as the primary product result and prequantized kernel-only timing as an optimization diagnostic.
 
 Target shape set:
 
 ```text
-batch_size=1, layout=NHD, fp16, non-causal, smooth_k=True
+batch_size=1, layout in {NHD, HND}, fp16, non-causal, smooth_k=False
 num_heads in {16, 32}
 seq_len in {2048, 4096, 8192}
 head_dim in {64, 128}
@@ -227,13 +208,15 @@ pytest tests/test_sageattn_cutlass.py tests/test_sageattn_cutlass_compile.py
 3. Focused kernel-only benchmark:
 
 ```text
-python bench/bench_qattn_cutlass.py --mode kernel-only --layout NHD --seq-lens 4096 --num-heads 16 --head-dims 64 --repeats 50 --warmup 10 --smooth-k
+python bench/bench_qattn_cutlass.py --mode kernel-only --layout NHD --seq-lens 4096 --num-heads 16 --head-dims 64 --repeats 50 --warmup 10
 ```
 
 4. Broader benchmark if the focused shape improves:
 
 ```text
-python bench/bench_qattn_cutlass.py --mode kernel-only --layout NHD --seq-lens 2048 4096 8192 --num-heads 16 32 --head-dims 64 128 --repeats 50 --warmup 10 --smooth-k --csv $Env:TEMP/qattn_cutlass_baseline.csv
+foreach ($layout in @('NHD', 'HND')) {
+  python bench/bench_qattn_cutlass.py --mode all --layout $layout --seq-lens 4096 8192 --num-heads 16 32 --head-dims 64 128 --repeats 100 --warmup 25 --csv "build/bench_qattn_cutlass_rawk_${layout}_4096_8192.csv"
+}
 ```
 
 5. Nsight Compute after meaningful performance changes.

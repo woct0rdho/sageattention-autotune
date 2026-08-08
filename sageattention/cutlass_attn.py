@@ -4,10 +4,12 @@ import torch
 
 from .cutlass_autotune import _eager_autotune_select, _sageattn_cutlass_autotuned
 from .cutlass_compile import _qattn_cutlass_sm80
-from .triton.quant_per_thread import per_thread_int8
+from .triton.quant_per_block import per_block_int8
 from .utils import LOG2_E, _lse_correction, _pad_qkv
 
 CutlassSageAttnResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+_CUTLASS_QK_QUANT_CONFIG = (32, 64)
 
 
 @overload
@@ -139,14 +141,13 @@ def _sageattn_cutlass_configured(
     else:
         km = None
 
-    q_int8, q_scale, k_int8, k_scale = per_thread_int8(
+    quant_blk_q, quant_blk_k = _CUTLASS_QK_QUANT_CONFIG
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
         km=km,
-        BLKQ=blk_q,
-        WARPQ=warp_q,
-        BLKK=blk_k,
-        WARPK=warp_k,
+        BLKQ=quant_blk_q,
+        BLKK=quant_blk_k,
         tensor_layout=tensor_layout,
     )
 
