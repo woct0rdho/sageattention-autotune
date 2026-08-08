@@ -2,8 +2,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sageattention.triton_bwd import _sageattn_triton_trainable_configured
-from sageattention.triton_bwd_autotune import _valid_configs
+from sageattention.triton.attn_bwd_autotune import _has_valid_bwd_configs
+from sageattention.triton.attn_bwd_qk_int8 import backward as _attn_backward
+from sageattention.triton.attn_qk_int8_per_block import forward as _attn_forward
+from sageattention.triton.quant_per_block import per_block_int8
+from sageattention.triton_autotune import _valid_configs as _valid_forward_configs
+
+PreparedBackwardInputs = tuple[torch.Tensor, ...]
 
 
 def _make_qkvo(
@@ -21,7 +26,12 @@ def _make_qkvo(
 
 
 def _make_valid_configs() -> tuple[tuple[int, int], ...]:
-    return _valid_configs(head_dim=64, device_index=torch.cuda.current_device())
+    device_index = torch.cuda.current_device()
+    return tuple(
+        block_config
+        for block_config in _valid_forward_configs(64, False, device_index)
+        if _has_valid_bwd_configs(block_config, 64, device_index)
+    )
 
 
 def _metric(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, float]:
@@ -69,6 +79,41 @@ def _flash_attn_backward(
     return q.grad, k.grad, v.grad
 
 
+def _prepare_sage_backward_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dout: torch.Tensor,
+    block_config: tuple[int, int],
+) -> PreparedBackwardInputs:
+    block_m, block_n = block_config
+    k_mean_keepdim = k.mean(dim=1, keepdim=True)
+    k_mean = k_mean_keepdim.squeeze(1).contiguous()
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(
+        q,
+        k,
+        km=k_mean_keepdim,
+        BLKQ=block_m,
+        BLKK=block_n,
+        tensor_layout="NHD",
+    )
+    out, lse = _attn_forward(
+        q_int8,
+        k_int8,
+        v,
+        q_scale,
+        k_scale,
+        tensor_layout="NHD",
+        is_causal=False,
+        pv_accum_dtype="fp32",
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        output_dtype=v.dtype,
+        return_lse=True,
+    )
+    return q_int8, k_int8, v, dout, out, lse, q_scale, k_scale, k_mean
+
+
 def _sage_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -76,24 +121,24 @@ def _sage_backward(
     dout: torch.Tensor,
     block_config: tuple[int, int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = q.detach().clone().requires_grad_(True)
-    k = k.detach().clone().requires_grad_(True)
-    v = v.detach().clone().requires_grad_(True)
-    out = _sageattn_triton_trainable_configured(
-        q,
-        k,
-        v,
-        tensor_layout="NHD",
-        pv_accum_dtype="fp32",
-        smooth_k=True,
-        block_config=block_config,
+    q_int8, k_int8, v, dout, out, lse, q_scale, k_scale, k_mean = _prepare_sage_backward_inputs(
+        q, k, v, dout, block_config
     )
-    out.backward(dout)
+    dq, dk, dv = _attn_backward(
+        q_int8,
+        k_int8,
+        v,
+        dout,
+        out,
+        lse,
+        q_scale,
+        k_scale,
+        k_mean,
+        BLOCK_M=block_config[0],
+        BLOCK_N=block_config[1],
+    )
 
-    assert q.grad is not None
-    assert k.grad is not None
-    assert v.grad is not None
-    return q.grad, k.grad, v.grad
+    return dq, dk, dv
 
 
 def _check_backward(
@@ -109,7 +154,7 @@ def _check_backward(
 
 
 @pytest.mark.parametrize("block_config", _make_valid_configs(), ids=str)
-def test_sagebwd_triton_block_config(block_config: tuple[int, int]) -> None:
+def test_qattn_triton_backward_block_config(block_config: tuple[int, int]) -> None:
     q, k, v, dout = _make_qkvo()
     actual = _sage_backward(q, k, v, dout, block_config)
     expected = _flash_attn_backward(q, k, v, dout)
