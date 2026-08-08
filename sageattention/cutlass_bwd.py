@@ -8,6 +8,7 @@ from .triton.quant_per_block import per_block_int8
 from .utils import _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
+_BWD_CONFIGS = (_BWD_CONFIG,)
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -22,7 +23,6 @@ def _bwd_fake_impl(
     query_scale: torch.Tensor,
     key_scale: torch.Tensor,
     value: torch.Tensor,
-    output: torch.Tensor,
     grad_output: torch.Tensor,
     lse: torch.Tensor,
     delta: torch.Tensor,
@@ -31,7 +31,6 @@ def _bwd_fake_impl(
     do_scale: torch.Tensor,
     ds_q_factors: torch.Tensor,
     ds_k_factors: torch.Tensor,
-    grad_query: torch.Tensor,
     grad_key: torch.Tensor,
     grad_value: torch.Tensor,
     tensor_layout: int,
@@ -64,6 +63,8 @@ def _sageattn_cutlass_bwd_configured(
         raise ValueError("q, k, v, output, and grad_output must have the same shape.")
     if len({q.device, k.device, v.device, output.device, grad_output.device, lse.device}) != 1:
         raise ValueError("All tensors must be on the same device.")
+    if config not in _BWD_CONFIGS:
+        raise ValueError(f"Unsupported CUTLASS backward config: {config}.")
 
     head_dim, q, k, v = _pad_qkv(q, k, v)
     if output.size(-1) != q.size(-1):
@@ -117,7 +118,6 @@ def _sageattn_cutlass_bwd_configured(
         q_scale,
         k_scale,
         v,
-        output,
         grad_output,
         lse,
         delta,
@@ -126,7 +126,6 @@ def _sageattn_cutlass_bwd_configured(
         do_scale,
         ds_q_factors,
         ds_k_factors,
-        grad_query,
         grad_key,
         grad_value,
         layout_i,

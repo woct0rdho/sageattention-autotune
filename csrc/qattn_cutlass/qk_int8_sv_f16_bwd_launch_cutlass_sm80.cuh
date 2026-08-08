@@ -77,7 +77,6 @@ inline Params prepare_params(const Tensor &query,
                                     const Tensor &query_scale,
                                     const Tensor &key_scale,
                                     const Tensor &value,
-                                    const Tensor &output,
                                     const Tensor &dO,
                                     const Tensor &lse,
                                     const Tensor &delta,
@@ -86,7 +85,6 @@ inline Params prepare_params(const Tensor &query,
                                     const Tensor &dO_scale,
                                     const Tensor &dS_q_factors,
                                     const Tensor &dS_k_factors,
-                                    const Tensor &dQ,
                                     const Tensor &dK,
                                     const Tensor &dV,
                                     const TensorLayout tensor_layout,
@@ -100,9 +98,7 @@ inline Params prepare_params(const Tensor &query,
   check_scale_tensor(query_scale, "query_scale");
   check_scale_tensor(key_scale, "key_scale");
   check_half_tensor(value, "value");
-  check_half_tensor(output, "output");
   check_half_tensor(dO, "dO");
-  check_half_tensor(dQ, "dQ");
   check_half_tensor(dK, "dK");
   check_half_tensor(dV, "dV");
   CHECK_CUDA(lse);
@@ -116,11 +112,9 @@ inline Params prepare_params(const Tensor &query,
   check_workspace_tensor(dS_q_factors, "dS_q_factors", 4, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dS_k_factors, "dS_k_factors", 3, torch::headeronly::ScalarType::Float);
 
-  STD_TORCH_CHECK(blk_q > 0 && blk_k > 0, "blk_q and blk_k must be positive");
-  STD_TORCH_CHECK(bwd_block_m == 64 && bwd_block_n == 128,
-                  "Focused CUTLASS qattn backward currently requires the 64x128 CTA");
-  STD_TORCH_CHECK((blk_q == 32 || blk_q == 128) && (blk_k == 64 || blk_k == 128),
-                  "Focused CUTLASS qattn backward requires QBlock=32 or 128 and KBlock=64 or 128");
+  STD_TORCH_CHECK(query.size(3) == 64, "Focused CUTLASS qattn backward currently supports head_dim 64 only");
+  STD_TORCH_CHECK(bwd_block_m == 64 && bwd_block_n == 128, "Focused CUTLASS qattn backward currently requires the 64x128 CTA");
+  STD_TORCH_CHECK(blk_q == 32 && blk_k == 64, "Focused CUTLASS qattn backward requires QBlock=32 and KBlock=64");
   Params params = {
     static_cast<int32_t>(query.size(3)),
     static_cast<int32_t>(query.size(0)),
@@ -133,9 +127,7 @@ inline Params prepare_params(const Tensor &query,
     static_cast<int32_t>(query.stride(0)), 0, 0,
     static_cast<int32_t>(key.stride(0)), 0, 0,
     static_cast<int32_t>(value.stride(0)), 0, 0,
-    static_cast<int32_t>(output.stride(0)), 0, 0,
     static_cast<int32_t>(dO.stride(0)), 0, 0,
-    static_cast<int32_t>(dQ.stride(0)), 0, 0,
     static_cast<int32_t>(dK.stride(0)), 0, 0,
     static_cast<int32_t>(dV.stride(0)), 0, 0,
     static_cast<int32_t>(query_scale.stride(0)),
@@ -150,27 +142,21 @@ inline Params prepare_params(const Tensor &query,
     params.num_heads = static_cast<int32_t>(query.size(2));
     CHECK_SHAPE(key, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
     CHECK_SHAPE(value, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
-    CHECK_SHAPE(output, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
     CHECK_SHAPE(dO, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
-    CHECK_SHAPE(dQ, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
     CHECK_SHAPE(dK, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
     CHECK_SHAPE(dV, params.batch_size, params.seq_len, params.num_heads, params.head_dim);
 
     params.stride_seq_q = static_cast<int32_t>(query.stride(1));
     params.stride_seq_k = static_cast<int32_t>(key.stride(1));
     params.stride_seq_v = static_cast<int32_t>(value.stride(1));
-    params.stride_seq_o = static_cast<int32_t>(output.stride(1));
     params.stride_seq_dO = static_cast<int32_t>(dO.stride(1));
-    params.stride_seq_dQ = static_cast<int32_t>(dQ.stride(1));
     params.stride_seq_dK = static_cast<int32_t>(dK.stride(1));
     params.stride_seq_dV = static_cast<int32_t>(dV.stride(1));
 
     params.stride_h_q = static_cast<int32_t>(query.stride(2));
     params.stride_h_k = static_cast<int32_t>(key.stride(2));
     params.stride_h_v = static_cast<int32_t>(value.stride(2));
-    params.stride_h_o = static_cast<int32_t>(output.stride(2));
     params.stride_h_dO = static_cast<int32_t>(dO.stride(2));
-    params.stride_h_dQ = static_cast<int32_t>(dQ.stride(2));
     params.stride_h_dK = static_cast<int32_t>(dK.stride(2));
     params.stride_h_dV = static_cast<int32_t>(dV.stride(2));
   }
@@ -180,33 +166,27 @@ inline Params prepare_params(const Tensor &query,
     params.seq_len = static_cast<int32_t>(query.size(2));
     CHECK_SHAPE(key, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
     CHECK_SHAPE(value, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
-    CHECK_SHAPE(output, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
     CHECK_SHAPE(dO, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
-    CHECK_SHAPE(dQ, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
     CHECK_SHAPE(dK, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
     CHECK_SHAPE(dV, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
 
     params.stride_seq_q = static_cast<int32_t>(query.stride(2));
     params.stride_seq_k = static_cast<int32_t>(key.stride(2));
     params.stride_seq_v = static_cast<int32_t>(value.stride(2));
-    params.stride_seq_o = static_cast<int32_t>(output.stride(2));
     params.stride_seq_dO = static_cast<int32_t>(dO.stride(2));
-    params.stride_seq_dQ = static_cast<int32_t>(dQ.stride(2));
     params.stride_seq_dK = static_cast<int32_t>(dK.stride(2));
     params.stride_seq_dV = static_cast<int32_t>(dV.stride(2));
 
     params.stride_h_q = static_cast<int32_t>(query.stride(1));
     params.stride_h_k = static_cast<int32_t>(key.stride(1));
     params.stride_h_v = static_cast<int32_t>(value.stride(1));
-    params.stride_h_o = static_cast<int32_t>(output.stride(1));
     params.stride_h_dO = static_cast<int32_t>(dO.stride(1));
-    params.stride_h_dQ = static_cast<int32_t>(dQ.stride(1));
     params.stride_h_dK = static_cast<int32_t>(dK.stride(1));
     params.stride_h_dV = static_cast<int32_t>(dV.stride(1));
   }
 
-  const int32_t q_scale_blocks = div_ceil_int(params.seq_len, static_cast<int32_t>(blk_q));
-  const int32_t k_scale_blocks = div_ceil_int(params.seq_len, static_cast<int32_t>(blk_k));
+  const int32_t q_scale_blocks = div_ceil_int(params.seq_len, 32);
+  const int32_t k_scale_blocks = div_ceil_int(params.seq_len, 64);
   const int32_t q_summary_blocks = div_ceil_int(params.seq_len, 32);
   const int32_t k_summary_blocks = div_ceil_int(params.seq_len, 64);
   CHECK_SHAPE(delta, params.batch_size, params.num_heads, params.seq_len);
@@ -232,7 +212,6 @@ void launch_mma(const Tensor &query,
                     const Tensor &query_scale,
                     const Tensor &key_scale,
                     const Tensor &value,
-                    const Tensor &output,
                     const Tensor &dO,
                     const Tensor &lse,
                     const Tensor &delta,
@@ -241,19 +220,13 @@ void launch_mma(const Tensor &query,
                     const Tensor &dO_scale,
                     const Tensor &dS_q_factors,
                     const Tensor &dS_k_factors,
-                    const Tensor &dQ,
                     const Tensor &dK,
                     const Tensor &dV,
                     const Params &params,
                     const double sm_scale)
 {
-  static_assert(
-    HeadDim == 64 && BlockM == 64 && BlockN == 128 && NumWarps == 8,
-    "Only the focused head-64 64x128 backward matmul configuration is built");
-  static_assert(
-    QuantBlockQ == 32 && QuantBlockK == 64,
-    "Focused backward A/B uses the selected QBlock=32/KBlock=64 quantization format");
-  using MicroTraits = BwdTileTraits<64>;
+  static_assert(HeadDim == 64 && BlockM == 64 && BlockN == 128 && NumWarps == 8, "Only the focused head-64 64x128 backward matmul configuration is built");
+  static_assert(QuantBlockQ == 32 && QuantBlockK == 64, "Focused backward A/B uses the selected QBlock=32/KBlock=64 quantization format");
   constexpr int32_t kKernelWarps = NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;
   const auto device_guard = make_device_guard(query);
@@ -301,7 +274,6 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const Tensor &query_scale,
                                                const Tensor &key_scale,
                                                const Tensor &value,
-                                               const Tensor &output,
                                                const Tensor &dO,
                                                const Tensor &lse,
                                                const Tensor &delta,
@@ -310,7 +282,6 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const Tensor &dO_scale,
                                                const Tensor &dS_q_factors,
                                                const Tensor &dS_k_factors,
-                                               const Tensor &dQ,
                                                const Tensor &dK,
                                                const Tensor &dV,
                                                const int64_t tensor_layout,
@@ -323,10 +294,8 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
   namespace bwd = sageattention::qattn_cutlass_bwd;
 
   const auto layout = bwd::parse_tensor_layout(tensor_layout);
-  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, output, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dQ, dK, dV, layout, blk_q, blk_k, bwd_block_m, bwd_block_n);
-  STD_TORCH_CHECK(params.head_dim == 64,
-                  "Focused CUTLASS qattn backward currently supports head_dim 64 only");
+  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, layout, blk_q, blk_k, bwd_block_m, bwd_block_n);
 
-  bwd::launch_configured_mma(query, key, query_scale, key_scale, value, output, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dQ, dK, dV, params, sm_scale);
+  bwd::launch_configured_mma(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale);
 }
 #endif

@@ -6,14 +6,26 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import torch
+from flash_attn import flash_attn_func
 
 from sageattention.cuda_attn import _sageattn_configured
 from sageattention.cuda_compile import _qattn_sm80
-from sageattention.cutlass_attn import _sageattn_cutlass_configured
+from sageattention.cutlass_attn import _CUTLASS_QK_QUANT_CONFIG, _sageattn_cutlass_configured
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
+from sageattention.triton.quant_per_block import per_block_int8
 from sageattention.triton.quant_per_thread import per_thread_int8
 
 BlockConfig = tuple[int, int, int, int]
+PreparedKernelInputs = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    float,
+]
 
 _DEFAULT_BLOCK_CONFIGS: tuple[BlockConfig, ...] = (
     (128, 64, 32, 64),
@@ -72,8 +84,16 @@ def _make_qkv(
     return q, k, v
 
 
+def _to_nhd(tensor: torch.Tensor, layout: str) -> torch.Tensor:
+    return tensor.transpose(1, 2).contiguous() if layout == "HND" else tensor
+
+
+def _flash_end_to_end(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return flash_attn_func(q, k, v, dropout_p=0.0, causal=False)
+
+
 def _cuda_end_to_end(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig, smooth_k: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig
 ) -> torch.Tensor:
     return _sageattn_configured(
         q,
@@ -82,7 +102,7 @@ def _cuda_end_to_end(
         layout,
         False,
         "fp32",
-        smooth_k,
+        False,
         False,
         False,
         block_config,
@@ -90,14 +110,14 @@ def _cuda_end_to_end(
 
 
 def _cutlass_end_to_end(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig, smooth_k: bool
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig
 ) -> torch.Tensor:
     return _sageattn_cutlass_configured(
         q,
         k,
         v,
         layout,
-        smooth_k,
+        False,
         False,
         block_config,
     )
@@ -109,28 +129,32 @@ def _prequantized_inputs(
     v: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
-    smooth_k: bool,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, float
-]:
+    per_block_quantization: bool,
+) -> PreparedKernelInputs:
     blk_q, blk_k, warp_q, warp_k = block_config
-    seq_dim = 2 if layout == "HND" else 1
-    k_mean = k.mean(dim=seq_dim, keepdim=True) if smooth_k else None
-    q_int8, q_scale, k_int8, k_scale = per_thread_int8(
-        q,
-        k,
-        km=k_mean,
-        BLKQ=blk_q,
-        WARPQ=warp_q,
-        BLKK=blk_k,
-        WARPK=warp_k,
-        tensor_layout=layout,
-    )
-    out_cuda = torch.empty_like(q)
-    out_cutlass = torch.empty_like(q)
-    layout_i = 1 if layout == "HND" else 0
-    sm_scale = q.size(-1) ** -0.5
-    return q_int8, k_int8, v, out_cuda, out_cutlass, q_scale, k_scale, layout_i, sm_scale
+    k_mean = None
+    if per_block_quantization:
+        quant_blk_q, quant_blk_k = _CUTLASS_QK_QUANT_CONFIG
+        q_int8, q_scale, k_int8, k_scale = per_block_int8(
+            q,
+            k,
+            km=k_mean,
+            BLKQ=quant_blk_q,
+            BLKK=quant_blk_k,
+            tensor_layout=layout,
+        )
+    else:
+        q_int8, q_scale, k_int8, k_scale = per_thread_int8(
+            q,
+            k,
+            km=k_mean,
+            BLKQ=blk_q,
+            WARPQ=warp_q,
+            BLKK=blk_k,
+            WARPK=warp_k,
+            tensor_layout=layout,
+        )
+    return q_int8, k_int8, v, torch.empty_like(q), q_scale, k_scale, 1 if layout == "HND" else 0, q.size(-1) ** -0.5
 
 
 def _cuda_kernel_only(
@@ -201,6 +225,15 @@ def _rel_error(actual: torch.Tensor, expected: torch.Tensor) -> tuple[float, flo
     return rel, max_abs
 
 
+def _forward_flops(batch_size: int, num_heads: int, seq_len: int, head_dim: int) -> int:
+    # QK^T and PV each perform 2 * B * H * N^2 * D effective FLOPs.
+    return 4 * batch_size * num_heads * head_dim * seq_len * seq_len
+
+
+def _tflops(flops: int, time_ms: float) -> float:
+    return flops / time_ms * 1.0e-9
+
+
 def _format_block_config(config: BlockConfig) -> str:
     return f"{config[0]}x{config[1]}x{config[2]}x{config[3]}"
 
@@ -217,10 +250,12 @@ def _write_rows(path: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def _print_row(row: dict[str, object]) -> None:
     print(
-        "{kind},{head_dim},{seq_len},{num_heads},{block_config},{cuda_ms:.4f},{cuda_mean_ms:.4f},{cuda_stdev_ms:.4f},"
-        "{cutlass_ms:.4f},{cutlass_mean_ms:.4f},{cutlass_stdev_ms:.4f},{cutlass_vs_cuda:.3f},{rel_err:.4g},{max_abs:.4g}".format(
-            **row
-        )
+        "{kind},{head_dim},{seq_len},{num_heads},{block_config},{forward_flops},"
+        "{flash_ms:.4f},{flash_mean_ms:.4f},{flash_stdev_ms:.4f},{flash_tflops:.3f},"
+        "{cuda_ms:.4f},{cuda_mean_ms:.4f},{cuda_stdev_ms:.4f},{cuda_tflops:.3f},"
+        "{cutlass_ms:.4f},{cutlass_mean_ms:.4f},{cutlass_stdev_ms:.4f},{cutlass_tflops:.3f},"
+        "{cutlass_vs_cuda:.3f},"
+        "{cutlass_vs_flash:.3f},{cutlass_speedup_vs_flash:.3f},{rel_err:.4g},{max_abs:.4g}".format(**row)
     )
 
 
@@ -231,7 +266,7 @@ def _benchmark_case(
     v: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
-    smooth_k: bool,
+    flash_stats: dict[str, float],
     warmup: int,
     repeats: int,
     include_end_to_end: bool,
@@ -241,11 +276,12 @@ def _benchmark_case(
     head_dim = q.size(-1)
     seq_len = q.size(2) if layout == "HND" else q.size(1)
     num_heads = q.size(1) if layout == "HND" else q.size(2)
+    flops = _forward_flops(q.size(0), num_heads, seq_len, head_dim)
     block_config_text = _format_block_config(block_config)
 
     if include_end_to_end:
-        out_cuda = _cuda_end_to_end(q, k, v, layout, block_config, smooth_k)
-        out_cutlass = _cutlass_end_to_end(q, k, v, layout, block_config, smooth_k)
+        out_cuda = _cuda_end_to_end(q, k, v, layout, block_config)
+        out_cutlass = _cutlass_end_to_end(q, k, v, layout, block_config)
         rel_err, max_abs = _rel_error(out_cutlass, out_cuda)
         cuda_stats = _bench(
             _cuda_end_to_end,
@@ -254,7 +290,6 @@ def _benchmark_case(
             v,
             layout,
             block_config,
-            smooth_k,
             warmup=warmup,
             repeats=repeats,
         )
@@ -265,7 +300,6 @@ def _benchmark_case(
             v,
             layout,
             block_config,
-            smooth_k,
             warmup=warmup,
             repeats=repeats,
         )
@@ -276,50 +310,44 @@ def _benchmark_case(
                 "seq_len": seq_len,
                 "num_heads": num_heads,
                 "block_config": block_config_text,
+                "forward_flops": flops,
+                "flash_ms": flash_stats["median_ms"],
+                "flash_mean_ms": flash_stats["mean_ms"],
+                "flash_stdev_ms": flash_stats["stdev_ms"],
+                "flash_tflops": _tflops(flops, flash_stats["median_ms"]),
                 "cuda_ms": cuda_stats["median_ms"],
                 "cuda_mean_ms": cuda_stats["mean_ms"],
                 "cuda_stdev_ms": cuda_stats["stdev_ms"],
+                "cuda_tflops": _tflops(flops, cuda_stats["median_ms"]),
                 "cutlass_ms": cutlass_stats["median_ms"],
                 "cutlass_mean_ms": cutlass_stats["mean_ms"],
                 "cutlass_stdev_ms": cutlass_stats["stdev_ms"],
+                "cutlass_tflops": _tflops(flops, cutlass_stats["median_ms"]),
                 "cutlass_vs_cuda": cutlass_stats["median_ms"] / cuda_stats["median_ms"],
+                "cutlass_vs_flash": cutlass_stats["median_ms"] / flash_stats["median_ms"],
+                "cutlass_speedup_vs_flash": flash_stats["median_ms"] / cutlass_stats["median_ms"],
                 "rel_err": rel_err,
                 "max_abs": max_abs,
             }
         )
 
     if include_kernel_only:
-        q_int8, k_int8, v_pq, out_cuda, out_cutlass, q_scale, k_scale, layout_i, sm_scale = _prequantized_inputs(
-            q, k, v, layout, block_config, smooth_k
-        )
-        _cuda_kernel_only(q_int8, k_int8, v_pq, out_cuda, q_scale, k_scale, layout_i, sm_scale, block_config)
-        _cutlass_kernel_only(q_int8, k_int8, v_pq, out_cutlass, q_scale, k_scale, layout_i, sm_scale, block_config)
+        cuda_inputs = _prequantized_inputs(q, k, v, layout, block_config, False)
+        cutlass_inputs = _prequantized_inputs(q, k, v, layout, block_config, True)
+        _cuda_kernel_only(*cuda_inputs, block_config)
+        _cutlass_kernel_only(*cutlass_inputs, block_config)
         torch.cuda.synchronize()
-        rel_err, max_abs = _rel_error(out_cutlass, out_cuda)
+        rel_err, max_abs = _rel_error(cutlass_inputs[3], cuda_inputs[3])
         cuda_stats = _bench(
             _cuda_kernel_only,
-            q_int8,
-            k_int8,
-            v_pq,
-            out_cuda,
-            q_scale,
-            k_scale,
-            layout_i,
-            sm_scale,
+            *cuda_inputs,
             block_config,
             warmup=warmup,
             repeats=repeats,
         )
         cutlass_stats = _bench(
             _cutlass_kernel_only,
-            q_int8,
-            k_int8,
-            v_pq,
-            out_cutlass,
-            q_scale,
-            k_scale,
-            layout_i,
-            sm_scale,
+            *cutlass_inputs,
             block_config,
             warmup=warmup,
             repeats=repeats,
@@ -331,13 +359,22 @@ def _benchmark_case(
                 "seq_len": seq_len,
                 "num_heads": num_heads,
                 "block_config": block_config_text,
+                "forward_flops": flops,
+                "flash_ms": flash_stats["median_ms"],
+                "flash_mean_ms": flash_stats["mean_ms"],
+                "flash_stdev_ms": flash_stats["stdev_ms"],
+                "flash_tflops": _tflops(flops, flash_stats["median_ms"]),
                 "cuda_ms": cuda_stats["median_ms"],
                 "cuda_mean_ms": cuda_stats["mean_ms"],
                 "cuda_stdev_ms": cuda_stats["stdev_ms"],
+                "cuda_tflops": _tflops(flops, cuda_stats["median_ms"]),
                 "cutlass_ms": cutlass_stats["median_ms"],
                 "cutlass_mean_ms": cutlass_stats["mean_ms"],
                 "cutlass_stdev_ms": cutlass_stats["stdev_ms"],
+                "cutlass_tflops": _tflops(flops, cutlass_stats["median_ms"]),
                 "cutlass_vs_cuda": cutlass_stats["median_ms"] / cuda_stats["median_ms"],
+                "cutlass_vs_flash": cutlass_stats["median_ms"] / flash_stats["median_ms"],
+                "cutlass_speedup_vs_flash": flash_stats["median_ms"] / cutlass_stats["median_ms"],
                 "rel_err": rel_err,
                 "max_abs": max_abs,
             }
@@ -347,7 +384,7 @@ def _benchmark_case(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark existing CUDA qattn forward against CUTLASS qattn forward.")
+    parser = argparse.ArgumentParser(description="Benchmark FlashAttention and SageAttention forward paths.")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-heads", nargs="+", type=int, default=[16, 32])
     parser.add_argument("--seq-lens", nargs="+", type=int, default=[2048, 4096, 8192])
@@ -360,7 +397,6 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
-    parser.add_argument("--smooth-k", action="store_true")
     parser.add_argument("--mode", choices=["all", "end-to-end", "kernel-only"], default="all")
     parser.add_argument("--csv", type=Path, help="Optional path to write benchmark rows as CSV.")
     args = parser.parse_args()
@@ -376,12 +412,18 @@ def main() -> None:
     print(f"device={props.name} capability=sm{props.major}{props.minor}")
     print(
         f"batch={args.batch_size} heads={args.num_heads} layout={args.layout} "
-        f"smooth_k={args.smooth_k} warmup={args.warmup} repeats={args.repeats}"
+        f"smooth_k=False warmup={args.warmup} repeats={args.repeats}"
     )
-    print("primary timing columns cuda_ms/cutlass_ms report medians")
+    print("primary timing columns flash_ms/cutlass_ms report medians; CUDA columns are reference diagnostics")
+    print("CUTLASS uses Q32/K64 metadata for head dimensions 64 and 128")
+    print("FlashAttention baseline=library-selected best available kernel; it is not forced to the Sage block shape")
+    print("TFLOPS use 4*batch*heads*head_dim*seq_len^2 effective dense forward FLOPs and median CUDA-event time")
     print(
-        "kind,head_dim,seq_len,num_heads,block_config,cuda_ms,cuda_mean_ms,cuda_stdev_ms,"
-        "cutlass_ms,cutlass_mean_ms,cutlass_stdev_ms,cutlass_vs_cuda,rel_err,max_abs"
+        "kind,head_dim,seq_len,num_heads,block_config,forward_flops,"
+        "flash_ms,flash_mean_ms,flash_stdev_ms,flash_tflops,"
+        "cuda_ms,cuda_mean_ms,cuda_stdev_ms,cuda_tflops,"
+        "cutlass_ms,cutlass_mean_ms,cutlass_stdev_ms,cutlass_tflops,"
+        "cutlass_vs_cuda,cutlass_vs_flash,cutlass_speedup_vs_flash,rel_err,max_abs"
     )
 
     rows: list[dict[str, object]] = []
@@ -389,6 +431,14 @@ def main() -> None:
         for head_dim in args.head_dims:
             for seq_len in args.seq_lens:
                 q, k, v = _make_qkv(args.batch_size, num_heads, seq_len, head_dim, args.layout)
+                flash_stats = _bench(
+                    _flash_end_to_end,
+                    _to_nhd(q, args.layout),
+                    _to_nhd(k, args.layout),
+                    _to_nhd(v, args.layout),
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                )
                 for block_config in block_configs:
                     case_rows = _benchmark_case(
                         q=q,
@@ -396,7 +446,7 @@ def main() -> None:
                         v=v,
                         layout=args.layout,
                         block_config=block_config,
-                        smooth_k=args.smooth_k,
+                        flash_stats=flash_stats,
                         warmup=args.warmup,
                         repeats=args.repeats,
                         include_end_to_end=include_end_to_end,

@@ -2,9 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sageattention.cutlass_bwd import _BWD_CONFIG, _sageattn_cutlass_bwd_configured
+from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
 
-_BWD_TEST_CANDIDATES = (_BWD_CONFIG,)
+_BWD_TEST_CANDIDATES = _BWD_CONFIGS
 
 
 def _make_qkvo(

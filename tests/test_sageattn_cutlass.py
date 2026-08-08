@@ -18,6 +18,11 @@ _MODES = tuple(
     )
 )
 
+_TEST_CASES = (
+    pytest.param((2, 16, 1024), (0.013, 0.08, 0.0003, 0.05), id="aligned"),
+    pytest.param((1, 2, 129), (0.04, 0.20, 0.003, 0.20), id="tail"),
+)
+
 
 def _valid_cases():
     device_index = torch.cuda.current_device()
@@ -39,11 +44,21 @@ def _run_case(
     pv_accum_dtype: str,
     smooth_k: bool,
     return_lse: bool,
+    shape: tuple[int, int, int],
+    tolerances: tuple[float, float, float, float],
 ) -> tuple[bool, str]:
     cutlass_attn = pytest.importorskip(
         "sageattention.cutlass_attn", reason="sageattention CUTLASS qattn kernel is not installed"
     )
-    q, k, v = _make_qkv(head_dim=head_dim, tensor_layout=tensor_layout, dtype=dtype)
+    batch_size, num_heads, seq_len = shape
+    q, k, v = _make_qkv(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        tensor_layout=tensor_layout,
+        dtype=dtype,
+    )
     expected = _expected(q, k, v, tensor_layout, is_causal, return_lse)
 
     actual = cutlass_attn._sageattn_cutlass_configured(
@@ -55,13 +70,24 @@ def _run_case(
         return_lse,
         config,
     )
-    return _attention_report(actual, expected)
+    rtol, atol, lse_rtol, lse_atol = tolerances
+    return _attention_report(
+        actual,
+        expected,
+        rtol=rtol,
+        atol=atol,
+        lse_rtol=lse_rtol,
+        lse_atol=lse_atol,
+    )
 
 
 @pytest.mark.parametrize(("config", "mode"), _valid_cases())
-def test_sageattn_cutlass_autotune_config(
+@pytest.mark.parametrize(("shape", "tolerances"), _TEST_CASES)
+def test_sageattn_cutlass_config_matches_flashattention(
     config: tuple[int, int, int, int],
     mode: tuple[int, torch.dtype, str, bool, str, bool, bool],
+    shape: tuple[int, int, int],
+    tolerances: tuple[float, float, float, float],
 ) -> None:
-    passed, msg = _run_case(config, *mode)
+    passed, msg = _run_case(config, *mode, shape, tolerances)
     assert passed, msg

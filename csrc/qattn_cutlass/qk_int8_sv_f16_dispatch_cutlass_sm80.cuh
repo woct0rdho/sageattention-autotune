@@ -9,7 +9,6 @@
 #include <torch/headeronly/util/Exception.h>
 
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -161,17 +160,16 @@ inline LaunchParams prepare_launch_params(const Tensor &query,
   }
 
   STD_TORCH_CHECK(params.head_dim == 64 || params.head_dim == 128, "CUTLASS qattn currently supports head_dim 64 or 128");
+  STD_TORCH_CHECK(params.qo_len > 0 && params.kv_len > 0, "CUTLASS qattn requires positive sequence lengths");
   STD_TORCH_CHECK(params.num_qo_heads % params.num_kv_heads == 0, "num_qo_heads must be divisible by num_kv_heads");
   params.num_kv_groups = params.num_qo_heads / params.num_kv_heads;
 
-  CHECK_SHAPE(query_scale,
-              params.batch_size,
-              params.num_qo_heads,
-              ceil_div_int(params.qo_len, params.blk_q) * (params.blk_q / params.warp_q) * 8);
-  CHECK_SHAPE(key_scale,
-              params.batch_size,
-              params.num_kv_heads,
-              ceil_div_int(params.kv_len, params.blk_k) * (params.blk_k / params.warp_k) * 4);
+  constexpr int32_t kQuantBlockQ = 32;
+  constexpr int32_t kQuantBlockK = 64;
+  STD_TORCH_CHECK(params.blk_q % kQuantBlockQ == 0 && kQuantBlockQ % params.warp_q == 0, "CUTLASS forward requires Q32 scales aligned to CTA and warp rows");
+  STD_TORCH_CHECK(kQuantBlockK % params.blk_k == 0 && params.warp_k == params.blk_k, "CUTLASS forward requires K64 scales aligned to CTA and warp columns");
+  CHECK_SHAPE(query_scale, params.batch_size, params.num_qo_heads, ceil_div_int(params.qo_len, kQuantBlockQ));
+  CHECK_SHAPE(key_scale, params.batch_size, params.num_kv_heads, ceil_div_int(params.kv_len, kQuantBlockK));
 
   return params;
 }

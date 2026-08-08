@@ -45,7 +45,6 @@ def _signature(
   const torch::stable::Tensor &query_scale,
   const torch::stable::Tensor &key_scale,
   const torch::stable::Tensor &value,
-  const torch::stable::Tensor &output,
   const torch::stable::Tensor &dO,
   const torch::stable::Tensor &lse,
   const torch::stable::Tensor &delta,
@@ -54,7 +53,6 @@ def _signature(
   const torch::stable::Tensor &dO_scale,
   const torch::stable::Tensor &dS_q_factors,
   const torch::stable::Tensor &dS_k_factors,
-  const torch::stable::Tensor &dQ,
   const torch::stable::Tensor &dK,
   const torch::stable::Tensor &dV,
   const Params &params,
@@ -86,7 +84,7 @@ def _dispatch_config(head_dim: int, config: tuple[int, int, int, int, int]) -> s
     return f"""\
       if (params.blk_q == {blk_q} && params.blk_k == {blk_k} && params.bwd_block_m == {block_m} && params.bwd_block_n == {block_n})
       {{
-        launch_mma<{head_dim}, {block_m}, {block_n}, {num_warps}, {blk_q}, {blk_k}>(query, key, query_scale, key_scale, value, output, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dQ, dK, dV, params, sm_scale);
+        launch_mma<{head_dim}, {block_m}, {block_n}, {num_warps}, {blk_q}, {blk_k}>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale);
         return;
       }}"""
 
@@ -128,7 +126,6 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &query_scale,
                                   const torch::stable::Tensor &key_scale,
                                   const torch::stable::Tensor &value,
-                                  const torch::stable::Tensor &output,
                                   const torch::stable::Tensor &dO,
                                   const torch::stable::Tensor &lse,
                                   const torch::stable::Tensor &delta,
@@ -137,7 +134,6 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &dO_scale,
                                   const torch::stable::Tensor &dS_q_factors,
                                   const torch::stable::Tensor &dS_k_factors,
-                                  const torch::stable::Tensor &dQ,
                                   const torch::stable::Tensor &dK,
                                   const torch::stable::Tensor &dV,
                                   const Params &params,

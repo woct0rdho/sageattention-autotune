@@ -249,15 +249,9 @@ struct Params {
   int32_t stride_bz_v;
   int32_t stride_seq_v;
   int32_t stride_h_v;
-  int32_t stride_bz_o;
-  int32_t stride_seq_o;
-  int32_t stride_h_o;
   int32_t stride_bz_dO;
   int32_t stride_seq_dO;
   int32_t stride_h_dO;
-  int32_t stride_bz_dQ;
-  int32_t stride_seq_dQ;
-  int32_t stride_h_dQ;
   int32_t stride_bz_dK;
   int32_t stride_seq_dK;
   int32_t stride_h_dK;
@@ -269,18 +263,6 @@ struct Params {
   int32_t stride_bz_k_scale;
   int32_t stride_h_k_scale;
 };
-
-template <typename ScaleView>
-__device__ __forceinline__ float query_scale_for_row(const ScaleView scale, const Params &params, const int32_t row)
-{
-  return scale(row / params.blk_q);
-}
-
-template <typename ScaleView>
-__device__ __forceinline__ float key_scale_for_row(const ScaleView scale, const Params &params, const int32_t row)
-{
-  return scale(row / params.blk_k);
-}
 
 template <int32_t HeadDim, typename T>
 __device__ __forceinline__ auto make_head_matrix_view(T *const base_ptr,
@@ -559,14 +541,6 @@ __device__ __forceinline__ void load_packed_mma_b_fragment(const Storage &storag
   }
 }
 
-template <typename Tensor>
-__device__ __forceinline__ auto make_transposed_tensor(Tensor tensor)
-{
-  CUTE_STATIC_ASSERT_V(cute::rank(tensor) == cute::_2{});
-  const auto transpose = cute::make_layout(cute::make_shape(cute::size<1>(tensor), cute::size<0>(tensor)), cute::GenRowMajor{});
-  return cute::make_tensor(tensor.data(), cute::composition(tensor.layout(), transpose));
-}
-
 template <typename Traits, typename Accum, typename Gmem>
 __device__ __forceinline__ void store_dKV_fragment_coalesced(const Accum &accum_frag,
                                                              const int32_t dim_block,
@@ -610,81 +584,11 @@ __device__ __forceinline__ void store_dKV_fragment_coalesced(const Accum &accum_
   __syncwarp();
 }
 
-template <typename Traits, typename Accum, typename Gmem>
-__device__ __forceinline__ void accumulate_dQ_fragment_warp_shuffle(const Accum &accum_frag,
-                                                                    const float scale,
-                                                                    Gmem dst,
-                                                                    const int32_t row_base,
-                                                                    const int32_t dim_base,
-                                                                    const int32_t seq_len,
-                                                                    const int32_t lane_id)
-{
-  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
-#pragma unroll
-  for (int32_t target_idx = 0; target_idx < 8; ++target_idx)
-  {
-    const int32_t source_group = (target_idx >= 4 ? 2 : 0) + ((target_idx & 1) != 0 ? 4 : 0);
-    const int32_t row_local = target_idx / 2 * 4 + lane_id / 8;
-    const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
-    const int32_t source_lane = (row_local & 7) * 4 + (dim_local & 7) / 2;
-    const float source_even = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group)), source_lane);
-    const float source_odd = __shfl_sync(0xffffffffu, static_cast<float>(accum_frag(source_group + 1)), source_lane);
-    const float value = (dim_local & 1) == 0 ? source_even : source_odd;
-    const int32_t row = row_base + row_local;
-    if (row < seq_len)
-    {
-      atomicAdd(&dst(row, dim_base + dim_local), value * scale);
-    }
-  }
-}
-
 __device__ __forceinline__ int32_t dQ_stage_offset(const int32_t row, const int32_t col)
 {
   const int32_t deinterleaved_col = ((col & 1) << 3) | (col >> 1);
   const int32_t physical_col = deinterleaved_col ^ (((row >> 1) & 3) << 2);
   return row * 16 + physical_col;
-}
-
-template <bool IsAligned, typename Traits, typename Accum>
-__device__ __forceinline__ void accumulate_dQ_fragment_shared_contiguous(const Accum &accum_frag,
-                                                                         const float scale,
-                                                                         float *const smem_stage,
-                                                                         float *const dst,
-                                                                         const int32_t row_base,
-                                                                         const int32_t dim_base,
-                                                                         const int32_t seq_len,
-                                                                         const int32_t lane_id)
-{
-  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
-#pragma unroll
-  for (int32_t idx = 0; idx < cute::size(accum_frag); ++idx)
-  {
-    const int32_t row_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
-    const int32_t dim_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
-    smem_stage[dQ_stage_offset(row_local, dim_local)] = static_cast<float>(accum_frag(idx)) * scale;
-  }
-  __syncwarp();
-
-  const int32_t lane_row = row_base + lane_id / 8;
-  float *const lane_dst = dst + lane_row * Traits::kHeadDim + dim_base + lane_id % 8;
-#pragma unroll
-  for (int32_t target_idx = 0; target_idx < 8; ++target_idx)
-  {
-    constexpr int32_t kRowsPerTargetPair = 4;
-    const int32_t target_pair = target_idx / 2;
-    const int32_t row_local = target_pair * kRowsPerTargetPair + lane_id / 8;
-    const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
-    const float value = smem_stage[dQ_stage_offset(row_local, dim_local)];
-    const int32_t row = lane_row + target_pair * kRowsPerTargetPair;
-    if (IsAligned || row < seq_len)
-    {
-      constexpr int32_t kPairColumnOffset = 8;
-      atomicAdd(
-        lane_dst + target_pair * kRowsPerTargetPair * Traits::kHeadDim + (target_idx & 1) * kPairColumnOffset,
-        value);
-    }
-  }
-  __syncwarp();
 }
 
 template <bool IsAligned, typename Traits, typename Accum>
