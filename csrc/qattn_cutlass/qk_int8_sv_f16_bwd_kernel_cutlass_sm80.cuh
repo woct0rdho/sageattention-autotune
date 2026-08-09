@@ -1011,6 +1011,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     constexpr auto dS_tile_shape = cute::make_shape(cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
     auto tdVP = cute::make_tensor<typename Traits::ScoreMMA::FrgTypeA>(cute::partition_shape_A(score_mma, dS_tile_shape));
     auto tdKdS = cute::make_tensor<typename Traits::ScoreMMA::FrgTypeA>(cute::partition_shape_A(score_mma, dS_tile_shape));
+    // Pack both temporal M halves into one swizzled 16x64 int8 parent per N32 pair.
     {
       auto rP = cute::make_fragment_like<int8_t>(acc_score_0);
       auto rdS = cute::make_fragment_like<int8_t>(acc_score_0);
@@ -1034,7 +1035,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       transpose_score_c_fragment_to_mma_a<0>(rP, tdVP, lane_id);
       transpose_score_c_fragment_to_mma_a<0>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
-      const int32_t dS_slot = 2 * n_pair;
+      const int32_t dS_slot = n_pair;
       auto sWarpScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
       auto sWarpScratch = cute::recast<int8_t>(sWarpScratchStorage);
       auto sdSMirror = cute::local_tile(sWarpScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
@@ -1064,10 +1065,10 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       transpose_score_c_fragment_to_mma_a<1>(rP, tdVP, lane_id);
       transpose_score_c_fragment_to_mma_a<1>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
-      const int32_t dS_slot = 2 * n_pair + 1;
+      const int32_t dS_slot = n_pair;
       auto sWarpScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
       auto sWarpScratch = cute::recast<int8_t>(sWarpScratchStorage);
-      auto sdSMirror = cute::local_tile(sWarpScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
+      auto sdSMirror = cute::local_tile(sWarpScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_1{}));
       auto sdSMirrorHalf = cute::local_tile(sdSMirror, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
       cute::copy(tiled_copy_score_c, tCrdS, thr_copy_score_c.partition_D(sdSMirrorHalf));
     }
@@ -1163,24 +1164,17 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
             tdQK,
             dQ_pair * kDimBlocks + dim_base / Traits::kBlockK,
             lane_id);
-#pragma unroll
-          for (int32_t m_half = 0; m_half < 2; ++m_half)
-          {
-            const int32_t dQ_dS_slot = 2 * dQ_pair + m_half;
-            auto sdSScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dQ_dS_slot * warp_scratch_offset);
-            auto sdSScratch = cute::recast<int8_t>(sdSScratchStorage);
-            auto sdSdQ = cute::local_tile(sdSScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
-            auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ);
-            cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ), thr_copy_score_a.retile_D(tdQdS));
-            if (m_half == 0)
-            {
-              cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_0);
-            }
-            else
-            {
-              cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_1);
-            }
-          }
+          // Each static 16x32 M-half tile retains the native MMA-A LDSM.x4 contract.
+          const int32_t dQ_dS_slot = dQ_pair;
+          auto sdSScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dQ_dS_slot * warp_scratch_offset);
+          auto sdSScratch = cute::recast<int8_t>(sdSScratchStorage);
+          auto sdSdQ0 = cute::local_tile(sdSScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
+          auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ0);
+          cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ0), thr_copy_score_a.retile_D(tdQdS));
+          cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_0);
+          auto sdSdQ1 = cute::local_tile(sdSScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_1{}));
+          cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ1), thr_copy_score_a.retile_D(tdQdS));
+          cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc_1);
         }
         const int32_t domain_k_factor_unclamped = k_domain_base + domain;
         const int32_t domain_k_factor_index = domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
