@@ -47,10 +47,10 @@ def _preprocess(
     grad_output_bhsd = grad_output_nhd.permute(0, 2, 1, 3)
     value_bhsd = value_nhd.permute(0, 2, 1, 3)
     delta = (output_bhsd * grad_output_bhsd).sum(dim=-1).contiguous()
-    dq_accum = torch.zeros((batch, heads, seq_len, head_dim), device=output.device, dtype=torch.float32)
 
     q_blocks = (seq_len + 31) // 32
     q_padded_len = q_blocks * 32
+    dq_accum = torch.zeros((batch, heads, q_padded_len, head_dim), device=output.device, dtype=torch.float32)
     do_padded = torch.nn.functional.pad(grad_output_bhsd, (0, 0, 0, q_padded_len - seq_len))
     do_tiles = do_padded.reshape(batch, heads, q_blocks, 32, 4, 16)
     do_scale = do_tiles.abs().amax(dim=(-3, -1)) * _INT8_SCALE_INV + _INT8_SCALE_FLOOR
@@ -98,7 +98,6 @@ def main() -> None:
     delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _preprocess(
         output, grad_output, value, args.layout
     )
-    grad_query = torch.empty_like(q)
     grad_key = torch.empty_like(k)
     grad_value = torch.empty_like(value)
     torch.cuda.synchronize()
@@ -110,7 +109,6 @@ def main() -> None:
         q_scale,
         k_scale,
         value,
-        output,
         grad_output,
         lse,
         delta,
@@ -119,7 +117,6 @@ def main() -> None:
         do_scale,
         ds_q_factors,
         ds_k_factors,
-        grad_query,
         grad_key,
         grad_value,
         0 if args.layout == "NHD" else 1,
