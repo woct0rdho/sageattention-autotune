@@ -18,6 +18,7 @@ from flash_attn import flash_attn_func
 from sageattention.cutlass_bwd import sageattn_cutlass_bwd
 from sageattention.triton.cutlass_bwd import preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
+from sageattention.utils import _lse_correction
 
 DATA_DIR = Path(__file__).resolve().parent
 DEFAULT_CAPTURES = (
@@ -138,6 +139,7 @@ def quantization_telemetry(
     reference_grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     actual_grads: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     metadata: dict[str, Any],
+    smooth_k: bool,
 ) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
     seq_len = q.size(1)
     heads = q.size(2)
@@ -147,21 +149,22 @@ def quantization_telemetry(
     k_blocks = math.ceil(seq_len / K_BLOCK)
     p_k_blocks = math.ceil(seq_len / P_K_BLOCK)
 
+    k_mean = k.mean(dim=1, keepdim=True) if smooth_k else None
     q_i8, q_scale, k_i8, k_scale = per_block_int8(
         q,
         k,
-        km=None,
+        km=k_mean,
         BLKQ=Q_BLOCK,
         BLKK=K_BLOCK,
         tensor_layout="NHD",
     )
-    delta, dq_accum, do_i8, do_scale, ds_q_factors, ds_k_factors = preprocess_delta_zero_dq(
+    delta, dq_accum, ds_sum, do_i8, do_scale, ds_q_factors, ds_k_factors = preprocess_delta_zero_dq(
         output,
         dout,
         v,
         "NHD",
     )
-    del dq_accum
+    del dq_accum, ds_sum
 
     q_i8_h = q_i8[0].permute(1, 0, 2).contiguous()
     k_i8_h = k_i8[0].permute(1, 0, 2).contiguous()
@@ -169,7 +172,10 @@ def quantization_telemetry(
     k_scale_h = k_scale[0]
     dout_h = dout[0].permute(1, 0, 2).float()
     value_h = v[0].permute(1, 0, 2).float()
-    lse_h = lse[0].float()
+    kernel_lse = lse
+    if k_mean is not None:
+        kernel_lse = lse - _lse_correction(q, k_mean, "NHD", 2) * sm_scale
+    lse_h = kernel_lse[0].float()
     delta_h = delta[0]
     ds_q_h = ds_q_factors[0]
     ds_k_h = ds_k_factors[0]
@@ -453,7 +459,7 @@ def quantization_telemetry(
         for scale_kind, scale_values in head_scales.items():
             histogram_rows.extend(scale_histogram_rows(scale_values, metadata, head, scale_kind))
 
-    del q_i8, k_i8, q_scale, k_scale, delta, do_i8, do_scale, ds_q_factors, ds_k_factors
+    del q_i8, k_i8, q_scale, k_scale, delta, do_i8, do_scale, ds_q_factors, ds_k_factors, kernel_lse
     del q_i8_h, k_i8_h, p_scale_batches, ds_ratio_batches, stage_accumulators
     return telemetry, histogram_rows
 
@@ -463,6 +469,7 @@ def evaluate_record(
     capture: Path,
     target_seq_len: int,
     max_heads: int | None,
+    smooth_k: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     source_seq_len = int(record["seq_len"])
     available_heads = int(record["heads"])
@@ -495,7 +502,7 @@ def evaluate_record(
         raise RuntimeError("FlashAttention did not produce all reference gradients.")
 
     with torch.inference_mode():
-        dq, dk, dv = sageattn_cutlass_bwd(q, k, v, output.detach(), dout, lse.detach(), "NHD")
+        dq, dk, dv = sageattn_cutlass_bwd(q, k, v, output.detach(), dout, lse.detach(), "NHD", smooth_k=smooth_k)
         histogram_metadata = {
             "capture": capture.name,
             "record_index": int(record["index"]),
@@ -505,6 +512,7 @@ def evaluate_record(
             "heads": heads,
             "sigma_index": int(record.get("sigma_index", -1)),
             "sigma": float(record.get("sigma", float("nan"))),
+            "smooth_k": smooth_k,
         }
         telemetry, histogram_rows = quantization_telemetry(
             q,
@@ -516,6 +524,7 @@ def evaluate_record(
             (q_ref.grad, k_ref.grad, v_ref.grad),
             (dq, dk, dv),
             histogram_metadata,
+            smooth_k,
         )
 
     rows: list[dict[str, Any]] = []
@@ -578,6 +587,7 @@ def main() -> None:
     parser.add_argument("--sequence-lengths", type=int, nargs="+", default=list(DEFAULT_SEQUENCE_LENGTHS))
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--histogram-output", type=Path, default=DEFAULT_HISTOGRAM_OUTPUT)
+    parser.add_argument("--smooth-k", nargs="+", choices=["false", "true"], default=["false", "true"])
     args = parser.parse_args()
 
     if args.max_heads < 0:
@@ -590,6 +600,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
 
     max_heads = args.max_heads or None
+    smooth_k_values = tuple(value == "true" for value in args.smooth_k)
     rows: list[dict[str, Any]] = []
     histogram_rows: list[dict[str, Any]] = []
     for capture in args.captures:
@@ -599,22 +610,23 @@ def main() -> None:
             records = records[: args.max_records]
         for record in records:
             for seq_len in args.sequence_lengths:
-                print(
-                    f"running capture={capture.name} record={record['index']} "
-                    f"source_seq={record['seq_len']} seq={seq_len} "
-                    f"heads={record['heads'] if max_heads is None else min(max_heads, record['heads'])}"
-                )
-                case_rows, case_histograms = evaluate_record(record, capture, seq_len, max_heads)
-                rows.extend(case_rows)
-                histogram_rows.extend(case_histograms)
-                aggregate = case_rows[0]
-                print(
-                    f"  dQ={aggregate['dq_cos']:.6f}/{aggregate['dq_rel']:.5f} "
-                    f"dK={aggregate['dk_cos']:.6f}/{aggregate['dk_rel']:.5f} "
-                    f"dV={aggregate['dv_cos']:.6f}/{aggregate['dv_rel']:.5f} "
-                    f"dS_clip_ppm={1e6 * aggregate['ds_int8_clipping_rate']:.3f} "
-                    f"strict={aggregate['strict_gate_pass']} finite={aggregate['finite']}"
-                )
+                for smooth_k in smooth_k_values:
+                    print(
+                        f"running capture={capture.name} record={record['index']} "
+                        f"source_seq={record['seq_len']} seq={seq_len} smooth_k={smooth_k} "
+                        f"heads={record['heads'] if max_heads is None else min(max_heads, record['heads'])}"
+                    )
+                    case_rows, case_histograms = evaluate_record(record, capture, seq_len, max_heads, smooth_k)
+                    rows.extend(case_rows)
+                    histogram_rows.extend(case_histograms)
+                    aggregate = case_rows[0]
+                    print(
+                        f"  dQ={aggregate['dq_cos']:.6f}/{aggregate['dq_rel']:.5f} "
+                        f"dK={aggregate['dk_cos']:.6f}/{aggregate['dk_rel']:.5f} "
+                        f"dV={aggregate['dv_cos']:.6f}/{aggregate['dv_rel']:.5f} "
+                        f"dS_clip_ppm={1e6 * aggregate['ds_int8_clipping_rate']:.3f} "
+                        f"strict={aggregate['strict_gate_pass']} finite={aggregate['finite']}"
+                    )
 
     write_csv(args.output, rows)
     write_csv(args.histogram_output, histogram_rows)

@@ -342,6 +342,35 @@ __device__ __forceinline__ float warp_reduce_max(float value)
   return __uint_as_float(max_bits);
 }
 
+template <bool IsAligned, typename Fragment>
+__device__ __forceinline__ void accumulate_dS_row_sum(const Fragment &dS,
+                                                       float *const dst,
+                                                       const int32_t row_base,
+                                                       const int32_t seq_len,
+                                                       const int32_t lane_id)
+{
+  static_assert(cute::size(Fragment{}) == 8, "dS row reduction expects eight score-C values per lane");
+  float row_sum_0 = dS(0) + dS(1) + dS(4) + dS(5);
+  float row_sum_1 = dS(2) + dS(3) + dS(6) + dS(7);
+  row_sum_0 += __shfl_xor_sync(0xffffffffu, row_sum_0, 1, 4);
+  row_sum_1 += __shfl_xor_sync(0xffffffffu, row_sum_1, 1, 4);
+  row_sum_0 += __shfl_xor_sync(0xffffffffu, row_sum_0, 2, 4);
+  row_sum_1 += __shfl_xor_sync(0xffffffffu, row_sum_1, 2, 4);
+  if ((lane_id & 3) == 0)
+  {
+    const int32_t row_0 = row_base + lane_id / 4;
+    const int32_t row_1 = row_0 + 8;
+    if (IsAligned || row_0 < seq_len)
+    {
+      atomicAdd(dst + row_0, row_sum_0);
+    }
+    if (IsAligned || row_1 < seq_len)
+    {
+      atomicAdd(dst + row_1, row_sum_1);
+    }
+  }
+}
+
 __device__ __forceinline__ int8_t round_to_int8(const float value)
 {
   int32_t result;
@@ -636,7 +665,8 @@ template <int32_t HeadDim,
           int32_t NumWarps,
           int32_t QuantBlockQ,
           int32_t QuantBlockK,
-          bool IsAligned>
+          bool IsAligned,
+          bool SmoothK>
 __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
                                                              const int8_t *__restrict__ const K,
                                                              const float *__restrict__ const QScale,
@@ -650,6 +680,7 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
                                                              const float *__restrict__ const Lse,
                                                              const float *__restrict__ const Delta,
                                                              float *__restrict__ const dQAccum,
+                                                             float *__restrict__ const dSSum,
                                                              half *__restrict__ const dK,
                                                              half *__restrict__ const dV,
                                                              const Params params,
@@ -691,6 +722,13 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
   const auto gdV = make_head_matrix_view<HeadDim>(dV, params, batch, head, params.stride_bz_dV, params.stride_seq_dV, params.stride_h_dV);
   const auto gLse = make_head_vector_view(Lse, params, batch, head);
   const auto gDelta = make_head_vector_view(Delta, params, batch, head);
+  constexpr int32_t kPaddedSeqLenMultiple = 2 * Traits::kBlockM;
+  const int32_t padded_seq_len = ((params.seq_len + kPaddedSeqLenMultiple - 1) / kPaddedSeqLenMultiple) * kPaddedSeqLenMultiple;
+  float *gdSSum = nullptr;
+  if constexpr (SmoothK)
+  {
+    gdSSum = dSSum + (batch * params.num_heads + head) * padded_seq_len;
+  }
   constexpr int32_t kDimBlocks = HeadDim / Traits::kBlockK;
   constexpr int32_t kdQNPairs = Traits::kCtaN / (2 * Traits::kBlockN);
   constexpr int32_t kQuantDomains = Traits::kCtaN / QuantBlockK;
@@ -1027,6 +1065,19 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
         }
         rPFloat1(idx) = p;
         acc_dp_1(idx) = dS;
+      }
+    }
+    if constexpr (SmoothK)
+    {
+      if (n_valid)
+      {
+        accumulate_dS_row_sum<IsAligned>(acc_dp_0, gdSSum, m_pair_base, params.seq_len, lane_id);
+        accumulate_dS_row_sum<IsAligned>(
+          acc_dp_1,
+          gdSSum,
+          m_pair_base + Traits::kBlockM,
+          params.seq_len,
+          lane_id);
       }
     }
     p_max_abs = warp_reduce_max(p_max_abs);

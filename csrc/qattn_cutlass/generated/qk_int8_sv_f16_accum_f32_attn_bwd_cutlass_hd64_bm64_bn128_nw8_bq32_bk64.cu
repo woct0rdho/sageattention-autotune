@@ -15,6 +15,7 @@ template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &lse,
   const torch::stable::Tensor &delta,
   const torch::stable::Tensor &dQ_accum,
+  const torch::stable::Tensor &dS_sum,
   const torch::stable::Tensor &dO_int8,
   const torch::stable::Tensor &dO_scale,
   const torch::stable::Tensor &dS_q_factors,
@@ -22,6 +23,7 @@ template void launch_mma<64, 64, 128, 8, 32, 64>(
   const torch::stable::Tensor &dK,
   const torch::stable::Tensor &dV,
   const Params &params,
-  double sm_scale);
+  double sm_scale,
+  bool smooth_k);
 
 } // namespace sageattention::qattn_cutlass_bwd

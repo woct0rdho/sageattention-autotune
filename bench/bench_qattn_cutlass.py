@@ -93,7 +93,12 @@ def _flash_end_to_end(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torc
 
 
 def _cuda_end_to_end(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: str,
+    smooth_k: bool,
+    block_config: BlockConfig,
 ) -> torch.Tensor:
     return _sageattn_configured(
         q,
@@ -102,7 +107,7 @@ def _cuda_end_to_end(
         layout,
         False,
         "fp32",
-        False,
+        smooth_k,
         False,
         False,
         block_config,
@@ -110,14 +115,19 @@ def _cuda_end_to_end(
 
 
 def _cutlass_end_to_end(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layout: str, block_config: BlockConfig
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    layout: str,
+    smooth_k: bool,
+    block_config: BlockConfig,
 ) -> torch.Tensor:
     return _sageattn_cutlass_configured(
         q,
         k,
         v,
         layout,
-        False,
+        smooth_k,
         False,
         block_config,
     )
@@ -130,9 +140,11 @@ def _prequantized_inputs(
     layout: str,
     block_config: BlockConfig,
     per_block_quantization: bool,
+    smooth_k: bool,
 ) -> PreparedKernelInputs:
     blk_q, blk_k, warp_q, warp_k = block_config
-    k_mean = None
+    seq_dim = 2 if layout == "HND" else 1
+    k_mean = k.mean(dim=seq_dim, keepdim=True) if smooth_k else None
     if per_block_quantization:
         quant_blk_q, quant_blk_k = _CUTLASS_QK_QUANT_CONFIG
         q_int8, q_scale, k_int8, k_scale = per_block_int8(
@@ -250,7 +262,7 @@ def _write_rows(path: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def _print_row(row: dict[str, object]) -> None:
     print(
-        "{kind},{head_dim},{seq_len},{num_heads},{block_config},{forward_flops},"
+        "{kind},{head_dim},{seq_len},{num_heads},{smooth_k},{block_config},{forward_flops},"
         "{flash_ms:.4f},{flash_mean_ms:.4f},{flash_stdev_ms:.4f},{flash_tflops:.3f},"
         "{cuda_ms:.4f},{cuda_mean_ms:.4f},{cuda_stdev_ms:.4f},{cuda_tflops:.3f},"
         "{cutlass_ms:.4f},{cutlass_mean_ms:.4f},{cutlass_stdev_ms:.4f},{cutlass_tflops:.3f},"
@@ -265,6 +277,7 @@ def _benchmark_case(
     k: torch.Tensor,
     v: torch.Tensor,
     layout: str,
+    smooth_k: bool,
     block_config: BlockConfig,
     flash_stats: dict[str, float],
     warmup: int,
@@ -280,8 +293,8 @@ def _benchmark_case(
     block_config_text = _format_block_config(block_config)
 
     if include_end_to_end:
-        out_cuda = _cuda_end_to_end(q, k, v, layout, block_config)
-        out_cutlass = _cutlass_end_to_end(q, k, v, layout, block_config)
+        out_cuda = _cuda_end_to_end(q, k, v, layout, smooth_k, block_config)
+        out_cutlass = _cutlass_end_to_end(q, k, v, layout, smooth_k, block_config)
         rel_err, max_abs = _rel_error(out_cutlass, out_cuda)
         cuda_stats = _bench(
             _cuda_end_to_end,
@@ -289,6 +302,7 @@ def _benchmark_case(
             k,
             v,
             layout,
+            smooth_k,
             block_config,
             warmup=warmup,
             repeats=repeats,
@@ -299,6 +313,7 @@ def _benchmark_case(
             k,
             v,
             layout,
+            smooth_k,
             block_config,
             warmup=warmup,
             repeats=repeats,
@@ -309,6 +324,7 @@ def _benchmark_case(
                 "head_dim": head_dim,
                 "seq_len": seq_len,
                 "num_heads": num_heads,
+                "smooth_k": smooth_k,
                 "block_config": block_config_text,
                 "forward_flops": flops,
                 "flash_ms": flash_stats["median_ms"],
@@ -332,8 +348,8 @@ def _benchmark_case(
         )
 
     if include_kernel_only:
-        cuda_inputs = _prequantized_inputs(q, k, v, layout, block_config, False)
-        cutlass_inputs = _prequantized_inputs(q, k, v, layout, block_config, True)
+        cuda_inputs = _prequantized_inputs(q, k, v, layout, block_config, False, smooth_k)
+        cutlass_inputs = _prequantized_inputs(q, k, v, layout, block_config, True, smooth_k)
         _cuda_kernel_only(*cuda_inputs, block_config)
         _cutlass_kernel_only(*cutlass_inputs, block_config)
         torch.cuda.synchronize()
@@ -358,6 +374,7 @@ def _benchmark_case(
                 "head_dim": head_dim,
                 "seq_len": seq_len,
                 "num_heads": num_heads,
+                "smooth_k": smooth_k,
                 "block_config": block_config_text,
                 "forward_flops": flops,
                 "flash_ms": flash_stats["median_ms"],
@@ -398,6 +415,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--mode", choices=["all", "end-to-end", "kernel-only"], default="all")
+    parser.add_argument("--smooth-k", nargs="+", choices=["false", "true"], default=["false"])
     parser.add_argument("--csv", type=Path, help="Optional path to write benchmark rows as CSV.")
     args = parser.parse_args()
 
@@ -407,19 +425,20 @@ def main() -> None:
     block_configs = _parse_block_configs(args.block_configs)
     include_end_to_end = args.mode in ("all", "end-to-end")
     include_kernel_only = args.mode in ("all", "kernel-only")
+    smooth_k_values = tuple(value == "true" for value in args.smooth_k)
 
     props = torch.cuda.get_device_properties(0)
     print(f"device={props.name} capability=sm{props.major}{props.minor}")
     print(
         f"batch={args.batch_size} heads={args.num_heads} layout={args.layout} "
-        f"smooth_k=False warmup={args.warmup} repeats={args.repeats}"
+        f"smooth_k={list(smooth_k_values)} warmup={args.warmup} repeats={args.repeats}"
     )
     print("primary timing columns flash_ms/cutlass_ms report medians; CUDA columns are reference diagnostics")
     print("CUTLASS uses Q32/K64 metadata for head dimensions 64 and 128")
     print("FlashAttention baseline=library-selected best available kernel; it is not forced to the Sage block shape")
     print("TFLOPS use 4*batch*heads*head_dim*seq_len^2 effective dense forward FLOPs and median CUDA-event time")
     print(
-        "kind,head_dim,seq_len,num_heads,block_config,forward_flops,"
+        "kind,head_dim,seq_len,num_heads,smooth_k,block_config,forward_flops,"
         "flash_ms,flash_mean_ms,flash_stdev_ms,flash_tflops,"
         "cuda_ms,cuda_mean_ms,cuda_stdev_ms,cuda_tflops,"
         "cutlass_ms,cutlass_mean_ms,cutlass_stdev_ms,cutlass_tflops,"
@@ -439,22 +458,24 @@ def main() -> None:
                     warmup=args.warmup,
                     repeats=args.repeats,
                 )
-                for block_config in block_configs:
-                    case_rows = _benchmark_case(
-                        q=q,
-                        k=k,
-                        v=v,
-                        layout=args.layout,
-                        block_config=block_config,
-                        flash_stats=flash_stats,
-                        warmup=args.warmup,
-                        repeats=args.repeats,
-                        include_end_to_end=include_end_to_end,
-                        include_kernel_only=include_kernel_only,
-                    )
-                    rows.extend(case_rows)
-                    for row in case_rows:
-                        _print_row(row)
+                for smooth_k in smooth_k_values:
+                    for block_config in block_configs:
+                        case_rows = _benchmark_case(
+                            q=q,
+                            k=k,
+                            v=v,
+                            layout=args.layout,
+                            smooth_k=smooth_k,
+                            block_config=block_config,
+                            flash_stats=flash_stats,
+                            warmup=args.warmup,
+                            repeats=args.repeats,
+                            include_end_to_end=include_end_to_end,
+                            include_kernel_only=include_kernel_only,
+                        )
+                        rows.extend(case_rows)
+                        for row in case_rows:
+                            _print_row(row)
 
     if args.csv is not None:
         _write_rows(args.csv, rows)
