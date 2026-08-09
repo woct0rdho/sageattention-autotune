@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
+from sageattention.triton.cutlass_bwd import convert_dq
 
 _BWD_TEST_CANDIDATES = _BWD_CONFIGS
 
@@ -85,6 +86,34 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str, *, for
     assert 1 - cos_sim < (1e-2 if format_experiment else 2e-3), msg
     assert fro_rel_err < (1.5e-1 if format_experiment else 6e-2), msg
     assert max_abs_err < (5e-1 if format_experiment else 2e-1), msg
+
+
+@pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
+def test_cutlass_dq_workspace_conversion(tensor_layout: str) -> None:
+    batch, heads, seq_len, head_dim = 2, 3, 65, 64
+    padded_seq_len = ((seq_len + 31) // 32) * 32
+    dq_accum = (
+        torch.arange(batch * heads * padded_seq_len * head_dim, device="cuda", dtype=torch.float32) % 1000
+    ).reshape(batch, heads, padded_seq_len, head_dim)
+    if tensor_layout == "NHD":
+        grad_query = torch.empty((batch, seq_len, heads, head_dim), device="cuda", dtype=torch.float16)
+    else:
+        grad_query = torch.empty((batch, heads, seq_len, head_dim), device="cuda", dtype=torch.float16)
+
+    rows = torch.arange(seq_len, device="cuda")[:, None]
+    cols = torch.arange(head_dim, device="cuda")[None, :]
+    lane = (rows & 7) * 4 + ((cols & 7) >> 1)
+    value = (cols & 1) | (((rows >> 3) & 1) << 1) | (((cols >> 3) & 1) << 2)
+    physical = (rows >> 4) * (16 * head_dim) + (cols >> 4) * 256 + lane + 32 * value
+    expected_nhd = (
+        dq_accum.reshape(batch, heads, -1)
+        .index_select(2, physical.reshape(-1))
+        .reshape(batch, heads, seq_len, head_dim)
+    )
+    expected = expected_nhd.transpose(1, 2) if tensor_layout == "NHD" else expected_nhd
+
+    convert_dq(dq_accum, grad_query, tensor_layout)
+    torch.testing.assert_close(grad_query, expected.to(torch.float16), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("config", _BWD_TEST_CANDIDATES)

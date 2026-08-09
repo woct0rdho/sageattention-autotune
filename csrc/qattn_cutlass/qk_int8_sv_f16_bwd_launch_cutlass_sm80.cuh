@@ -128,6 +128,8 @@ inline Params prepare_params(const Tensor &query,
     static_cast<int32_t>(key.stride(0)), 0, 0,
     static_cast<int32_t>(value.stride(0)), 0, 0,
     static_cast<int32_t>(dO.stride(0)), 0, 0,
+    static_cast<int32_t>(dQ_accum.stride(0)),
+    static_cast<int32_t>(dQ_accum.stride(1)),
     static_cast<int32_t>(dK.stride(0)), 0, 0,
     static_cast<int32_t>(dV.stride(0)), 0, 0,
     static_cast<int32_t>(query_scale.stride(0)),
@@ -190,7 +192,8 @@ inline Params prepare_params(const Tensor &query,
   const int32_t q_summary_blocks = div_ceil_int(params.seq_len, 32);
   const int32_t k_summary_blocks = div_ceil_int(params.seq_len, 64);
   CHECK_SHAPE(delta, params.batch_size, params.num_heads, params.seq_len);
-  CHECK_SHAPE(dQ_accum, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
+  const int32_t dq_accum_rows = div_ceil_int(params.seq_len, 32) * 32;
+  CHECK_SHAPE(dQ_accum, params.batch_size, params.num_heads, dq_accum_rows, params.head_dim);
   CHECK_SHAPE(dO_int8, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
   CHECK_SHAPE(dO_scale, params.batch_size, params.num_heads, q_summary_blocks, 4);
   CHECK_SHAPE(dS_q_factors, params.batch_size, params.num_heads, q_summary_blocks, 2);

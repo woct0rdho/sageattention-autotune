@@ -99,10 +99,7 @@ def _preprocess_delta_zero_dq_kernel(
     dq_accum_ptrs = (
         DQAccum + off_b * stride_dqab + offs_m[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
     )
-    if IS_EVEN_M:
-        tl.store(dq_accum_ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32))
-    else:
-        tl.store(dq_accum_ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32), mask=mask_m[:, None])
+    tl.store(dq_accum_ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32))
 
     for dim_block in range(DIM_BLOCKS):
         block_d = dim_block * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -187,7 +184,6 @@ def _convert_dq_kernel(
     DQAccum,
     DQ,
     stride_dqab,
-    stride_dqas,
     stride_dqah,
     stride_dqb,
     stride_dqs,
@@ -207,15 +203,29 @@ def _convert_dq_kernel(
     if not IS_EVEN_M:
         mask_m = offs_m < SEQ_LEN
 
-    dq_accum_ptrs = (
-        DQAccum + off_b * stride_dqab + offs_m[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
+    tl.static_assert(BLOCK_M % 16 == 0)
+    tl.static_assert(HEAD_DIM % 16 == 0)
+    physical = tl.arange(0, BLOCK_M * HEAD_DIM)
+    dq_accum_ptrs = DQAccum + off_b * stride_dqab + off_h * stride_dqah + start_m * BLOCK_M * HEAD_DIM + physical
+    dq = tl.load(dq_accum_ptrs)
+    dq = tl.reshape(
+        dq,
+        (
+            BLOCK_M // 16,
+            HEAD_DIM // 16,
+            2,
+            2,
+            2,
+            8,
+            4,
+        ),
     )
+    dq = tl.permute(dq, (0, 3, 5, 1, 2, 6, 4))
+    dq = tl.reshape(dq, (BLOCK_M, HEAD_DIM))
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
     if IS_EVEN_M:
-        dq = tl.load(dq_accum_ptrs)
         tl.store(dq_ptrs, dq.to(DQ.type.element_ty))
     else:
-        dq = tl.load(dq_accum_ptrs, mask=mask_m[:, None], other=0.0)
         tl.store(dq_ptrs, dq.to(DQ.type.element_ty), mask=mask_m[:, None])
 
 
@@ -260,8 +270,9 @@ def preprocess_delta_zero_dq(
 
     q_blocks = triton.cdiv(seq_len, _CUTLASS_BWD_BLOCK_M)
     k_blocks = triton.cdiv(seq_len, _CUTLASS_BWD_K_BLOCK)
+    dq_accum_rows = q_blocks * _CUTLASS_BWD_BLOCK_M
     delta = torch.empty((batch, heads, seq_len), device=output.device, dtype=torch.float32)
-    dq_accum = torch.empty((batch, heads, seq_len, head_dim), device=output.device, dtype=torch.float32)
+    dq_accum = torch.empty((batch, heads, dq_accum_rows, head_dim), device=output.device, dtype=torch.float32)
     do_int8 = torch.empty((batch, heads, seq_len, head_dim), device=output.device, dtype=torch.int8)
     do_scale = torch.empty((batch, heads, q_blocks, _CUTLASS_BWD_DIM_BLOCKS), device=output.device, dtype=torch.float32)
 
@@ -329,21 +340,23 @@ def preprocess_delta_zero_dq(
 
 def convert_dq(dq_accum: torch.Tensor, grad_query: torch.Tensor, tensor_layout: str) -> None:
     if dq_accum.ndim != 4 or dq_accum.dtype != torch.float32 or not dq_accum.is_contiguous():
-        raise ValueError("dq_accum must be a contiguous fp32 [batch, heads, seq_len, head_dim] tensor.")
+        raise ValueError(
+            "dq_accum must be a contiguous fp32 padded [batch, heads, ceil(seq_len / 32) * 32, head_dim] tensor."
+        )
     if grad_query.ndim != 4 or grad_query.dtype != torch.float16 or not grad_query.is_cuda:
         raise ValueError("grad_query must be a CUDA fp16 tensor.")
     batch = grad_query.size(0)
     heads = grad_query.size(1) if tensor_layout == "HND" else grad_query.size(2)
     seq_len = grad_query.size(2) if tensor_layout == "HND" else grad_query.size(1)
     head_dim = grad_query.size(-1)
-    if dq_accum.shape != (batch, heads, seq_len, head_dim):
+    dq_accum_rows = triton.cdiv(seq_len, _CUTLASS_BWD_BLOCK_M) * _CUTLASS_BWD_BLOCK_M
+    if dq_accum.shape != (batch, heads, dq_accum_rows, head_dim):
         raise ValueError("dq_accum shape does not match grad_query.")
 
     _convert_dq_kernel[(triton.cdiv(seq_len, _CUTLASS_BWD_BLOCK_M), heads, batch)](
         dq_accum,
         grad_query,
         dq_accum.stride(0),
-        dq_accum.stride(2),
         dq_accum.stride(1),
         grad_query.stride(0),
         grad_query.stride(2 if tensor_layout == "HND" else 1),
