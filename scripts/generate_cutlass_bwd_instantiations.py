@@ -52,6 +52,7 @@ def _signature(
   const torch::stable::Tensor &lse,
   const torch::stable::Tensor &delta,
   const torch::stable::Tensor &dQ_accum,
+  const torch::stable::Tensor &dS_sum,
   const torch::stable::Tensor &dO_int8,
   const torch::stable::Tensor &dO_scale,
   const torch::stable::Tensor &dS_q_factors,
@@ -59,7 +60,8 @@ def _signature(
   const torch::stable::Tensor &dK,
   const torch::stable::Tensor &dV,
   const Params &params,
-  double sm_scale);"""
+  double sm_scale,
+  bool smooth_k);"""
 
 
 def _generated_source(root: Path, head_dim: int, config: tuple[int, int, int, int, int]) -> Path:
@@ -87,7 +89,7 @@ def _dispatch_config(head_dim: int, config: tuple[int, int, int, int, int]) -> s
     return f"""\
       if (params.blk_q == {blk_q} && params.blk_k == {blk_k} && params.bwd_block_m == {block_m} && params.bwd_block_n == {block_n})
       {{
-        launch_mma<{head_dim}, {block_m}, {block_n}, {num_warps}, {blk_q}, {blk_k}>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale);
+        launch_mma<{head_dim}, {block_m}, {block_n}, {num_warps}, {blk_q}, {blk_k}>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale, smooth_k);
         return;
       }}"""
 
@@ -133,6 +135,7 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &lse,
                                   const torch::stable::Tensor &delta,
                                   const torch::stable::Tensor &dQ_accum,
+                                  const torch::stable::Tensor &dS_sum,
                                   const torch::stable::Tensor &dO_int8,
                                   const torch::stable::Tensor &dO_scale,
                                   const torch::stable::Tensor &dS_q_factors,
@@ -140,7 +143,8 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &dK,
                                   const torch::stable::Tensor &dV,
                                   const Params &params,
-                                  const double sm_scale)
+                                  const double sm_scale,
+                                  const bool smooth_k)
 {{
 {head_branches}
 

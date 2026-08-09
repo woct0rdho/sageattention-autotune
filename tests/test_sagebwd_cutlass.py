@@ -89,7 +89,8 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str, *, for
 
 
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
-def test_cutlass_dq_workspace_conversion(tensor_layout: str) -> None:
+@pytest.mark.parametrize("smooth_k", (False, True))
+def test_cutlass_dq_workspace_conversion(tensor_layout: str, smooth_k: bool) -> None:
     batch, heads, seq_len, head_dim = 2, 3, 65, 64
     padded_seq_len = ((seq_len + 31) // 32) * 32
     dq_accum = (
@@ -110,9 +111,27 @@ def test_cutlass_dq_workspace_conversion(tensor_layout: str) -> None:
         .index_select(2, physical.reshape(-1))
         .reshape(batch, heads, seq_len, head_dim)
     )
+    if smooth_k:
+        ds_sum = 0.001 * torch.arange(batch * heads * padded_seq_len, device="cuda", dtype=torch.float32).reshape(
+            batch, heads, padded_seq_len
+        )
+        if tensor_layout == "NHD":
+            k_mean = 0.01 * torch.arange(batch * heads * head_dim, device="cuda", dtype=torch.float16).reshape(
+                batch, 1, heads, head_dim
+            )
+            k_mean_nhd = k_mean[:, 0]
+        else:
+            k_mean = 0.01 * torch.arange(batch * heads * head_dim, device="cuda", dtype=torch.float16).reshape(
+                batch, heads, 1, head_dim
+            )
+            k_mean_nhd = k_mean[:, :, 0]
+        expected_nhd += ds_sum[:, :, :seq_len, None] * k_mean_nhd[:, :, None, :]
+    else:
+        ds_sum = None
+        k_mean = None
     expected = expected_nhd.transpose(1, 2) if tensor_layout == "NHD" else expected_nhd
 
-    convert_dq(dq_accum, grad_query, tensor_layout)
+    convert_dq(dq_accum, grad_query, tensor_layout, ds_sum, k_mean)
     torch.testing.assert_close(grad_query, expected.to(torch.float16), rtol=0, atol=0)
 
 
@@ -120,15 +139,17 @@ def test_cutlass_dq_workspace_conversion(tensor_layout: str) -> None:
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
 @pytest.mark.parametrize("head_dim", (64,))
 @pytest.mark.parametrize("seq_len", (64, 65))
+@pytest.mark.parametrize("smooth_k", (False, True))
 def test_sagebwd_cutlass_config_matches_flashattention(
     config: tuple[int, int, int, int],
     tensor_layout: str,
     head_dim: int,
     seq_len: int,
+    smooth_k: bool,
 ) -> None:
     q, k, v, dout = _make_qkvo(seq_len=seq_len, head_dim=head_dim, tensor_layout=tensor_layout)
     out, lse, dq_ref, dk_ref, dv_ref = _flash_forward_backward(q, k, v, dout, tensor_layout)
-    dq, dk, dv = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, config)
+    dq, dk, dv = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, smooth_k, config)
     _check_close(dq, dq_ref, "dQ", format_experiment=True)
     _check_close(dk, dk_ref, "dK", format_experiment=True)
     _check_close(dv, dv_ref, "dV", format_experiment=True)
@@ -136,11 +157,12 @@ def test_sagebwd_cutlass_config_matches_flashattention(
 
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
 @pytest.mark.parametrize("seq_len", (256, 257, 512, 513))
-def test_sagebwd_cutlass_n256_matches_n128(tensor_layout: str, seq_len: int) -> None:
+@pytest.mark.parametrize("smooth_k", (False, True))
+def test_sagebwd_cutlass_n256_matches_n128(tensor_layout: str, seq_len: int, smooth_k: bool) -> None:
     q, k, v, dout = _make_qkvo(seq_len=seq_len, tensor_layout=tensor_layout)
     out, lse, *_ = _flash_forward_backward(q, k, v, dout, tensor_layout)
-    n128 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, (32, 64, 64, 128))
-    n256 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, (32, 64, 64, 256))
+    n128 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, smooth_k, (32, 64, 64, 128))
+    n256 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, smooth_k, (32, 64, 64, 256))
 
     torch.testing.assert_close(n256[0], n128[0], rtol=0, atol=2e-4)
     torch.testing.assert_close(n256[1], n128[1], rtol=0, atol=0)

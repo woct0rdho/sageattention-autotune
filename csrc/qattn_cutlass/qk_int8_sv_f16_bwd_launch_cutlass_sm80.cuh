@@ -81,6 +81,7 @@ inline Params prepare_params(const Tensor &query,
                                     const Tensor &lse,
                                     const Tensor &delta,
                                     const Tensor &dQ_accum,
+                                    const Tensor &dS_sum,
                                     const Tensor &dO_int8,
                                     const Tensor &dO_scale,
                                     const Tensor &dS_q_factors,
@@ -91,7 +92,8 @@ inline Params prepare_params(const Tensor &query,
                                     const int64_t blk_q,
                                     const int64_t blk_k,
                                     const int64_t bwd_block_m,
-                                    const int64_t bwd_block_n)
+                                    const int64_t bwd_block_n,
+                                    const bool smooth_k)
 {
   check_int8_tensor(query, "query");
   check_int8_tensor(key, "key");
@@ -107,6 +109,7 @@ inline Params prepare_params(const Tensor &query,
   CHECK_DIMS(lse, 3);
   check_workspace_tensor(delta, "delta", 3, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dQ_accum, "dQ_accum", 4, torch::headeronly::ScalarType::Float);
+  check_workspace_tensor(dS_sum, "dS_sum", 3, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dO_int8, "dO_int8", 4, torch::headeronly::ScalarType::Char);
   check_workspace_tensor(dO_scale, "dO_scale", 4, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dS_q_factors, "dS_q_factors", 4, torch::headeronly::ScalarType::Float);
@@ -196,6 +199,10 @@ inline Params prepare_params(const Tensor &query,
   CHECK_SHAPE(delta, params.batch_size, params.num_heads, params.seq_len);
   const int32_t dq_accum_rows = div_ceil_int(params.seq_len, 32) * 32;
   CHECK_SHAPE(dQ_accum, params.batch_size, params.num_heads, dq_accum_rows, params.head_dim);
+  if (smooth_k)
+  {
+    CHECK_SHAPE(dS_sum, params.batch_size, params.num_heads, dq_accum_rows);
+  }
   CHECK_SHAPE(dO_int8, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
   CHECK_SHAPE(dO_scale, params.batch_size, params.num_heads, q_summary_blocks, 4);
   CHECK_SHAPE(dS_q_factors, params.batch_size, params.num_heads, q_summary_blocks, 2);
@@ -221,6 +228,7 @@ void launch_mma(const Tensor &query,
                     const Tensor &lse,
                     const Tensor &delta,
                     const Tensor &dQ_accum,
+                    const Tensor &dS_sum,
                     const Tensor &dO_int8,
                     const Tensor &dO_scale,
                     const Tensor &dS_q_factors,
@@ -228,7 +236,8 @@ void launch_mma(const Tensor &query,
                     const Tensor &dK,
                     const Tensor &dV,
                     const Params &params,
-                    const double sm_scale)
+                    const double sm_scale,
+                    const bool smooth_k)
 {
   static_assert(
     HeadDim == 64 && BlockM == 64 &&
@@ -260,15 +269,26 @@ void launch_mma(const Tensor &query,
       reinterpret_cast<const float*>(lse.const_data_ptr()),
       reinterpret_cast<const float*>(delta.const_data_ptr()),
       reinterpret_cast<float*>(dQ_accum.mutable_data_ptr()),
+      reinterpret_cast<float*>(dS_sum.mutable_data_ptr()),
       reinterpret_cast<half*>(dK.mutable_data_ptr()),
       reinterpret_cast<half*>(dV.mutable_data_ptr()),
       params,
       static_cast<float>(sm_scale));
   };
-  auto kernel = params.seq_len % BlockN == 0
-    ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true>
-    : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false>;
-  launch_kernel(kernel);
+  if (smooth_k)
+  {
+    auto kernel = params.seq_len % BlockN == 0
+      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, true>
+      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, true>;
+    launch_kernel(kernel);
+  }
+  else
+  {
+    auto kernel = params.seq_len % BlockN == 0
+      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, false>
+      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, false>;
+    launch_kernel(kernel);
+  }
 
 }
 
@@ -286,6 +306,7 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const Tensor &lse,
                                                const Tensor &delta,
                                                const Tensor &dQ_accum,
+                                               const Tensor &dS_sum,
                                                const Tensor &dO_int8,
                                                const Tensor &dO_scale,
                                                const Tensor &dS_q_factors,
@@ -297,13 +318,14 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
                                                const int64_t blk_q,
                                                const int64_t blk_k,
                                                const int64_t bwd_block_m,
-                                               const int64_t bwd_block_n)
+                                               const int64_t bwd_block_n,
+                                               const bool smooth_k)
 {
   namespace bwd = sageattention::qattn_cutlass_bwd;
 
   const auto layout = bwd::parse_tensor_layout(tensor_layout);
-  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, layout, blk_q, blk_k, bwd_block_m, bwd_block_n);
+  const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, layout, blk_q, blk_k, bwd_block_m, bwd_block_n, smooth_k);
 
-  bwd::launch_configured_mma(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale);
+  bwd::launch_configured_mma(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale, smooth_k);
 }
 #endif

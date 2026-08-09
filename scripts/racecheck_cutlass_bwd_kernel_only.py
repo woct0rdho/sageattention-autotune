@@ -37,7 +37,7 @@ def _preprocess(
     grad_output: torch.Tensor,
     value: torch.Tensor,
     layout: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     output_nhd = _to_nhd(output, layout).float()
     grad_output_nhd = _to_nhd(grad_output, layout).float()
     value_nhd = _to_nhd(value, layout).float()
@@ -51,6 +51,7 @@ def _preprocess(
     q_blocks = (seq_len + 31) // 32
     q_padded_len = q_blocks * 32
     dq_accum = torch.zeros((batch, heads, q_padded_len, head_dim), device=output.device, dtype=torch.float32)
+    ds_sum = torch.zeros((batch, heads, q_padded_len), device=output.device, dtype=torch.float32)
     do_padded = torch.nn.functional.pad(grad_output_bhsd, (0, 0, 0, q_padded_len - seq_len))
     do_tiles = do_padded.reshape(batch, heads, q_blocks, 32, 4, 16)
     do_scale = do_tiles.abs().amax(dim=(-3, -1)) * _INT8_SCALE_INV + _INT8_SCALE_FLOOR
@@ -72,7 +73,7 @@ def _preprocess(
         .amax(dim=-1)
         .contiguous()
     )
-    return delta, dq_accum, do_int8, do_scale.contiguous(), ds_q_factors, ds_k_factors
+    return delta, dq_accum, ds_sum, do_int8, do_scale.contiguous(), ds_q_factors, ds_k_factors
 
 
 def main() -> None:
@@ -81,6 +82,7 @@ def main() -> None:
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--layout", choices=("NHD", "HND"), default="NHD")
     parser.add_argument("--block-n", type=int, choices=(128, 256), default=128)
+    parser.add_argument("--smooth-k", action="store_true")
     args = parser.parse_args()
 
     importlib.import_module("sageattention._qattn_cutlass_sm80")
@@ -95,8 +97,10 @@ def main() -> None:
     lse = torch.randn((1, args.num_heads, args.seq_len), device="cuda", dtype=torch.float32)
 
     q_int8, q_scale = _quantize_blocks(q, 32, args.layout)
-    k_int8, k_scale = _quantize_blocks(k, 64, args.layout)
-    delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _preprocess(
+    seq_dim = 1 if args.layout == "NHD" else 2
+    k_for_quant = k - k.mean(dim=seq_dim, keepdim=True) if args.smooth_k else k
+    k_int8, k_scale = _quantize_blocks(k_for_quant, 64, args.layout)
+    delta, dq_accum, ds_sum, do_int8, do_scale, ds_q_factors, ds_k_factors = _preprocess(
         output, grad_output, value, args.layout
     )
     grad_key = torch.empty_like(k)
@@ -114,6 +118,7 @@ def main() -> None:
         lse,
         delta,
         dq_accum,
+        ds_sum,
         do_int8,
         do_scale,
         ds_q_factors,
@@ -126,6 +131,7 @@ def main() -> None:
         64,
         64,
         args.block_n,
+        args.smooth_k,
     )
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()

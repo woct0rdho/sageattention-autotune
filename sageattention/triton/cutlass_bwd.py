@@ -40,6 +40,7 @@ def _preprocess_delta_zero_dq_kernel(
     DO,
     Delta,
     DQAccum,
+    DSSum,
     DOInt8,
     DOScale,
     DSQFactors,
@@ -54,6 +55,9 @@ def _preprocess_delta_zero_dq_kernel(
     stride_dqab,
     stride_dqas,
     stride_dqah,
+    stride_dssb,
+    stride_dssh,
+    stride_dsss,
     stride_doib,
     stride_dois,
     stride_doih,
@@ -69,6 +73,7 @@ def _preprocess_delta_zero_dq_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     DIM_BLOCKS: tl.constexpr,
+    ZERO_DS_SUM: tl.constexpr,
     IS_EVEN_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -100,6 +105,10 @@ def _preprocess_delta_zero_dq_kernel(
         DQAccum + off_b * stride_dqab + offs_m[:, None] * stride_dqas + off_h * stride_dqah + offs_d[None, :]
     )
     tl.store(dq_accum_ptrs, tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32))
+
+    if ZERO_DS_SUM:
+        ds_sum_ptrs = DSSum + off_b * stride_dssb + off_h * stride_dssh + offs_m * stride_dsss
+        tl.store(ds_sum_ptrs, tl.zeros([BLOCK_M], dtype=tl.float32))
 
     for dim_block in range(DIM_BLOCKS):
         block_d = dim_block * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -177,21 +186,29 @@ def _v_l2_max_kernel(
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
     ],
-    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "IS_EVEN_M"],
+    key=["SEQ_LEN_BUCKET", "HEAD_DIM", "HAS_KMEAN", "IS_EVEN_M"],
 )
 @triton.jit
 def _convert_dq_kernel(
     DQAccum,
     DQ,
+    DSSum,
+    KMean,
     stride_dqab,
     stride_dqah,
     stride_dqb,
     stride_dqs,
     stride_dqh,
+    stride_dssb,
+    stride_dssh,
+    stride_dsss,
+    stride_kmb,
+    stride_kmh,
     SEQ_LEN: tl.constexpr,
     SEQ_LEN_BUCKET: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
+    HAS_KMEAN: tl.constexpr,
     IS_EVEN_M: tl.constexpr,
 ):
     start_m = tl.program_id(0)
@@ -222,6 +239,10 @@ def _convert_dq_kernel(
     )
     dq = tl.permute(dq, (0, 3, 5, 1, 2, 6, 4))
     dq = tl.reshape(dq, (BLOCK_M, HEAD_DIM))
+    if HAS_KMEAN:
+        ds_sum = tl.load(DSSum + off_b * stride_dssb + off_h * stride_dssh + offs_m * stride_dsss)
+        k_mean = tl.load(KMean + off_b * stride_kmb + off_h * stride_kmh + offs_d).to(tl.float32)
+        dq += ds_sum[:, None] * k_mean[None, :]
     dq_ptrs = DQ + off_b * stride_dqb + offs_m[:, None] * stride_dqs + off_h * stride_dqh + offs_d[None, :]
     if IS_EVEN_M:
         tl.store(dq_ptrs, dq.to(DQ.type.element_ty))
@@ -242,7 +263,8 @@ def preprocess_delta_zero_dq(
     grad_output: torch.Tensor,
     value: torch.Tensor,
     tensor_layout: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    smooth_k: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if output.ndim != 4 or output.shape != grad_output.shape:
         raise ValueError("output and grad_output must have the same four-dimensional shape.")
     if output.dtype != torch.float16 or grad_output.dtype != torch.float16:
@@ -273,6 +295,9 @@ def preprocess_delta_zero_dq(
     dq_accum_rows = q_blocks * _CUTLASS_BWD_BLOCK_M
     delta = torch.empty((batch, heads, seq_len), device=output.device, dtype=torch.float32)
     dq_accum = torch.empty((batch, heads, dq_accum_rows, head_dim), device=output.device, dtype=torch.float32)
+    ds_sum = (
+        torch.empty((batch, heads, dq_accum_rows), device=output.device, dtype=torch.float32) if smooth_k else delta
+    )
     do_int8 = torch.empty((batch, heads, seq_len, head_dim), device=output.device, dtype=torch.int8)
     do_scale = torch.empty((batch, heads, q_blocks, _CUTLASS_BWD_DIM_BLOCKS), device=output.device, dtype=torch.float32)
 
@@ -285,6 +310,7 @@ def preprocess_delta_zero_dq(
         grad_output,
         delta,
         dq_accum,
+        ds_sum,
         do_int8,
         do_scale,
         ds_q_factors,
@@ -299,6 +325,9 @@ def preprocess_delta_zero_dq(
         dq_accum.stride(0),
         dq_accum.stride(2),
         dq_accum.stride(1),
+        ds_sum.stride(0),
+        ds_sum.stride(1),
+        ds_sum.stride(2),
         do_int8.stride(0),
         do_int8.stride(2),
         do_int8.stride(1),
@@ -314,6 +343,7 @@ def preprocess_delta_zero_dq(
         BLOCK_M=_CUTLASS_BWD_BLOCK_M,
         BLOCK_K=_CUTLASS_BWD_BLOCK_K,
         DIM_BLOCKS=_CUTLASS_BWD_DIM_BLOCKS,
+        ZERO_DS_SUM=smooth_k,
         IS_EVEN_M=seq_len % _CUTLASS_BWD_BLOCK_M == 0,
     )
 
@@ -335,10 +365,16 @@ def preprocess_delta_zero_dq(
         IS_EVEN_N=seq_len % _CUTLASS_BWD_K_BLOCK == 0,
     )
 
-    return delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors
+    return delta, dq_accum, ds_sum, do_int8, do_scale, ds_q_factors, ds_k_factors
 
 
-def convert_dq(dq_accum: torch.Tensor, grad_query: torch.Tensor, tensor_layout: str) -> None:
+def convert_dq(
+    dq_accum: torch.Tensor,
+    grad_query: torch.Tensor,
+    tensor_layout: str,
+    ds_sum: torch.Tensor | None = None,
+    k_mean: torch.Tensor | None = None,
+) -> None:
     if dq_accum.ndim != 4 or dq_accum.dtype != torch.float32 or not dq_accum.is_contiguous():
         raise ValueError(
             "dq_accum must be a contiguous fp32 padded [batch, heads, ceil(seq_len / 32) * 32, head_dim] tensor."
@@ -353,17 +389,43 @@ def convert_dq(dq_accum: torch.Tensor, grad_query: torch.Tensor, tensor_layout: 
     if dq_accum.shape != (batch, heads, dq_accum_rows, head_dim):
         raise ValueError("dq_accum shape does not match grad_query.")
 
+    if (ds_sum is None) != (k_mean is None):
+        raise ValueError("ds_sum and k_mean must either both be provided or both be omitted.")
+    has_kmean = k_mean is not None
+    if has_kmean:
+        assert ds_sum is not None and k_mean is not None
+        if ds_sum.shape != (batch, heads, dq_accum_rows) or ds_sum.dtype != torch.float32 or not ds_sum.is_contiguous():
+            raise ValueError("ds_sum must be a contiguous fp32 [batch, heads, padded_seq_len] tensor.")
+        expected_k_mean_shape = (batch, 1, heads, head_dim) if tensor_layout == "NHD" else (batch, heads, 1, head_dim)
+        if k_mean.shape != expected_k_mean_shape or k_mean.dtype != torch.float16 or not k_mean.is_cuda:
+            raise ValueError("k_mean must be a CUDA fp16 tensor with one sequence row in the selected layout.")
+        k_mean = k_mean.contiguous()
+        stride_kmb, _, stride_kmh = _logical_strides(k_mean, tensor_layout)
+    else:
+        ds_sum = dq_accum
+        k_mean = grad_query
+        stride_kmb = 0
+        stride_kmh = 0
+
     _convert_dq_kernel[(triton.cdiv(seq_len, _CUTLASS_BWD_BLOCK_M), heads, batch)](
         dq_accum,
         grad_query,
+        ds_sum,
+        k_mean,
         dq_accum.stride(0),
         dq_accum.stride(1),
         grad_query.stride(0),
         grad_query.stride(2 if tensor_layout == "HND" else 1),
         grad_query.stride(1 if tensor_layout == "HND" else 2),
+        ds_sum.stride(0) if has_kmean else 0,
+        ds_sum.stride(1) if has_kmean else 0,
+        ds_sum.stride(2) if has_kmean else 0,
+        stride_kmb,
+        stride_kmh,
         SEQ_LEN=seq_len,
         SEQ_LEN_BUCKET=_autotune_seq_len_bucket(seq_len),
         HEAD_DIM=head_dim,
         BLOCK_M=_CUTLASS_BWD_BLOCK_M,
+        HAS_KMEAN=has_kmean,
         IS_EVEN_M=seq_len % _CUTLASS_BWD_BLOCK_M == 0,
     )

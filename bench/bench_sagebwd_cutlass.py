@@ -14,6 +14,7 @@ from sageattention.cutlass_bwd import _BWD_CONFIGS
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
+from sageattention.utils import _lse_correction
 
 BlockConfig = tuple[int, int, int, int]
 BackwardCandidate = BlockConfig
@@ -22,6 +23,7 @@ PreparedQuantizedQK = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor | None,
 ]
 _FORWARD_QK_CONFIG: BlockConfig = (64, 64, 32, 64)
 
@@ -136,6 +138,7 @@ def _prepare_sage_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     layout: str,
+    smooth_k: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.inference_mode():
         result = _sageattn_cutlass_configured(
@@ -143,7 +146,7 @@ def _prepare_sage_forward(
             k,
             v,
             layout,
-            False,
+            smooth_k,
             True,
             _FORWARD_QK_CONFIG,
         )
@@ -156,19 +159,35 @@ def _prepare_quantized_qk(
     k: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
+    smooth_k: bool,
 ) -> PreparedQuantizedQK:
     blk_q, blk_k, _, _ = block_config
     # Keep the forward-compatible Q32/K64 Q/K representation outside the timed
     # backward region until the public forward saves and routes these tensors.
     with torch.inference_mode():
-        return per_block_int8(
+        seq_dim = 2 if layout == "HND" else 1
+        k_mean = k.mean(dim=seq_dim, keepdim=True) if smooth_k else None
+        q_int8, q_scale, k_int8, k_scale = per_block_int8(
             q,
             k,
-            km=None,
+            km=k_mean,
             BLKQ=blk_q,
             BLKK=blk_k,
             tensor_layout=layout,
         )
+        return q_int8, q_scale, k_int8, k_scale, k_mean
+
+
+def _prepare_kernel_lse(
+    q: torch.Tensor,
+    lse: torch.Tensor,
+    k_mean: torch.Tensor | None,
+    layout: str,
+) -> torch.Tensor:
+    if k_mean is None:
+        return lse
+    head_dim_index = 1 if layout == "HND" else 2
+    return (lse - _lse_correction(q, k_mean, layout, head_dim_index) * (q.size(-1) ** -0.5)).contiguous()
 
 
 def _prepare_backward_workspaces(
@@ -176,9 +195,10 @@ def _prepare_backward_workspaces(
     output: torch.Tensor,
     dout: torch.Tensor,
     layout: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    smooth_k: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.inference_mode():
-        return preprocess_delta_zero_dq(output, dout, v, layout)
+        return preprocess_delta_zero_dq(output, dout, v, layout, smooth_k)
 
 
 def _sage_kernel_only_backward(
@@ -192,6 +212,7 @@ def _sage_kernel_only_backward(
     lse: torch.Tensor,
     delta: torch.Tensor,
     dq_accum: torch.Tensor,
+    ds_sum: torch.Tensor,
     do_int8: torch.Tensor,
     do_scale: torch.Tensor,
     ds_q_factors: torch.Tensor,
@@ -202,6 +223,8 @@ def _sage_kernel_only_backward(
     layout_i: int,
     sm_scale: float,
     block_config: BlockConfig,
+    k_mean: torch.Tensor | None,
+    smooth_k: bool,
 ) -> None:
     blk_q, blk_k, bwd_block_m, bwd_block_n = block_config
     with torch.inference_mode():
@@ -215,6 +238,7 @@ def _sage_kernel_only_backward(
             lse,
             delta,
             dq_accum,
+            ds_sum,
             do_int8,
             do_scale,
             ds_q_factors,
@@ -227,8 +251,15 @@ def _sage_kernel_only_backward(
             blk_k,
             bwd_block_m,
             bwd_block_n,
+            smooth_k,
         )
-        convert_dq(dq_accum, dq, "HND" if layout_i else "NHD")
+        convert_dq(
+            dq_accum,
+            dq,
+            "HND" if layout_i else "NHD",
+            ds_sum if smooth_k else None,
+            k_mean,
+        )
 
 
 def _sage_prequantized_end_to_end_backward(
@@ -244,13 +275,16 @@ def _sage_prequantized_end_to_end_backward(
     lse: torch.Tensor,
     layout: str,
     block_config: BlockConfig,
+    k_mean: torch.Tensor | None,
+    smooth_k: bool,
 ) -> None:
     with torch.inference_mode():
-        delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
+        delta, dq_accum, ds_sum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
             v,
             output,
             dout,
             layout,
+            smooth_k,
         )
         _sage_kernel_only_backward(
             q_int8,
@@ -263,6 +297,7 @@ def _sage_prequantized_end_to_end_backward(
             lse,
             delta,
             dq_accum,
+            ds_sum,
             do_int8,
             do_scale,
             ds_q_factors,
@@ -273,6 +308,8 @@ def _sage_prequantized_end_to_end_backward(
             1 if layout == "HND" else 0,
             q.size(-1) ** -0.5,
             block_config,
+            k_mean,
+            smooth_k,
         )
 
 
@@ -297,6 +334,7 @@ def _make_row(
     head_dim: int,
     seq_len: int,
     layout: str,
+    smooth_k: bool,
     block_config: BlockConfig,
     flops: int,
     flash_stats: dict[str, float],
@@ -311,6 +349,7 @@ def _make_row(
         "head_dim": head_dim,
         "seq_len": seq_len,
         "layout": layout,
+        "smooth_k": smooth_k,
         "block_config": _format_block_config(block_config),
         "backward_flops": flops,
         "flash_ms": flash_ms,
@@ -327,9 +366,9 @@ def _make_row(
 
 
 def _assign_sage_ranks(rows: list[dict[str, object]]) -> None:
-    kinds = {str(row["kind"]) for row in rows}
-    for kind in kinds:
-        kind_rows = [row for row in rows if row["kind"] == kind]
+    groups = {(str(row["kind"]), bool(row["smooth_k"])) for row in rows}
+    for kind, smooth_k in groups:
+        kind_rows = [row for row in rows if row["kind"] == kind and row["smooth_k"] == smooth_k]
         for rank, row in enumerate(sorted(kind_rows, key=lambda item: cast(float, item["sage_ms"])), start=1):
             row["sage_rank"] = rank
 
@@ -341,6 +380,7 @@ def _benchmark_case(
     v: torch.Tensor,
     dout: torch.Tensor,
     layout: str,
+    smooth_k: bool,
     candidates: tuple[BackwardCandidate, ...],
     warmup: int,
     repeats: int,
@@ -358,8 +398,9 @@ def _benchmark_case(
 
     rows: list[dict[str, object]] = []
     for block_config in candidates:
-        output, lse = _prepare_sage_forward(q, k, v, layout)
-        q_int8, q_scale, k_int8, k_scale = _prepare_quantized_qk(q, k, layout, block_config)
+        output, lse = _prepare_sage_forward(q, k, v, layout, smooth_k)
+        q_int8, q_scale, k_int8, k_scale, k_mean = _prepare_quantized_qk(q, k, layout, block_config, smooth_k)
+        kernel_lse = _prepare_kernel_lse(q, lse, k_mean, layout)
 
         if include_end_to_end:
             sage_stats = _bench(
@@ -373,9 +414,11 @@ def _benchmark_case(
                 v,
                 output,
                 dout,
-                lse,
+                kernel_lse,
                 layout,
                 block_config,
+                k_mean,
+                smooth_k,
                 warmup=warmup,
                 repeats=repeats,
             )
@@ -387,6 +430,7 @@ def _benchmark_case(
                     head_dim=head_dim,
                     seq_len=seq_len,
                     layout=layout,
+                    smooth_k=smooth_k,
                     block_config=block_config,
                     flops=flops,
                     flash_stats=flash_stats,
@@ -395,11 +439,12 @@ def _benchmark_case(
             )
 
         if include_kernel_only:
-            delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
+            delta, dq_accum, ds_sum, do_int8, do_scale, ds_q_factors, ds_k_factors = _prepare_backward_workspaces(
                 v,
                 output,
                 dout,
                 layout,
+                smooth_k,
             )
             layout_i = 1 if layout == "HND" else 0
             sm_scale = q.size(-1) ** -0.5
@@ -412,9 +457,10 @@ def _benchmark_case(
                 v,
                 output,
                 dout,
-                lse,
+                kernel_lse,
                 delta,
                 dq_accum,
+                ds_sum,
                 do_int8,
                 do_scale,
                 ds_q_factors,
@@ -425,6 +471,8 @@ def _benchmark_case(
                 layout_i,
                 sm_scale,
                 block_config,
+                k_mean,
+                smooth_k,
                 warmup=warmup,
                 repeats=repeats,
             )
@@ -436,6 +484,7 @@ def _benchmark_case(
                     head_dim=head_dim,
                     seq_len=seq_len,
                     layout=layout,
+                    smooth_k=smooth_k,
                     block_config=block_config,
                     flops=flops,
                     flash_stats=flash_stats,
@@ -459,7 +508,7 @@ def _write_rows(path: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def _print_row(row: dict[str, object]) -> None:
     print(
-        "{kind},{batch_size},{num_heads},{head_dim},{seq_len},{layout},{block_config},{backward_flops},"
+        "{kind},{batch_size},{num_heads},{head_dim},{seq_len},{layout},{smooth_k},{block_config},{backward_flops},"
         "{flash_ms:.4f},{flash_mean_ms:.4f},{flash_stdev_ms:.4f},{flash_tflops:.3f},"
         "{sage_ms:.4f},{sage_mean_ms:.4f},{sage_stdev_ms:.4f},{sage_tflops:.3f},"
         "{sage_speedup:.3f},{sage_rank}".format(**row)
@@ -494,6 +543,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--mode", choices=["all", "end-to-end", "kernel-only"], default="all")
+    parser.add_argument("--smooth-k", nargs="+", choices=["false", "true"], default=["false"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, help="Optional path to write benchmark rows as CSV.")
     args = parser.parse_args()
@@ -510,6 +560,7 @@ def main() -> None:
         raise ValueError("No supported backward block configurations were selected.")
     include_end_to_end = args.mode in ("all", "end-to-end")
     include_kernel_only = args.mode in ("all", "kernel-only")
+    smooth_k_values = tuple(value == "true" for value in args.smooth_k)
 
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     print(f"device={props.name} capability=sm{props.major}{props.minor}")
@@ -519,7 +570,7 @@ def main() -> None:
     )
     print(f"block_configs={[_format_block_config(config) for config in block_configs]}")
     print("dS scale policy=precomputed separable predictor")
-    print("K quantization policy=raw K (smooth_k=False)")
+    print(f"smooth_k={list(smooth_k_values)}")
     print("FlashAttention baseline=library-selected best available kernel")
     print("TFLOPS use 8*batch*heads*head_dim*seq_len^2 effective dense backward FLOPs and median CUDA-event time")
     print(
@@ -529,7 +580,7 @@ def main() -> None:
         "Sage forward setup is not timed and uses the head-64 Q32/K64 artifact domain; its saved tensors are still discarded, so benchmark preparation remains a reuse proxy until forward state is routed into backward; sage_speedup > 1 means Sage is faster"
     )
     print(
-        "kind,batch_size,num_heads,head_dim,seq_len,layout,block_config,backward_flops,"
+        "kind,batch_size,num_heads,head_dim,seq_len,layout,smooth_k,block_config,backward_flops,"
         "flash_ms,flash_mean_ms,flash_stdev_ms,flash_tflops,"
         "sage_ms,sage_mean_ms,sage_stdev_ms,sage_tflops,sage_speedup,sage_rank"
     )
@@ -539,21 +590,23 @@ def main() -> None:
         for head_dim in args.head_dims:
             for seq_len in args.seq_lens:
                 q, k, v, dout = _make_inputs(args.batch_size, num_heads, seq_len, head_dim, args.layout)
-                case_rows = _benchmark_case(
-                    q=q,
-                    k=k,
-                    v=v,
-                    dout=dout,
-                    layout=args.layout,
-                    candidates=candidates,
-                    warmup=args.warmup,
-                    repeats=args.repeats,
-                    include_end_to_end=include_end_to_end,
-                    include_kernel_only=include_kernel_only,
-                )
-                rows.extend(case_rows)
-                for row in case_rows:
-                    _print_row(row)
+                for smooth_k in smooth_k_values:
+                    case_rows = _benchmark_case(
+                        q=q,
+                        k=k,
+                        v=v,
+                        dout=dout,
+                        layout=args.layout,
+                        smooth_k=smooth_k,
+                        candidates=candidates,
+                        warmup=args.warmup,
+                        repeats=args.repeats,
+                        include_end_to_end=include_end_to_end,
+                        include_kernel_only=include_kernel_only,
+                    )
+                    rows.extend(case_rows)
+                    for row in case_rows:
+                        _print_row(row)
 
     if args.csv is not None:
         _write_rows(args.csv, rows)

@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from .triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from .triton.quant_per_block import per_block_int8
-from .utils import _pad_qkv
+from .utils import _lse_correction, _pad_qkv
 
 _BWD_CONFIG = (32, 64, 64, 128)
 _BWD_CONFIGS = (
@@ -30,6 +30,7 @@ def _bwd_fake_impl(
     lse: torch.Tensor,
     delta: torch.Tensor,
     dq_accum: torch.Tensor,
+    ds_sum: torch.Tensor,
     do_int8: torch.Tensor,
     do_scale: torch.Tensor,
     ds_q_factors: torch.Tensor,
@@ -42,6 +43,7 @@ def _bwd_fake_impl(
     blk_k: int,
     bwd_block_m: int,
     bwd_block_n: int,
+    smooth_k: bool,
 ) -> None:
     return None
 
@@ -54,6 +56,7 @@ def _sageattn_cutlass_bwd_configured(
     grad_output: torch.Tensor,
     lse: torch.Tensor,
     tensor_layout: str,
+    smooth_k: bool,
     config: tuple[int, int, int, int],
 ) -> CutlassSageBwdResult:
     if not all(tensor.is_cuda for tensor in (q, k, v, output, grad_output, lse)):
@@ -81,10 +84,14 @@ def _sageattn_cutlass_bwd_configured(
 
     if tensor_layout == "NHD":
         layout_i = 0
+        seq_dim_index = 1
+        head_dim_index = 2
         seq_len = q.size(1)
         num_heads = q.size(2)
     elif tensor_layout == "HND":
         layout_i = 1
+        seq_dim_index = 2
+        head_dim_index = 1
         num_heads = q.size(1)
         seq_len = q.size(2)
     else:
@@ -96,18 +103,25 @@ def _sageattn_cutlass_bwd_configured(
     v = v.contiguous()
     output = output.contiguous()
     grad_output = grad_output.contiguous()
+    sm_scale = head_dim**-0.5
+    if smooth_k:
+        k_mean = k.mean(dim=seq_dim_index, keepdim=True)
+        lse = lse - _lse_correction(q, k_mean, tensor_layout, head_dim_index) * sm_scale
+    else:
+        k_mean = None
     lse = lse.contiguous()
-    delta, dq_accum, do_int8, do_scale, ds_q_factors, ds_k_factors = preprocess_delta_zero_dq(
+    delta, dq_accum, ds_sum, do_int8, do_scale, ds_q_factors, ds_k_factors = preprocess_delta_zero_dq(
         output,
         grad_output,
         v,
         tensor_layout,
+        smooth_k,
     )
     blk_q, blk_k, bwd_block_m, bwd_block_n = config
     q_int8, q_scale, k_int8, k_scale = per_block_int8(
         q,
         k,
-        km=None,
+        km=k_mean,
         BLKQ=blk_q,
         BLKK=blk_k,
         tensor_layout=tensor_layout,
@@ -125,6 +139,7 @@ def _sageattn_cutlass_bwd_configured(
         lse,
         delta,
         dq_accum,
+        ds_sum,
         do_int8,
         do_scale,
         ds_q_factors,
@@ -132,13 +147,20 @@ def _sageattn_cutlass_bwd_configured(
         grad_key,
         grad_value,
         layout_i,
-        head_dim**-0.5,
+        sm_scale,
         blk_q,
         blk_k,
         bwd_block_m,
         bwd_block_n,
+        smooth_k,
     )
-    convert_dq(dq_accum, grad_query, tensor_layout)
+    convert_dq(
+        dq_accum,
+        grad_query,
+        tensor_layout,
+        ds_sum if smooth_k else None,
+        k_mean,
+    )
     return grad_query[..., :head_dim], grad_key[..., :head_dim], grad_value[..., :head_dim]
 
 
@@ -150,5 +172,6 @@ def sageattn_cutlass_bwd(
     grad_output: torch.Tensor,
     lse: torch.Tensor,
     tensor_layout: str = "HND",
+    smooth_k: bool = True,
 ) -> CutlassSageBwdResult:
-    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, _BWD_CONFIG)
+    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, smooth_k, _BWD_CONFIG)
