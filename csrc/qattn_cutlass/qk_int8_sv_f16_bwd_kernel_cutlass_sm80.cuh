@@ -100,8 +100,7 @@ struct BwdTileTraits
   static constexpr int32_t kCtaNLoadRows = kCtaN / kNumWarps;
   static_assert(kCtaNMicroTiles % kSmemWarps == 0, "Backward N microtiles must divide active warp waves");
 
-  static_assert(cute::size<0>(ScoreAtomShapeMNK{}) == kAtomM && cute::size<1>(ScoreAtomShapeMNK{}) == kAtomN,
-                "Backward score MMA atom must match logical M/N atom shape");
+  static_assert(cute::size<0>(ScoreAtomShapeMNK{}) == kAtomM && cute::size<1>(ScoreAtomShapeMNK{}) == kAtomN, "Backward score MMA atom must match logical M/N atom shape");
   static_assert(HeadDim % kBlockK == 0, "head_dim must be divisible by the MMA K tile");
   static_assert(HeadDim % kScoreAtomK == 0, "head_dim must be divisible by the score MMA K tile");
   static_assert(kCtaM % kBlockM == 0 && kCtaN % kBlockN == 0, "Backward CTA tile must be a multiple of the micro MMA tile");
@@ -160,6 +159,21 @@ struct BwdTileTraits
   using SmemLayoutN = decltype(cute::make_layout(cute::make_shape(cute::Int<kBlockN>{}), cute::make_stride(cute::_1{})));
 };
 
+// The inverse of the MMA C TV layout maps logical M+16*N coordinates to lane/value order.
+template <typename Traits>
+CUTE_HOST_DEVICE constexpr auto make_dQ_workspace_mn_layout()
+{
+  typename Traits::ScoreMMA score_mma;
+  return cute::right_inverse(score_mma.get_layoutC_TV());
+}
+
+template <typename Traits>
+CUTE_HOST_DEVICE constexpr auto make_dQ_workspace_fragment_layout()
+{
+  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ workspace fragment layout expects a 16x16 MMA C tile");
+  return cute::make_layout(cute::make_shape(cute::_32{}, cute::_8{}), cute::make_stride(cute::_1{}, cute::_32{}));
+}
+
 template <typename Traits>
 struct QdOMmaBPacketStorage
 {
@@ -200,8 +214,7 @@ struct SharedStorage2DWarp
        (Traits::kNumWarps == 16 && Traits::kCtaN == 128)),
     "2D warp storage is specialized for the 64-row, two-M-half schedule");
   using SmemLayoutdOFp16Pair = decltype(make_smem_matrix_layout<2 * Traits::kBlockM, Traits::kHalfLoadVecCols>());
-  using SmemLayoutMPair = decltype(cute::make_layout(
-    cute::make_shape(cute::Int<2 * Traits::kBlockM>{}), cute::make_stride(cute::_1{})));
+  using SmemLayoutMPair = decltype(cute::make_layout(cute::make_shape(cute::Int<2 * Traits::kBlockM>{}), cute::make_stride(cute::_1{})));
 
   struct WarpScratchStorage
   {
@@ -214,7 +227,6 @@ struct SharedStorage2DWarp
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutK>> k_i8_mma_b;
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<SmemLayoutdOFp16Pair>> dO_fp16_pair;
   WarpScratchStorage warp_scratch;
-  alignas(16) cute::ArrayEngine<cute::uint128_t, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutScorePair>> score_pair_i8;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> lse;
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
 };
@@ -252,6 +264,8 @@ struct Params {
   int32_t stride_bz_dO;
   int32_t stride_seq_dO;
   int32_t stride_h_dO;
+  int32_t stride_bz_dQAccum;
+  int32_t stride_h_dQAccum;
   int32_t stride_bz_dK;
   int32_t stride_seq_dK;
   int32_t stride_h_dK;
@@ -325,9 +339,7 @@ __device__ __forceinline__ int8_t round_to_int8(const float value)
 }
 
 // Proven C-to-A bit network: MOVM, rotate the five-bit lane ID, swap bytes 1/2, MOVM.
-__device__ __forceinline__ uint32_t transpose_score_c_word_to_mma_a(
-  const uint32_t source,
-  const int32_t lane_id)
+__device__ __forceinline__ uint32_t transpose_score_c_word_to_mma_a(const uint32_t source, const int32_t lane_id)
 {
   uint32_t moved;
   cute::SM75_U32x1_MOVM_T::copy(source, moved);
@@ -340,10 +352,7 @@ __device__ __forceinline__ uint32_t transpose_score_c_word_to_mma_a(
 }
 
 template <int32_t Half, typename CFragment, typename AFragment>
-__device__ __forceinline__ void transpose_score_c_fragment_to_mma_a(
-  const CFragment &source,
-  AFragment &destination,
-  const int32_t lane_id)
+__device__ __forceinline__ void transpose_score_c_fragment_to_mma_a(const CFragment &source, AFragment &destination, const int32_t lane_id)
 {
   static_assert(Half == 0 || Half == 1, "Score C-to-A transpose selects one M16 half");
   auto source_words = cute::recast<uint32_t>(source);
@@ -467,10 +476,8 @@ __device__ __forceinline__ void load_q_dO_pair(const GQ gQ,
                                                const int32_t loader_warp,
                                                const int32_t lane_id)
 {
-  constexpr auto int8_pair_load_shape = cute::make_shape(
-    cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
-  constexpr auto half_pair_load_shape = cute::make_shape(
-    cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
+  constexpr auto int8_pair_load_shape = cute::make_shape(cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
+  constexpr auto half_pair_load_shape = cute::make_shape(cute::Int<Traits::kMStageLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
   const int32_t m_load_base = m_pair_base + loader_warp * Traits::kMStageLoadRows;
 #pragma unroll
   for (int32_t pair_half = 0; pair_half < 2; ++pair_half)
@@ -584,52 +591,32 @@ __device__ __forceinline__ void store_dKV_fragment_coalesced(const Accum &accum_
   __syncwarp();
 }
 
-__device__ __forceinline__ int32_t dQ_stage_offset(const int32_t row, const int32_t col)
-{
-  const int32_t deinterleaved_col = ((col & 1) << 3) | (col >> 1);
-  const int32_t physical_col = deinterleaved_col ^ (((row >> 1) & 3) << 2);
-  return row * 16 + physical_col;
-}
-
 template <bool IsAligned, typename Traits, typename Accum>
-__device__ __forceinline__ void accumulate_dQ_float_fragment_shared_contiguous(const Accum &accum_frag,
-                                                                               float *const smem_stage,
-                                                                               float *const dst,
-                                                                               const int32_t row_base,
-                                                                               const int32_t dim_base,
-                                                                               const int32_t seq_len,
-                                                                               const int32_t lane_id)
+__device__ __forceinline__ void accumulate_dQ_float_fragment_workspace(const Accum &accum_frag,
+                                                                       float *const dst,
+                                                                       const int32_t row_base,
+                                                                       const int32_t dim_base,
+                                                                       const int32_t seq_len,
+                                                                       const int32_t lane_id)
 {
-  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ warp permutation assumes 16x16 MMA C tiles");
+  static_assert(Traits::kBlockM == 16 && Traits::kBlockK == 16, "dQ workspace mapping assumes 16x16 MMA C tiles");
+  static_assert(cute::size(Accum{}) == 8, "dQ workspace mapping expects eight MMA C values per lane");
+  constexpr auto mn_to_tv = make_dQ_workspace_mn_layout<Traits>();
+  static_assert(mn_to_tv(cute::Int<16>{}) == cute::Int<32>{});
+  static_assert(mn_to_tv(cute::Int<8>{}) == cute::Int<64>{});
+  static_assert(mn_to_tv(cute::Int<128>{}) == cute::Int<128>{});
+  constexpr auto fragment_layout = make_dQ_workspace_fragment_layout<Traits>();
+  const int32_t tile_base = row_base * Traits::kHeadDim + dim_base * Traits::kBlockM;
 #pragma unroll
   for (int32_t idx = 0; idx < cute::size(accum_frag); ++idx)
   {
     const int32_t row_local = lane_id / 4 + ((idx & 2) != 0 ? 8 : 0);
-    const int32_t dim_local = (lane_id & 3) * 2 + (idx & 1) + ((idx & 4) != 0 ? 8 : 0);
-    smem_stage[dQ_stage_offset(row_local, dim_local)] = accum_frag(idx);
-  }
-  __syncwarp();
-
-  const int32_t lane_row = row_base + lane_id / 8;
-  float *const lane_dst = dst + lane_row * Traits::kHeadDim + dim_base + lane_id % 8;
-#pragma unroll
-  for (int32_t target_idx = 0; target_idx < 8; ++target_idx)
-  {
-    constexpr int32_t kRowsPerTargetPair = 4;
-    const int32_t target_pair = target_idx / 2;
-    const int32_t row_local = target_pair * kRowsPerTargetPair + lane_id / 8;
-    const int32_t dim_local = (target_idx & 1) * 8 + lane_id % 8;
-    const float value = smem_stage[dQ_stage_offset(row_local, dim_local)];
-    const int32_t row = lane_row + target_pair * kRowsPerTargetPair;
+    const int32_t row = row_base + row_local;
     if (IsAligned || row < seq_len)
     {
-      constexpr int32_t kPairColumnOffset = 8;
-      atomicAdd(
-        lane_dst + target_pair * kRowsPerTargetPair * Traits::kHeadDim + (target_idx & 1) * kPairColumnOffset,
-        value);
+      atomicAdd(dst + tile_base + fragment_layout(lane_id, idx), accum_frag(idx));
     }
   }
-  __syncwarp();
 }
 
 template <int32_t HeadDim,
@@ -659,15 +646,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
   using Storage = SharedStorage2DWarp<Traits>;
-  static_assert(
-    HeadDim == 64 && CtaM == 64 && CtaN == 128 && NumWarps == 8,
-    "K128 eight-warp kernel is specialized for the head64 M64xN128 schedule");
-  static_assert(
-    QuantBlockQ == 32 && QuantBlockK == 64,
-    "K128 eight-warp kernel currently implements the selected QBlock=32/KBlock=64 quantization format");
-  static_assert(
-    Traits::kCtaNMicroTiles == NumWarps && Traits::kCtaMMicroTiles == 4,
-    "K128 ownership requires one physical warp per N16 tile and two temporal M halves");
+  static_assert(HeadDim == 64 && CtaM == 64 && CtaN == 128 && NumWarps == 8, "K128 eight-warp kernel is specialized for the head64 M64xN128 schedule");
+  static_assert(QuantBlockQ == 32 && QuantBlockK == 64, "K128 eight-warp kernel currently implements the selected QBlock=32/KBlock=64 quantization format");
+  static_assert(Traits::kCtaNMicroTiles == NumWarps && Traits::kCtaMMicroTiles == 4, "K128 ownership requires one physical warp per N16 tile and two temporal M halves");
 
   const int32_t n_block = blockIdx.x;
   const int32_t head = blockIdx.y;
@@ -714,7 +695,6 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
   extern __shared__ char shared_storage[];
   auto &shared = *reinterpret_cast<Storage *>(shared_storage);
 
-  constexpr int32_t score_pair_offset = cute::cosize_v<typename Traits::SmemLayoutScorePair>;
   constexpr int32_t warp_scratch_offset = cute::cosize_v<typename Traits::SmemLayoutdSdKV>;
   constexpr int32_t kCtaNLoadRows = Traits::kCtaNLoadRows;
 
@@ -730,14 +710,6 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
   auto sdOFp16Pair = cute::recast<half>(sdOFp16PairStorage);
   auto sLse = make_smem_tensor(shared.lse, typename Storage::SmemLayoutMPair{});
   auto sDelta = make_smem_tensor(shared.delta, typename Storage::SmemLayoutMPair{});
-
-  auto sScorePairStorage = make_smem_tensor(
-    shared.score_pair_i8, typename Traits::SmemLayoutScorePair{}, n_tile * score_pair_offset);
-  auto sScorePair = cute::recast<int8_t>(sScorePairStorage);
-  constexpr auto score_pair_tile_shape = cute::make_shape(
-    cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kScoreAtomK>{});
-  auto sPPair = cute::local_tile(sScorePair, score_pair_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
-  auto sdSPair = cute::local_tile(sScorePair, score_pair_tile_shape, cute::make_coord(cute::_0{}, cute::_1{}));
 
   using BlockMNShape = typename Traits::BlockMNShape;
   typename Traits::ScoreMMA score_mma;
@@ -759,10 +731,8 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
   const auto thr_copy_half_b = tiled_copy_half_b.get_thread_slice(lane_id);
   constexpr int32_t kAccumulatorElements = 8;
 
-  constexpr auto cta_k_load_shape = cute::make_shape(
-    cute::Int<kCtaNLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
-  constexpr auto cta_v_load_shape = cute::make_shape(
-    cute::Int<kCtaNLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
+  constexpr auto cta_k_load_shape = cute::make_shape(cute::Int<kCtaNLoadRows>{}, cute::Int<Traits::kInt8LoadVecCols>{});
+  constexpr auto cta_v_load_shape = cute::make_shape(cute::Int<kCtaNLoadRows>{}, cute::Int<Traits::kHalfLoadVecCols>{});
   auto sKLoad = cute::local_tile(sKStorage, cta_k_load_shape, cute::make_coord(warp_id, cute::_0{}));
   auto sVLoad = cute::local_tile(sVStorage, cta_v_load_shape, cute::make_coord(warp_id, cute::_0{}));
   const int32_t n_load_base = n_cta_base + warp_id * kCtaNLoadRows;
@@ -777,8 +747,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 #pragma unroll
     for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
     {
-      constexpr auto k_pair_shape = cute::make_shape(
-        cute::Int<kKPairRows>{}, cute::Int<Traits::kBlockK>{});
+      constexpr auto k_pair_shape = cute::make_shape(cute::Int<kKPairRows>{}, cute::Int<Traits::kBlockK>{});
       const int32_t dim_block = dim_base / Traits::kBlockK;
       const auto gKPair = cute::local_tile(
         gK,
@@ -796,22 +765,18 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
         [&](auto coord) { return cute::get<0>(coord) < params.seq_len; });
       cute::clear(fragment);
       cute::copy_if(predicate, thr_mma_score.partition_B(gKdQ), fragment);
-      store_packed_mma_b_fragment(
-        shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
+      store_packed_mma_b_fragment(shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
     }
   }
   // The cooperative K/V load crosses warp ownership; publish it before V fragments are read.
   __syncthreads();
 
-  auto dK_accum_frag = cute::make_tensor<float>(
-    cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
-  auto dV_accum_frag = cute::make_tensor<float>(
-    cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
+  auto dK_accum_frag = cute::make_tensor<float>(cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
+  auto dV_accum_frag = cute::make_tensor<float>(cute::make_shape(cute::Int<kDimBlocks>{}, cute::Int<kAccumulatorElements>{}), cute::LayoutRight{});
   cute::clear(dK_accum_frag);
   cute::clear(dV_accum_frag);
 
-  constexpr auto v_subtile_shape = cute::make_shape(
-    cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
+  constexpr auto v_subtile_shape = cute::make_shape(cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
   const auto sVTile0 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::_0{}));
   const auto sVTile1 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::_1{}));
   const auto sVTile2 = cute::local_tile(sV, v_subtile_shape, cute::make_coord(n_tile, cute::Int<2>{}));
@@ -867,8 +832,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
   const int32_t k_domain_base = n_cta_base / QuantBlockK;
   const auto load_k_block_scale = [&]() {
     const int32_t scale_index_unclamped = k_domain_base + n_domain;
-    const int32_t scale_index =
-      scale_index_unclamped < k_scale_extent ? scale_index_unclamped : k_scale_extent - 1;
+    const int32_t scale_index = scale_index_unclamped < k_scale_extent ? scale_index_unclamped : k_scale_extent - 1;
     return gKScale(scale_index);
   };
   for (int32_t m_pair_base = 0; m_pair_base < params.seq_len; m_pair_base += 2 * Traits::kBlockM)
@@ -876,31 +840,22 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     const int32_t q_block_index = m_pair_base / QuantBlockQ;
     const float q_block_scale = gQScale(q_block_index);
     const float k_block_scale = load_k_block_scale();
-    constexpr auto QdO_pair_shape = cute::make_shape(
-      cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+    constexpr auto QdO_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
     if (warp_id < kDimBlocks)
     {
-      const auto sQPair = cute::local_tile(
-        sQ, QdO_pair_shape, cute::make_coord(cute::_0{}, warp_id));
+      const auto sQPair = cute::local_tile(sQ, QdO_pair_shape, cute::make_coord(cute::_0{}, warp_id));
       const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
       auto fragment = thr_mma_score.partition_fragment_B(sQdK);
-      cute::copy(
-        tiled_copy_transposed_b,
-        thr_copy_transposed_b.partition_S(sQdK),
-        thr_copy_transposed_b.retile_D(fragment));
+      cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(fragment));
       store_packed_mma_b_fragment(shared.QdO_mma_b.q_i8_mma_b, fragment, warp_id, lane_id);
     }
     else if (warp_id < 2 * kDimBlocks)
     {
       const int32_t dim_block = warp_id - kDimBlocks;
-      const auto sdOPair = cute::local_tile(
-        sdOInt8, QdO_pair_shape, cute::make_coord(cute::_0{}, dim_block));
+      const auto sdOPair = cute::local_tile(sdOInt8, QdO_pair_shape, cute::make_coord(cute::_0{}, dim_block));
       const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
       auto fragment = thr_mma_score.partition_fragment_B(sdOdV);
-      cute::copy(
-        tiled_copy_transposed_b,
-        thr_copy_transposed_b.partition_S(sdOdV),
-        thr_copy_transposed_b.retile_D(fragment));
+      cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sdOdV), thr_copy_transposed_b.retile_D(fragment));
       store_packed_mma_b_fragment(shared.QdO_mma_b.dO_i8_mma_b, fragment, dim_block, lane_id);
     }
     auto acc_score_0 = cute::partition_fragment_C(score_mma, BlockMNShape{});
@@ -917,12 +872,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kScoreAtomK)
       {
-        constexpr auto score_subtile_shape = cute::make_shape(
-          cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
-        const auto sQTile0 = cute::local_tile(
-          sQ, score_subtile_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kScoreAtomK));
-        const auto sQTile1 = cute::local_tile(
-          sQ, score_subtile_shape, cute::make_coord(cute::_1{}, dim_base / Traits::kScoreAtomK));
+        constexpr auto score_subtile_shape = cute::make_shape(cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
+        const auto sQTile0 = cute::local_tile(sQ, score_subtile_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kScoreAtomK));
+        const auto sQTile1 = cute::local_tile(sQ, score_subtile_shape, cute::make_coord(cute::_1{}, dim_base / Traits::kScoreAtomK));
         const auto sKTile = cute::local_tile(
           sK,
           cute::make_shape(cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kScoreAtomK>{}),
@@ -939,12 +891,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
-        constexpr auto half_subtile_shape = cute::make_shape(
-          cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
-        const auto sdOTile0 = cute::local_tile(
-          sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kBlockK));
-        const auto sdOTile1 = cute::local_tile(
-          sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_1{}, dim_base / Traits::kBlockK));
+        constexpr auto half_subtile_shape = cute::make_shape(cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+        const auto sdOTile0 = cute::local_tile(sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kBlockK));
+        const auto sdOTile1 = cute::local_tile(sdOFp16Pair, half_subtile_shape, cute::make_coord(cute::_1{}, dim_base / Traits::kBlockK));
         const auto sdOHalf0 = cute::recast<cute::half_t>(sdOTile0);
         const auto sdOHalf1 = cute::recast<cute::half_t>(sdOTile1);
         auto tdPrdO = thr_mma_half.partition_fragment_A(sdOHalf0);
@@ -1058,12 +1007,10 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     const float dS_scale = predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
     const float inv_p_scale = 1.0f / p_scale;
     const float inv_dS_scale = 1.0f / dS_scale;
-    constexpr auto score_store_shape = cute::make_shape(
-      cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockN>{});
-    constexpr auto dS_tile_shape = cute::make_shape(
-      cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
-    auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
-    auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
+    constexpr auto score_store_shape = cute::make_shape(cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kBlockN>{});
+    constexpr auto dS_tile_shape = cute::make_shape(cute::Int<Traits::kBlockM>{}, cute::Int<Traits::kScoreAtomK>{});
+    auto tdVP = cute::make_tensor<typename Traits::ScoreMMA::FrgTypeA>(cute::partition_shape_A(score_mma, dS_tile_shape));
+    auto tdKdS = cute::make_tensor<typename Traits::ScoreMMA::FrgTypeA>(cute::partition_shape_A(score_mma, dS_tile_shape));
     {
       auto rP = cute::make_fragment_like<int8_t>(acc_score_0);
       auto rdS = cute::make_fragment_like<int8_t>(acc_score_0);
@@ -1088,8 +1035,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       transpose_score_c_fragment_to_mma_a<0>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
       const int32_t dS_slot = 2 * n_pair;
-      auto sWarpScratchStorage = make_smem_tensor(
-        shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
+      auto sWarpScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
       auto sWarpScratch = cute::recast<int8_t>(sWarpScratchStorage);
       auto sdSMirror = cute::local_tile(sWarpScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
       auto sdSMirrorHalf = cute::local_tile(sdSMirror, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
@@ -1119,8 +1065,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       transpose_score_c_fragment_to_mma_a<1>(rdS, tdKdS, lane_id);
       auto tCrdS = thr_copy_score_c.retile_S(rdS);
       const int32_t dS_slot = 2 * n_pair + 1;
-      auto sWarpScratchStorage = make_smem_tensor(
-        shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
+      auto sWarpScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dS_slot * warp_scratch_offset);
       auto sWarpScratch = cute::recast<int8_t>(sWarpScratchStorage);
       auto sdSMirror = cute::local_tile(sWarpScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
       auto sdSMirrorHalf = cute::local_tile(sdSMirror, score_store_shape, cute::make_coord(cute::_0{}, n_tile & 1));
@@ -1136,10 +1081,8 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
-        constexpr auto dO_pair_shape = cute::make_shape(
-          cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
-        const auto sdOPair = cute::local_tile(
-          sdOInt8, dO_pair_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kBlockK));
+        constexpr auto dO_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+        const auto sdOPair = cute::local_tile(sdOInt8, dO_pair_shape, cute::make_coord(cute::_0{}, dim_base / Traits::kBlockK));
         const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
         auto dV_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dV_acc);
@@ -1155,10 +1098,8 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
           dV_accum_frag(dim_block, idx) += static_cast<float>(dV_acc(idx)) * dV_scale;
         }
 
-        constexpr auto q_pair_shape = cute::make_shape(
-          cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
-        const auto sQPair = cute::local_tile(
-          sQ, q_pair_shape, cute::make_coord(cute::_0{}, dim_block));
+        constexpr auto q_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+        const auto sQPair = cute::local_tile(sQ, q_pair_shape, cute::make_coord(cute::_0{}, dim_block));
         const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
         auto dK_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dK_acc);
@@ -1213,10 +1154,8 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
         for (int32_t pair_in_domain = 0; pair_in_domain < 2; ++pair_in_domain)
         {
           const int32_t dQ_pair = 2 * domain + pair_in_domain;
-          constexpr auto k_pair_shape = cute::make_shape(
-            cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
-          const auto sKPair = cute::local_tile(
-            sK, k_pair_shape, cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
+          constexpr auto k_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
+          const auto sKPair = cute::local_tile(sK, k_pair_shape, cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
           const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
           auto tdQK = thr_mma_score.partition_fragment_B(sKdQ);
           load_packed_mma_b_fragment(
@@ -1228,10 +1167,7 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
           for (int32_t m_half = 0; m_half < 2; ++m_half)
           {
             const int32_t dQ_dS_slot = 2 * dQ_pair + m_half;
-            auto sdSScratchStorage = make_smem_tensor(
-              shared.warp_scratch.dS_dKV,
-              typename Traits::SmemLayoutdSdKV{},
-              dQ_dS_slot * warp_scratch_offset);
+            auto sdSScratchStorage = make_smem_tensor(shared.warp_scratch.dS_dKV, typename Traits::SmemLayoutdSdKV{}, dQ_dS_slot * warp_scratch_offset);
             auto sdSScratch = cute::recast<int8_t>(sdSScratchStorage);
             auto sdSdQ = cute::local_tile(sdSScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
             auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ);
@@ -1247,14 +1183,12 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
           }
         }
         const int32_t domain_k_factor_unclamped = k_domain_base + domain;
-        const int32_t domain_k_factor_index =
-          domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
+        const int32_t domain_k_factor_index = domain_k_factor_unclamped < dS_k_extent ? domain_k_factor_unclamped : dS_k_extent - 1;
         const float dQ_predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
           (dO_l2_max * gdSKFactors[domain_k_factor_index] + delta_abs_max);
         const float dQ_dS_scale = dQ_predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
         const int32_t domain_k_scale_index_unclamped = k_domain_base + domain;
-        const int32_t domain_k_scale_index =
-          domain_k_scale_index_unclamped < k_scale_extent ? domain_k_scale_index_unclamped : k_scale_extent - 1;
+        const int32_t domain_k_scale_index = domain_k_scale_index_unclamped < k_scale_extent ? domain_k_scale_index_unclamped : k_scale_extent - 1;
         const float dQ_scale = dQ_dS_scale * gKScale(domain_k_scale_index);
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dQ_acc_0); ++idx)
@@ -1263,23 +1197,16 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
           dQ_sum_1(idx) += static_cast<float>(dQ_acc_1(idx)) * dQ_scale;
         }
       }
-      static_assert(
-        score_pair_offset * sizeof(cute::uint128_t) >= 16 * 16 * sizeof(float),
-        "Each dead score-pair slot must fit one warp-local dQ transpose");
-      auto *const dQ_stage = reinterpret_cast<float *>(
-        shared.score_pair_i8.begin() + n_tile * score_pair_offset);
-      float *const dQ_head = dQAccum + (batch * params.num_heads + head) * params.seq_len * HeadDim;
-      accumulate_dQ_float_fragment_shared_contiguous<IsAligned, Traits>(
+      float *const dQ_head = dQAccum + batch * params.stride_bz_dQAccum + head * params.stride_h_dQAccum;
+      accumulate_dQ_float_fragment_workspace<IsAligned, Traits>(
         dQ_sum_0,
-        dQ_stage,
         dQ_head,
         m_pair_base,
         dim_base,
         params.seq_len,
         lane_id);
-      accumulate_dQ_float_fragment_shared_contiguous<IsAligned, Traits>(
+      accumulate_dQ_float_fragment_workspace<IsAligned, Traits>(
         dQ_sum_1,
-        dQ_stage,
         dQ_head,
         m_pair_base + Traits::kBlockM,
         dim_base,
@@ -1294,17 +1221,14 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
     __syncthreads();
   }
 
-  half *const dKV_stage = reinterpret_cast<half *>(
-    shared.warp_scratch.dS_dKV.begin() + n_tile * warp_scratch_offset);
+  half *const dKV_stage = reinterpret_cast<half *>(shared.warp_scratch.dS_dKV.begin() + n_tile * warp_scratch_offset);
   if (n_valid)
   {
 #pragma unroll
     for (int32_t dim_block = 0; dim_block < kDimBlocks; ++dim_block)
     {
-      store_dKV_fragment_coalesced<Traits>(
-        dV_accum_frag, dim_block, gdV, dKV_stage, n_base, params.seq_len, lane_id);
-      store_dKV_fragment_coalesced<Traits>(
-        dK_accum_frag, dim_block, gdK, dKV_stage, n_base, params.seq_len, lane_id);
+      store_dKV_fragment_coalesced<Traits>(dV_accum_frag, dim_block, gdV, dKV_stage, n_base, params.seq_len, lane_id);
+      store_dKV_fragment_coalesced<Traits>(dK_accum_frag, dim_block, gdK, dKV_stage, n_base, params.seq_len, lane_id);
     }
   }
 }
