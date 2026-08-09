@@ -194,7 +194,7 @@ struct VOrQdOMmaBStorage
 };
 
 template <typename Traits>
-  requires (Traits::kCtaN >= 128)
+  requires (Traits::kCtaN == 128)
 struct VOrQdOMmaBStorage<Traits>
 {
   union
@@ -202,6 +202,14 @@ struct VOrQdOMmaBStorage<Traits>
     alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
     QdOMmaBPacketStorage<Traits> QdO_mma_b;
   };
+};
+
+template <typename Traits>
+  requires (Traits::kCtaN == 256)
+struct VOrQdOMmaBStorage<Traits>
+{
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
+  QdOMmaBPacketStorage<Traits> QdO_mma_b;
 };
 
 template <typename Traits>
@@ -218,7 +226,10 @@ struct SharedStorage2DWarp
 
   struct WarpScratchStorage
   {
-    alignas(16) cute::ArrayEngine<cute::uint128_t, Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutdSdKV>> dS_dKV;
+    static constexpr int32_t kUnits = Traits::kCtaN == 256
+      ? Traits::kCtaNMicroTiles / 2 * cute::cosize_v<typename Traits::SmemLayoutdSdKV>
+      : Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutdSdKV>;
+    alignas(16) cute::ArrayEngine<cute::uint128_t, kUnits> dS_dKV;
   };
 
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutQ>> q_i8;
@@ -794,16 +805,19 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
   auto tdPrV1 = thr_mma_half.partition_fragment_B(sVHalf1);
   auto tdPrV2 = thr_mma_half.partition_fragment_B(sVHalf2);
   auto tdPrV3 = thr_mma_half.partition_fragment_B(sVHalf3);
-  cute::clear(tdPrV0);
-  cute::clear(tdPrV1);
-  cute::clear(tdPrV2);
-  cute::clear(tdPrV3);
-  if (n_valid)
+  if constexpr (CtaN == 128)
   {
-    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf0), thr_copy_half_b.retile_D(tdPrV0));
-    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf1), thr_copy_half_b.retile_D(tdPrV1));
-    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf2), thr_copy_half_b.retile_D(tdPrV2));
-    cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf3), thr_copy_half_b.retile_D(tdPrV3));
+    cute::clear(tdPrV0);
+    cute::clear(tdPrV1);
+    cute::clear(tdPrV2);
+    cute::clear(tdPrV3);
+    if (n_valid)
+    {
+      cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf0), thr_copy_half_b.retile_D(tdPrV0));
+      cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf1), thr_copy_half_b.retile_D(tdPrV1));
+      cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf2), thr_copy_half_b.retile_D(tdPrV2));
+      cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf3), thr_copy_half_b.retile_D(tdPrV3));
+    }
   }
 
   constexpr int32_t kTailLoaderWarp0 = 1;
@@ -903,38 +917,54 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
         const auto sdOHalf1 = cute::recast<cute::half_t>(sdOTile1);
         auto tdPrdO = thr_mma_half.partition_fragment_A(sdOHalf0);
         cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf0), thr_copy_half_a.retile_D(tdPrdO));
-        if (dim_base == 0)
+        if constexpr (CtaN == 128)
         {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_0);
-        }
-        else if (dim_base == Traits::kBlockK)
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_0);
-        }
-        else if (dim_base == 2 * Traits::kBlockK)
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_0);
+          if (dim_base == 0)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_0);
+          }
+          else if (dim_base == Traits::kBlockK)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_0);
+          }
+          else if (dim_base == 2 * Traits::kBlockK)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_0);
+          }
+          else
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_0);
+          }
+          cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf1), thr_copy_half_a.retile_D(tdPrdO));
+          if (dim_base == 0)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_1);
+          }
+          else if (dim_base == Traits::kBlockK)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_1);
+          }
+          else if (dim_base == 2 * Traits::kBlockK)
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_1);
+          }
+          else
+          {
+            cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_1);
+          }
         }
         else
         {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_0);
-        }
-        cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf1), thr_copy_half_a.retile_D(tdPrdO));
-        if (dim_base == 0)
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV0, acc_dp_1);
-        }
-        else if (dim_base == Traits::kBlockK)
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV1, acc_dp_1);
-        }
-        else if (dim_base == 2 * Traits::kBlockK)
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV2, acc_dp_1);
-        }
-        else
-        {
-          cute::gemm(thr_mma_half, tdPrdO, tdPrV3, acc_dp_1);
+          const auto sVTile = cute::local_tile(
+            sV,
+            v_subtile_shape,
+            cute::make_coord(n_tile, dim_base / Traits::kBlockK));
+          const auto sVHalf = cute::recast<cute::half_t>(sVTile);
+          auto tdPrV = thr_mma_half.partition_fragment_B(sVHalf);
+          cute::copy(tiled_copy_half_b, thr_copy_half_b.partition_S(sVHalf), thr_copy_half_b.retile_D(tdPrV));
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV, acc_dp_0);
+          cute::copy(tiled_copy_half_a, thr_copy_half_a.partition_S(sdOHalf1), thr_copy_half_a.retile_D(tdPrdO));
+          cute::gemm(thr_mma_half, tdPrdO, tdPrV, acc_dp_1);
         }
       }
     }
@@ -1220,7 +1250,11 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
     __syncthreads();
   }
 
-  half *const dKV_stage = reinterpret_cast<half *>(shared.warp_scratch.dS_dKV.begin() + n_tile * warp_scratch_offset);
+  half *const dKV_stage_base = reinterpret_cast<half *>(shared.warp_scratch.dS_dKV.begin());
+  constexpr int32_t dKV_stage_stride = CtaN == 256
+    ? cute::cosize_v<typename Traits::SmemLayoutdKV>
+    : warp_scratch_offset * packed_elements<half>();
+  half *const dKV_stage = dKV_stage_base + n_tile * dKV_stage_stride;
   if (n_valid)
   {
 #pragma unroll
