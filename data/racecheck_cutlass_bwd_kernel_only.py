@@ -80,6 +80,7 @@ def main() -> None:
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--layout", choices=("NHD", "HND"), default="NHD")
+    parser.add_argument("--block-n", type=int, choices=(128, 256), default=128)
     args = parser.parse_args()
 
     importlib.import_module("sageattention._qattn_cutlass_sm80")
@@ -124,7 +125,7 @@ def main() -> None:
         32,
         64,
         64,
-        128,
+        args.block_n,
     )
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()

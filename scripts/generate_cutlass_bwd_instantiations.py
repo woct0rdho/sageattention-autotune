@@ -3,7 +3,10 @@ from pathlib import Path
 
 # Focused optimization currently builds only the exact head-64 target.
 HEAD_DIMS = (64,)
-CONFIGS = ((64, 128, 8, 32, 64),)
+CONFIGS = (
+    (64, 128, 8, 32, 64),
+    (64, 256, 16, 32, 64),
+)
 GENERATED_DIR = Path("csrc/qattn_cutlass/generated")
 DISPATCH_HEADER = "qk_int8_sv_f16_accum_f32_attn_bwd_cutlass_dispatch.cuh"
 SOURCE_PREFIX = "qk_int8_sv_f16_accum_f32_attn_bwd_cutlass"
