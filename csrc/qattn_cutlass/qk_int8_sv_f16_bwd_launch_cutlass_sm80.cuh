@@ -113,7 +113,9 @@ inline Params prepare_params(const Tensor &query,
   check_workspace_tensor(dS_k_factors, "dS_k_factors", 3, torch::headeronly::ScalarType::Float);
 
   STD_TORCH_CHECK(query.size(3) == 64, "Focused CUTLASS qattn backward currently supports head_dim 64 only");
-  STD_TORCH_CHECK(bwd_block_m == 64 && bwd_block_n == 128, "Focused CUTLASS qattn backward currently requires the 64x128 CTA");
+  STD_TORCH_CHECK(
+    bwd_block_m == 64 && (bwd_block_n == 128 || bwd_block_n == 256),
+    "Focused CUTLASS qattn backward currently requires a 64x128 or 64x256 CTA");
   STD_TORCH_CHECK(blk_q == 32 && blk_k == 64, "Focused CUTLASS qattn backward requires QBlock=32 and KBlock=64");
   Params params = {
     static_cast<int32_t>(query.size(3)),
@@ -228,7 +230,10 @@ void launch_mma(const Tensor &query,
                     const Params &params,
                     const double sm_scale)
 {
-  static_assert(HeadDim == 64 && BlockM == 64 && BlockN == 128 && NumWarps == 8, "Only the focused head-64 64x128 backward matmul configuration is built");
+  static_assert(
+    HeadDim == 64 && BlockM == 64 &&
+      ((BlockN == 128 && NumWarps == 8) || (BlockN == 256 && NumWarps == 16)),
+    "Only the focused head-64 64x128/64x256 backward matmul configurations are built");
   static_assert(QuantBlockQ == 32 && QuantBlockK == 64, "Focused backward A/B uses the selected QBlock=32/KBlock=64 quantization format");
   constexpr int32_t kKernelWarps = NumWarps;
   using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;

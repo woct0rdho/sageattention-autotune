@@ -180,7 +180,7 @@ struct QdOMmaBPacketStorage
 };
 
 template <typename Traits>
-  requires (Traits::kCtaN == 128)
+  requires (Traits::kCtaN >= 128)
 struct QdOMmaBPacketStorage<Traits>
 {
   alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutQ>> q_i8_mma_b;
@@ -194,7 +194,7 @@ struct VOrQdOMmaBStorage
 };
 
 template <typename Traits>
-  requires (Traits::kCtaN == 128)
+  requires (Traits::kCtaN >= 128)
 struct VOrQdOMmaBStorage<Traits>
 {
   union
@@ -211,7 +211,7 @@ struct SharedStorage2DWarp
   static_assert(
     Traits::kCtaM == 64 &&
       ((Traits::kNumWarps == 8 && (Traits::kCtaN == 64 || Traits::kCtaN == 128)) ||
-       (Traits::kNumWarps == 16 && Traits::kCtaN == 128)),
+       (Traits::kNumWarps == 16 && (Traits::kCtaN == 128 || Traits::kCtaN == 256))),
     "2D warp storage is specialized for the 64-row, two-M-half schedule");
   using SmemLayoutdOFp16Pair = decltype(make_smem_matrix_layout<2 * Traits::kBlockM, Traits::kHalfLoadVecCols>());
   using SmemLayoutMPair = decltype(cute::make_layout(cute::make_shape(cute::Int<2 * Traits::kBlockM>{}), cute::make_stride(cute::_1{})));
@@ -626,7 +626,7 @@ template <int32_t HeadDim,
           int32_t QuantBlockQ,
           int32_t QuantBlockK,
           bool IsAligned>
-__global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
+__global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
                                                              const int8_t *__restrict__ const K,
                                                              const float *__restrict__ const QScale,
                                                              const float *__restrict__ const KScale,
@@ -646,7 +646,10 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
   using Storage = SharedStorage2DWarp<Traits>;
-  static_assert(HeadDim == 64 && CtaM == 64 && CtaN == 128 && NumWarps == 8, "K128 eight-warp kernel is specialized for the head64 M64xN128 schedule");
+  static_assert(
+    HeadDim == 64 && CtaM == 64 &&
+      ((CtaN == 128 && NumWarps == 8) || (CtaN == 256 && NumWarps == 16)),
+    "K128 kernel is specialized for the head64 M64xN128/N256 schedules");
   static_assert(QuantBlockQ == 32 && QuantBlockK == 64, "K128 eight-warp kernel currently implements the selected QBlock=32/KBlock=64 quantization format");
   static_assert(Traits::kCtaNMicroTiles == NumWarps && Traits::kCtaMMicroTiles == 4, "K128 ownership requires one physical warp per N16 tile and two temporal M halves");
 
@@ -680,7 +683,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
   constexpr int32_t kDimBlocks = HeadDim / Traits::kBlockK;
   constexpr int32_t kdQNPairs = Traits::kCtaN / (2 * Traits::kBlockN);
   constexpr int32_t kQuantDomains = Traits::kCtaN / QuantBlockK;
-  static_assert(kDimBlocks == kdQNPairs && kQuantDomains == 2, "K128 dQ ownership expects four N32 pairs and two KBlock=64 domains");
+  static_assert(
+    kdQNPairs == 2 * kQuantDomains && (kQuantDomains == 2 || kQuantDomains == 4),
+    "K128 dQ ownership expects two N32 pairs per KBlock=64 domain");
   const int32_t pair_blocks = (params.seq_len + 2 * Traits::kBlockM - 1) / (2 * Traits::kBlockM);
   const float *const gdOScale = dOScale + (batch * params.num_heads + head) * pair_blocks * kDimBlocks;
   const int32_t dS_q_extent = (params.seq_len + 32 - 1) / 32;
@@ -1135,9 +1140,9 @@ __global__ __maxnreg__(243) void fused_mma_kernel_k128_8warp(const int8_t *__res
       load_row_state_pair(gLse, gDelta, sLse, sDelta, next_m_pair_base, params.seq_len, lane_id);
     }
 
-    if ((n_tile & 1) == 0)
+    if ((CtaN == 128 && (n_tile & 1) == 0) || (CtaN == 256 && warp_id < kDimBlocks))
     {
-      const int32_t dim_base = n_pair * Traits::kBlockK;
+      const int32_t dim_base = (CtaN == 128 ? n_pair : warp_id) * Traits::kBlockK;
       // Keep each packed K fragment live across both M halves; the alternative reloads it for each half.
       auto dQ_acc_like = cute::partition_fragment_C(score_mma, BlockMNShape{});
       auto dQ_sum_0 = cute::make_fragment_like<float>(dQ_acc_like);

@@ -132,3 +132,16 @@ def test_sagebwd_cutlass_config_matches_flashattention(
     _check_close(dq, dq_ref, "dQ", format_experiment=True)
     _check_close(dk, dk_ref, "dK", format_experiment=True)
     _check_close(dv, dv_ref, "dV", format_experiment=True)
+
+
+@pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
+@pytest.mark.parametrize("seq_len", (256, 257, 512, 513))
+def test_sagebwd_cutlass_n256_matches_n128(tensor_layout: str, seq_len: int) -> None:
+    q, k, v, dout = _make_qkvo(seq_len=seq_len, tensor_layout=tensor_layout)
+    out, lse, *_ = _flash_forward_backward(q, k, v, dout, tensor_layout)
+    n128 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, (32, 64, 64, 128))
+    n256 = _sageattn_cutlass_bwd_configured(q, k, v, out, dout, lse, tensor_layout, (32, 64, 64, 256))
+
+    torch.testing.assert_close(n256[0], n128[0], rtol=0, atol=2e-4)
+    torch.testing.assert_close(n256[1], n128[1], rtol=0, atol=0)
+    torch.testing.assert_close(n256[2], n128[2], rtol=0, atol=0)
