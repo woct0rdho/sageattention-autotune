@@ -5,13 +5,15 @@ import torch.nn.functional as F
 
 from .triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from .triton.quant_per_block import per_block_int8
-from .utils import _lse_correction, _pad_qkv
+from .utils import _lse_correction, _pad_qkv, _padded_head_dim
 
 _BWD_CONFIG = (32, 64, 64, 128)
-_BWD_CONFIGS = (
-    _BWD_CONFIG,
-    (32, 64, 64, 256),
-)
+_BWD_CONFIG_HD128 = (32, 64, 64, 64)
+_BWD_CONFIGS_BY_HEAD_DIM = {
+    64: (_BWD_CONFIG, (32, 64, 64, 256)),
+    128: (_BWD_CONFIG_HD128,),
+}
+_BWD_CONFIGS = tuple(config for configs in _BWD_CONFIGS_BY_HEAD_DIM.values() for config in configs)
 
 importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
 _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
@@ -69,16 +71,15 @@ def _sageattn_cutlass_bwd_configured(
         raise ValueError("q, k, v, output, and grad_output must have the same shape.")
     if len({q.device, k.device, v.device, output.device, grad_output.device, lse.device}) != 1:
         raise ValueError("All tensors must be on the same device.")
-    if config not in _BWD_CONFIGS:
-        raise ValueError(f"Unsupported CUTLASS backward config: {config}.")
-
     head_dim, q, k, v = _pad_qkv(q, k, v)
     if output.size(-1) != q.size(-1):
         output = F.pad(output, (0, q.size(-1) - output.size(-1)))
     if grad_output.size(-1) != q.size(-1):
         grad_output = F.pad(grad_output, (0, q.size(-1) - grad_output.size(-1)))
-    if q.size(-1) != 64:
-        raise ValueError("Focused CUTLASS qattn backward currently supports padded head_dim 64 only.")
+    if q.size(-1) not in (64, 128):
+        raise ValueError("CUTLASS qattn backward currently supports padded head_dim 64 or 128.")
+    if config not in _BWD_CONFIGS_BY_HEAD_DIM[q.size(-1)]:
+        raise ValueError(f"Unsupported CUTLASS backward config for head_dim {q.size(-1)}: {config}.")
     if any(tensor.stride(-1) != 1 for tensor in (q, k, v, output, grad_output)):
         raise ValueError("Last dimension of q, k, v, output, and grad_output must be contiguous.")
 
@@ -174,4 +175,8 @@ def sageattn_cutlass_bwd(
     tensor_layout: str = "HND",
     smooth_k: bool = True,
 ) -> CutlassSageBwdResult:
-    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, smooth_k, _BWD_CONFIG)
+    padded_head_dim = _padded_head_dim(q.size(-1))
+    if padded_head_dim not in _BWD_CONFIGS_BY_HEAD_DIM:
+        raise ValueError("CUTLASS qattn backward currently supports padded head_dim 64 or 128.")
+    config = _BWD_CONFIGS_BY_HEAD_DIM[padded_head_dim][0]
+    return _sageattn_cutlass_bwd_configured(q, k, v, output, grad_output, lse, tensor_layout, smooth_k, config)

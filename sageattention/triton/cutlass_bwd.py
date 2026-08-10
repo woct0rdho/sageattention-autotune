@@ -24,7 +24,6 @@ from .quant_per_block import _INT8_SCALE_FLOOR, _INT8_SCALE_INV, _round_to_int8
 _CUTLASS_BWD_BLOCK_M = 32
 _CUTLASS_BWD_BLOCK_K = 16
 _CUTLASS_BWD_K_BLOCK = 64
-_CUTLASS_BWD_DIM_BLOCKS = 64 // _CUTLASS_BWD_BLOCK_K
 
 
 @triton.autotune(
@@ -282,8 +281,8 @@ def preprocess_delta_zero_dq(
     heads = output.size(1) if tensor_layout == "HND" else output.size(2)
     seq_len = output.size(2) if tensor_layout == "HND" else output.size(1)
     head_dim = output.size(-1)
-    if head_dim != 64:
-        raise ValueError("CUTLASS backward preprocessing currently supports head_dim 64 only.")
+    if head_dim not in (64, 128):
+        raise ValueError("CUTLASS backward preprocessing currently supports head_dim 64 or 128.")
 
     output = output.contiguous()
     grad_output = grad_output.contiguous()
@@ -292,6 +291,7 @@ def preprocess_delta_zero_dq(
 
     q_blocks = triton.cdiv(seq_len, _CUTLASS_BWD_BLOCK_M)
     k_blocks = triton.cdiv(seq_len, _CUTLASS_BWD_K_BLOCK)
+    dim_blocks = head_dim // _CUTLASS_BWD_BLOCK_K
     dq_accum_rows = q_blocks * _CUTLASS_BWD_BLOCK_M
     delta = torch.empty((batch, heads, seq_len), device=output.device, dtype=torch.float32)
     dq_accum = torch.empty((batch, heads, dq_accum_rows, head_dim), device=output.device, dtype=torch.float32)
@@ -299,7 +299,7 @@ def preprocess_delta_zero_dq(
         torch.empty((batch, heads, dq_accum_rows), device=output.device, dtype=torch.float32) if smooth_k else delta
     )
     do_int8 = torch.empty((batch, heads, seq_len, head_dim), device=output.device, dtype=torch.int8)
-    do_scale = torch.empty((batch, heads, q_blocks, _CUTLASS_BWD_DIM_BLOCKS), device=output.device, dtype=torch.float32)
+    do_scale = torch.empty((batch, heads, q_blocks, dim_blocks), device=output.device, dtype=torch.float32)
 
     ds_q_factors = torch.empty((batch, heads, q_blocks, 2), device=output.device, dtype=torch.float32)
     ds_k_factors = torch.empty((batch, heads, k_blocks), device=output.device, dtype=torch.float32)
@@ -342,7 +342,7 @@ def preprocess_delta_zero_dq(
         HEAD_DIM=head_dim,
         BLOCK_M=_CUTLASS_BWD_BLOCK_M,
         BLOCK_K=_CUTLASS_BWD_BLOCK_K,
-        DIM_BLOCKS=_CUTLASS_BWD_DIM_BLOCKS,
+        DIM_BLOCKS=dim_blocks,
         ZERO_DS_SUM=smooth_k,
         IS_EVEN_M=seq_len % _CUTLASS_BWD_BLOCK_M == 0,
     )

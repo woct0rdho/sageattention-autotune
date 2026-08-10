@@ -61,10 +61,7 @@ inline void check_scale_tensor(const Tensor &tensor, const char *const name)
   CHECK_DIMS(tensor, 3);
 }
 
-inline void check_workspace_tensor(const Tensor &tensor,
-                                   const char *const name,
-                                   const int64_t dims,
-                                   const torch::headeronly::ScalarType dtype)
+inline void check_workspace_tensor(const Tensor &tensor, const char *const name, const int64_t dims, const torch::headeronly::ScalarType dtype)
 {
   CHECK_CUDA(tensor);
   CHECK_CONTIGUOUS(tensor);
@@ -115,10 +112,7 @@ inline Params prepare_params(const Tensor &query,
   check_workspace_tensor(dS_q_factors, "dS_q_factors", 4, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dS_k_factors, "dS_k_factors", 3, torch::headeronly::ScalarType::Float);
 
-  STD_TORCH_CHECK(query.size(3) == 64, "Focused CUTLASS qattn backward currently supports head_dim 64 only");
-  STD_TORCH_CHECK(
-    bwd_block_m == 64 && (bwd_block_n == 128 || bwd_block_n == 256),
-    "Focused CUTLASS qattn backward currently requires a 64x128 or 64x256 CTA");
+  STD_TORCH_CHECK(query.size(3) == 64 || query.size(3) == 128, "CUTLASS qattn backward currently supports head_dim 64 or 128");
   STD_TORCH_CHECK(blk_q == 32 && blk_k == 64, "Focused CUTLASS qattn backward requires QBlock=32 and KBlock=64");
   Params params = {
     static_cast<int32_t>(query.size(3)),
@@ -204,7 +198,7 @@ inline Params prepare_params(const Tensor &query,
     CHECK_SHAPE(dS_sum, params.batch_size, params.num_heads, dq_accum_rows);
   }
   CHECK_SHAPE(dO_int8, params.batch_size, params.num_heads, params.seq_len, params.head_dim);
-  CHECK_SHAPE(dO_scale, params.batch_size, params.num_heads, q_summary_blocks, 4);
+  CHECK_SHAPE(dO_scale, params.batch_size, params.num_heads, q_summary_blocks, params.head_dim / 16);
   CHECK_SHAPE(dS_q_factors, params.batch_size, params.num_heads, q_summary_blocks, 2);
   CHECK_SHAPE(dS_k_factors, params.batch_size, params.num_heads, k_summary_blocks);
   CHECK_SHAPE(query_scale, params.batch_size, params.num_heads, q_scale_blocks);
@@ -213,46 +207,46 @@ inline Params prepare_params(const Tensor &query,
   return params;
 }
 
-template <int32_t HeadDim,
-          int32_t BlockM,
-          int32_t BlockN,
-          int32_t NumWarps,
-          int32_t QuantBlockQ,
-          int32_t QuantBlockK>
+template <int32_t HeadDim, int32_t BlockM, int32_t BlockN, int32_t NumWarps, int32_t QuantBlockQ, int32_t QuantBlockK>
 void launch_mma(const Tensor &query,
-                    const Tensor &key,
-                    const Tensor &query_scale,
-                    const Tensor &key_scale,
-                    const Tensor &value,
-                    const Tensor &dO,
-                    const Tensor &lse,
-                    const Tensor &delta,
-                    const Tensor &dQ_accum,
-                    const Tensor &dS_sum,
-                    const Tensor &dO_int8,
-                    const Tensor &dO_scale,
-                    const Tensor &dS_q_factors,
-                    const Tensor &dS_k_factors,
-                    const Tensor &dK,
-                    const Tensor &dV,
-                    const Params &params,
-                    const double sm_scale,
-                    const bool smooth_k)
+                const Tensor &key,
+                const Tensor &query_scale,
+                const Tensor &key_scale,
+                const Tensor &value,
+                const Tensor &dO,
+                const Tensor &lse,
+                const Tensor &delta,
+                const Tensor &dQ_accum,
+                const Tensor &dS_sum,
+                const Tensor &dO_int8,
+                const Tensor &dO_scale,
+                const Tensor &dS_q_factors,
+                const Tensor &dS_k_factors,
+                const Tensor &dK,
+                const Tensor &dV,
+                const Params &params,
+                const double sm_scale,
+                const bool smooth_k)
 {
-  static_assert(
-    HeadDim == 64 && BlockM == 64 &&
-      ((BlockN == 128 && NumWarps == 8) || (BlockN == 256 && NumWarps == 16)),
-    "Only the focused head-64 64x128/64x256 backward matmul configurations are built");
   static_assert(QuantBlockQ == 32 && QuantBlockK == 64, "Focused backward A/B uses the selected QBlock=32/KBlock=64 quantization format");
   constexpr int32_t kKernelWarps = NumWarps;
-  using KernelTraits = BwdTileTraits<64, BlockM, BlockN, kKernelWarps>;
+  using KernelTraits = BwdTileTraits<HeadDim, BlockM, BlockN, kKernelWarps>;
   const auto device_guard = make_device_guard(query);
   const auto stream = get_current_cuda_stream(query);
   const int32_t kv_blocks = div_ceil_int(params.seq_len, KernelTraits::kCtaN);
 
   const dim3 kv_grid(kv_blocks, params.num_heads, params.batch_size);
 
-  constexpr int32_t smem_size = sizeof(SharedStorage2DWarp<KernelTraits>);
+  constexpr int32_t smem_size = []() {
+    if constexpr (HeadDim == 64)
+    {
+      return static_cast<int32_t>(sizeof(SharedStorage2DWarp<KernelTraits>));
+    }
+    else
+    {
+      return static_cast<int32_t>(sizeof(SharedStorageHD128<KernelTraits>));
+    }
+  }();
   const auto launch_kernel = [&](auto kernel) {
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     kernel<<<kv_grid, dim3(32, kKernelWarps), smem_size, stream>>>(
@@ -275,21 +269,40 @@ void launch_mma(const Tensor &query,
       params,
       static_cast<float>(sm_scale));
   };
-  if (smooth_k)
+  if constexpr (HeadDim == 64)
   {
-    auto kernel = params.seq_len % BlockN == 0
-      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, true>
-      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, true>;
-    launch_kernel(kernel);
+    if (smooth_k)
+    {
+      auto kernel = params.seq_len % BlockN == 0
+        ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, true>
+        : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, true>;
+      launch_kernel(kernel);
+    }
+    else
+    {
+      auto kernel = params.seq_len % BlockN == 0
+        ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, false>
+        : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, false>;
+      launch_kernel(kernel);
+    }
   }
   else
   {
-    auto kernel = params.seq_len % BlockN == 0
-      ? fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, false>
-      : fused_mma_kernel_k128_8warp<64, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, false>;
-    launch_kernel(kernel);
+    if (smooth_k)
+    {
+      auto kernel = params.seq_len % BlockN == 0
+        ? fused_mma_kernel_hd128_2d<128, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, true>
+        : fused_mma_kernel_hd128_2d<128, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, true>;
+      launch_kernel(kernel);
+    }
+    else
+    {
+      auto kernel = params.seq_len % BlockN == 0
+        ? fused_mma_kernel_hd128_2d<128, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, true, false>
+        : fused_mma_kernel_hd128_2d<128, BlockM, BlockN, kKernelWarps, QuantBlockQ, QuantBlockK, false, false>;
+      launch_kernel(kernel);
+    }
   }
-
 }
 
 } // namespace sageattention::qattn_cutlass_bwd
@@ -325,7 +338,6 @@ void qk_int8_sv_f16_accum_f32_attn_bwd_cutlass(const Tensor &query,
 
   const auto layout = bwd::parse_tensor_layout(tensor_layout);
   const auto params = bwd::prepare_params(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, layout, blk_q, blk_k, bwd_block_m, bwd_block_n, smooth_k);
-
   bwd::launch_configured_mma(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale, smooth_k);
 }
 #endif

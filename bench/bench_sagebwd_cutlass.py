@@ -10,7 +10,7 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import _BWD_CONFIGS
+from sageattention.cutlass_bwd import _BWD_CONFIGS, _BWD_CONFIGS_BY_HEAD_DIM
 from sageattention.cutlass_compile import _qattn_cutlass_sm80
 from sageattention.triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
@@ -49,8 +49,12 @@ def _parse_block_configs(values: list[str] | None) -> tuple[BlockConfig, ...]:
     return configs
 
 
-def _make_candidates(block_configs: tuple[BlockConfig, ...]) -> tuple[BackwardCandidate, ...]:
-    return block_configs
+def _make_head_dim_candidates(
+    head_dim: int,
+    block_configs: tuple[BlockConfig, ...],
+) -> tuple[BackwardCandidate, ...]:
+    supported = _BWD_CONFIGS_BY_HEAD_DIM[head_dim]
+    return tuple(config for config in block_configs if config in supported)
 
 
 def _bench(fn, *args, warmup: int, repeats: int) -> dict[str, float]:
@@ -520,8 +524,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("batch size must be positive")
     if any(value <= 0 for value in (*args.num_heads, *args.seq_lens)):
         raise ValueError("number of heads and sequence lengths must be positive")
-    if any(head_dim != 64 for head_dim in args.head_dims):
-        raise ValueError("CUTLASS backward currently supports head dimension 64 only")
+    if any(head_dim not in _BWD_CONFIGS_BY_HEAD_DIM for head_dim in args.head_dims):
+        raise ValueError("CUTLASS backward currently supports head dimensions 64 and 128")
     if args.warmup < 0 or args.repeats <= 0:
         raise ValueError("warmup must be non-negative and repeats must be positive")
 
@@ -533,7 +537,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-heads", nargs="+", type=int, default=[16, 32])
     parser.add_argument("--seq-lens", nargs="+", type=int, default=[4096, 8192])
-    parser.add_argument("--head-dims", nargs="+", type=int, default=[64])
+    parser.add_argument("--head-dims", nargs="+", type=int, default=[64, 128])
     parser.add_argument("--layout", choices=["HND", "NHD"], default="NHD")
     parser.add_argument(
         "--block-configs",
@@ -555,9 +559,6 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     block_configs = _parse_block_configs(args.block_configs)
-    candidates = _make_candidates(block_configs)
-    if not candidates:
-        raise ValueError("No supported backward block configurations were selected.")
     include_end_to_end = args.mode in ("all", "end-to-end")
     include_kernel_only = args.mode in ("all", "kernel-only")
     smooth_k_values = tuple(value == "true" for value in args.smooth_k)
@@ -577,7 +578,7 @@ def main() -> None:
         "end_to_end excludes Q/K quantization: backward-compatible Q/K INT8 tensors and scales are prepared outside timing; it includes preprocessing, output/workspace allocation, the main kernel, and dQ conversion"
     )
     print(
-        "Sage forward setup is not timed and uses the head-64 Q32/K64 artifact domain; its saved tensors are still discarded, so benchmark preparation remains a reuse proxy until forward state is routed into backward; sage_speedup > 1 means Sage is faster"
+        "Sage forward setup is not timed and uses the fixed Q32/K64 artifact domain; its saved tensors are still discarded, so benchmark preparation remains a reuse proxy until forward state is routed into backward; sage_speedup > 1 means Sage is faster"
     )
     print(
         "kind,batch_size,num_heads,head_dim,seq_len,layout,smooth_k,block_config,backward_flops,"
@@ -588,6 +589,10 @@ def main() -> None:
     rows: list[dict[str, object]] = []
     for num_heads in args.num_heads:
         for head_dim in args.head_dims:
+            candidates = _make_head_dim_candidates(head_dim, block_configs)
+            if not candidates:
+                selected = ", ".join(_format_block_config(config) for config in block_configs)
+                raise ValueError(f"No selected backward block config supports head dimension {head_dim}: {selected}")
             for seq_len in args.seq_lens:
                 q, k, v, dout = _make_inputs(args.batch_size, num_heads, seq_len, head_dim, args.layout)
                 for smooth_k in smooth_k_values:

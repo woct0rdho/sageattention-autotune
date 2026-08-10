@@ -2,10 +2,16 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sageattention.cutlass_bwd import _BWD_CONFIGS, _sageattn_cutlass_bwd_configured
+from sageattention.cutlass_bwd import (
+    _BWD_CONFIGS_BY_HEAD_DIM,
+    _sageattn_cutlass_bwd_configured,
+    sageattn_cutlass_bwd,
+)
 from sageattention.triton.cutlass_bwd import convert_dq
 
-_BWD_TEST_CANDIDATES = _BWD_CONFIGS
+_BWD_TEST_CANDIDATES = tuple(
+    (head_dim, config) for head_dim, configs in _BWD_CONFIGS_BY_HEAD_DIM.items() for config in configs
+)
 
 
 def _make_qkvo(
@@ -89,9 +95,10 @@ def _check_close(actual: torch.Tensor, expected: torch.Tensor, name: str, *, for
 
 
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
+@pytest.mark.parametrize("head_dim", (64, 128))
 @pytest.mark.parametrize("smooth_k", (False, True))
-def test_cutlass_dq_workspace_conversion(tensor_layout: str, smooth_k: bool) -> None:
-    batch, heads, seq_len, head_dim = 2, 3, 65, 64
+def test_cutlass_dq_workspace_conversion(tensor_layout: str, head_dim: int, smooth_k: bool) -> None:
+    batch, heads, seq_len = 2, 3, 65
     padded_seq_len = ((seq_len + 31) // 32) * 32
     dq_accum = (
         torch.arange(batch * heads * padded_seq_len * head_dim, device="cuda", dtype=torch.float32) % 1000
@@ -135,9 +142,8 @@ def test_cutlass_dq_workspace_conversion(tensor_layout: str, smooth_k: bool) -> 
     torch.testing.assert_close(grad_query, expected.to(torch.float16), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("config", _BWD_TEST_CANDIDATES)
+@pytest.mark.parametrize(("head_dim", "config"), _BWD_TEST_CANDIDATES)
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
-@pytest.mark.parametrize("head_dim", (64,))
 @pytest.mark.parametrize("seq_len", (64, 65))
 @pytest.mark.parametrize("smooth_k", (False, True))
 def test_sagebwd_cutlass_config_matches_flashattention(
@@ -153,6 +159,27 @@ def test_sagebwd_cutlass_config_matches_flashattention(
     _check_close(dq, dq_ref, "dQ", format_experiment=True)
     _check_close(dk, dk_ref, "dK", format_experiment=True)
     _check_close(dv, dv_ref, "dV", format_experiment=True)
+
+
+@pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
+@pytest.mark.parametrize("head_dim", (64, 128))
+def test_sagebwd_cutlass_public_default_selects_head_dim_config(tensor_layout: str, head_dim: int) -> None:
+    q, k, v, dout = _make_qkvo(seq_len=65, head_dim=head_dim, tensor_layout=tensor_layout)
+    out, lse, *_ = _flash_forward_backward(q, k, v, dout, tensor_layout)
+    expected = _sageattn_cutlass_bwd_configured(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        tensor_layout,
+        True,
+        _BWD_CONFIGS_BY_HEAD_DIM[head_dim][0],
+    )
+    actual = sageattn_cutlass_bwd(q, k, v, out, dout, lse, tensor_layout)
+    for index, (actual_grad, expected_grad) in enumerate(zip(actual, expected)):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=1e-6 if index == 0 else 0)
 
 
 @pytest.mark.parametrize("tensor_layout", ("NHD", "HND"))
