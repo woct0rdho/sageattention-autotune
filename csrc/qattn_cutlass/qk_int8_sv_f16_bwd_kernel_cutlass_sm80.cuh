@@ -242,6 +242,37 @@ struct SharedStorage2DWarp
   cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
 };
 
+template <typename Traits>
+struct SharedStorageHD128
+{
+  static_assert(
+    Traits::kHeadDim == 128 && Traits::kCtaM == 64 && Traits::kCtaN == 64 && Traits::kNumWarps == 8,
+    "D128 storage is specialized for the M64xN64 eight-warp schedule");
+  using SmemLayoutdOFp16Pair = decltype(make_smem_matrix_layout<2 * Traits::kBlockM, Traits::kHalfLoadVecCols>());
+  using SmemLayoutMPair = decltype(cute::make_layout(cute::make_shape(cute::Int<2 * Traits::kBlockM>{}), cute::make_stride(cute::_1{})));
+
+  struct WarpScratchStorage
+  {
+    alignas(16) cute::ArrayEngine<
+      cute::uint128_t,
+      Traits::kNumWarps * cute::cosize_v<typename Traits::SmemLayoutdSdKV>> dS_dKV;
+  };
+
+  alignas(16) cute::ArrayEngine<cute::uint128_t, 2 * cute::cosize_v<typename Traits::SmemLayoutQ>> q_i8;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, 2 * cute::cosize_v<typename Traits::SmemLayoutdO>> dO_i8;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutK>> k_i8;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutK>> k_i8_mma_b;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, 2 * cute::cosize_v<SmemLayoutdOFp16Pair>> dO_fp16_pair;
+  WarpScratchStorage warp_scratch;
+  alignas(16) cute::ArrayEngine<
+    cute::uint128_t,
+    Traits::kSmemWarps * cute::cosize_v<typename Traits::SmemLayoutScorePair>> score_pair_i8;
+  alignas(16) cute::ArrayEngine<cute::uint128_t, cute::cosize_v<typename Traits::SmemLayoutV>> v;
+  cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> lse;
+  cute::ArrayEngine<float, cute::cosize_v<SmemLayoutMPair>> delta;
+  float p_scale[Traits::kNumWarps];
+};
+
 template <typename Storage, typename Layout>
 __device__ __forceinline__ auto make_smem_tensor(Storage& storage, const Layout layout)
 {
@@ -252,6 +283,14 @@ template <typename Storage, typename Layout>
 __device__ __forceinline__ auto make_smem_tensor(Storage& storage, const Layout layout, const int32_t offset)
 {
   return cute::make_tensor(cute::make_smem_ptr(storage.begin() + offset), layout);
+}
+
+template <typename Tensor>
+__device__ __forceinline__ auto make_transposed_tensor(Tensor tensor)
+{
+  CUTE_STATIC_ASSERT_V(cute::rank(tensor) == cute::_2{});
+  const auto transpose = cute::make_layout(cute::make_shape(cute::size<1>(tensor), cute::size<0>(tensor)), cute::GenRowMajor{});
+  return cute::make_tensor(tensor.data(), cute::composition(tensor.layout(), transpose));
 }
 
 struct Params {
@@ -344,10 +383,10 @@ __device__ __forceinline__ float warp_reduce_max(float value)
 
 template <bool IsAligned, typename Fragment>
 __device__ __forceinline__ void accumulate_dS_row_sum(const Fragment &dS,
-                                                       float *const dst,
-                                                       const int32_t row_base,
-                                                       const int32_t seq_len,
-                                                       const int32_t lane_id)
+                                                      float *const dst,
+                                                      const int32_t row_base,
+                                                      const int32_t seq_len,
+                                                      const int32_t lane_id)
 {
   static_assert(cute::size(Fragment{}) == 8, "dS row reduction expects eight score-C values per lane");
   float row_sum_0 = dS(0) + dS(1) + dS(4) + dS(5);
@@ -659,32 +698,26 @@ __device__ __forceinline__ void accumulate_dQ_float_fragment_workspace(const Acc
   }
 }
 
-template <int32_t HeadDim,
-          int32_t CtaM,
-          int32_t CtaN,
-          int32_t NumWarps,
-          int32_t QuantBlockQ,
-          int32_t QuantBlockK,
-          bool IsAligned,
-          bool SmoothK>
-__global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
-                                                             const int8_t *__restrict__ const K,
-                                                             const float *__restrict__ const QScale,
-                                                             const float *__restrict__ const KScale,
-                                                             const half *__restrict__ const V,
-                                                             const half *__restrict__ const dO,
-                                                             const int8_t *__restrict__ const dOInt8,
-                                                             const float *__restrict__ const dOScale,
-                                                             const float *__restrict__ const dSQFactors,
-                                                             const float *__restrict__ const dSKFactors,
-                                                             const float *__restrict__ const Lse,
-                                                             const float *__restrict__ const Delta,
-                                                             float *__restrict__ const dQAccum,
-                                                             float *__restrict__ const dSSum,
-                                                             half *__restrict__ const dK,
-                                                             half *__restrict__ const dV,
-                                                             const Params params,
-                                                             const float sm_scale)
+template <int32_t HeadDim, int32_t CtaM, int32_t CtaN, int32_t NumWarps, int32_t QuantBlockQ, int32_t QuantBlockK, bool IsAligned, bool SmoothK>
+__global__ __maxnreg__(NumWarps == 16 ? 128 : 243)
+void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
+                                 const int8_t *__restrict__ const K,
+                                 const float *__restrict__ const QScale,
+                                 const float *__restrict__ const KScale,
+                                 const half *__restrict__ const V,
+                                 const half *__restrict__ const dO,
+                                 const int8_t *__restrict__ const dOInt8,
+                                 const float *__restrict__ const dOScale,
+                                 const float *__restrict__ const dSQFactors,
+                                 const float *__restrict__ const dSKFactors,
+                                 const float *__restrict__ const Lse,
+                                 const float *__restrict__ const Delta,
+                                 float *__restrict__ const dQAccum,
+                                 float *__restrict__ const dSSum,
+                                 half *__restrict__ const dK,
+                                 half *__restrict__ const dV,
+                                 const Params params,
+                                 const float sm_scale)
 {
   using Traits = BwdTileTraits<HeadDim, CtaM, CtaN, NumWarps>;
   using Storage = SharedStorage2DWarp<Traits>;
@@ -1318,3 +1351,5 @@ __global__ __maxnreg__(NumWarps == 16 ? 128 : 243) void fused_mma_kernel_k128_8w
 }
 
 } // namespace sageattention::qattn_cutlass_bwd
+
+#include "qk_int8_sv_f16_bwd_kernel_hd128_cutlass_sm80.cuh"

@@ -48,6 +48,27 @@ extern template void launch_mma<64, 64, 256, 16, 32, 64>(
   double sm_scale,
   bool smooth_k);
 
+extern template void launch_mma<128, 64, 64, 8, 32, 64>(
+  const torch::stable::Tensor &query,
+  const torch::stable::Tensor &key,
+  const torch::stable::Tensor &query_scale,
+  const torch::stable::Tensor &key_scale,
+  const torch::stable::Tensor &value,
+  const torch::stable::Tensor &dO,
+  const torch::stable::Tensor &lse,
+  const torch::stable::Tensor &delta,
+  const torch::stable::Tensor &dQ_accum,
+  const torch::stable::Tensor &dS_sum,
+  const torch::stable::Tensor &dO_int8,
+  const torch::stable::Tensor &dO_scale,
+  const torch::stable::Tensor &dS_q_factors,
+  const torch::stable::Tensor &dS_k_factors,
+  const torch::stable::Tensor &dK,
+  const torch::stable::Tensor &dV,
+  const Params &params,
+  double sm_scale,
+  bool smooth_k);
+
 inline void launch_configured_mma(const torch::stable::Tensor &query,
                                   const torch::stable::Tensor &key,
                                   const torch::stable::Tensor &query_scale,
@@ -78,6 +99,14 @@ inline void launch_configured_mma(const torch::stable::Tensor &query,
       if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 256)
       {
         launch_mma<64, 64, 256, 16, 32, 64>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale, smooth_k);
+        return;
+      }
+  }
+  if (params.head_dim == 128)
+  {
+      if (params.blk_q == 32 && params.blk_k == 64 && params.bwd_block_m == 64 && params.bwd_block_n == 64)
+      {
+        launch_mma<128, 64, 64, 8, 32, 64>(query, key, query_scale, key_scale, value, dO, lse, delta, dQ_accum, dS_sum, dO_int8, dO_scale, dS_q_factors, dS_k_factors, dK, dV, params, sm_scale, smooth_k);
         return;
       }
   }
