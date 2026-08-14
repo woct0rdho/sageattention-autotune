@@ -351,6 +351,8 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
 
     if (n_valid && m_half == 0)
     {
+      auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
+      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tdVP));
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
@@ -362,9 +364,7 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
         auto dV_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dV_acc);
-        auto tdVP = thr_mma_score.partition_fragment_A(sPPair);
         auto tdVdO = thr_mma_score.partition_fragment_B(sdOdV);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sPPair), thr_copy_score_a.retile_D(tdVP));
         cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sdOdV), thr_copy_transposed_b.retile_D(tdVdO));
         cute::gemm(thr_mma_score, tdVP, tdVdO, dV_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
@@ -379,6 +379,8 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
     }
     else if (n_valid)
     {
+      auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
+      cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tdKdS));
 #pragma unroll
       for (int32_t dim_base = 0; dim_base < HeadDim; dim_base += Traits::kBlockK)
       {
@@ -390,9 +392,7 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
         auto dK_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dK_acc);
-        auto tdKdS = thr_mma_score.partition_fragment_A(sdSPair);
         auto tdKQ = thr_mma_score.partition_fragment_B(sQdK);
-        cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSPair), thr_copy_score_a.retile_D(tdKdS));
         cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(tdKQ));
         cute::gemm(thr_mma_score, tdKdS, tdKQ, dK_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
