@@ -57,10 +57,10 @@ CUTE_HOST_DEVICE constexpr auto make_smem_matrix_layout()
   return make_smem_layout<Cols>(make_plain_smem_matrix_layout<Rows, Cols>());
 }
 
-template <int32_t Rows, int32_t Cols, typename CopyAtom>
+template <int32_t Rows, int32_t Cols, typename CopyAtom, int32_t LineLanes = (Cols == 4 ? 4 : 8)>
 struct GmemTiledCopyContract
 {
-  static constexpr int32_t kLineLanes = Cols == 4 ? 4 : 8;
+  static constexpr int32_t kLineLanes = LineLanes;
   static_assert(Cols % kLineLanes == 0, "Bwd gmem head copy columns must divide the lane layout");
   static constexpr int32_t kRowsPerIter = 32 / kLineLanes;
   static_assert(Rows % kRowsPerIter == 0, "Bwd gmem head copy rows must divide the warp layout");
@@ -145,7 +145,8 @@ struct BwdTileTraits
   using GmemTiledCopydO = typename GmemTiledCopyContract<kMStageLoadRows, kInt8LoadVecCols, GmemCopyAtomAsync>::TiledCopy;
   using GmemTiledCopyK = typename GmemTiledCopyContract<kCtaNLoadRows, kInt8LoadVecCols, GmemCopyAtomAsync>::TiledCopy;
   using GmemTiledCopyV = typename GmemTiledCopyContract<kCtaNLoadRows, kHalfLoadVecCols, GmemCopyAtomAsync>::TiledCopy;
-  using GmemTiledCopydOFp16 = typename GmemTiledCopyContract<kMStageLoadRows, kHalfLoadVecCols, GmemCopyAtomAsync>::TiledCopy;
+  using GmemTiledCopydOFp16 = typename GmemTiledCopyContract<
+    kMStageLoadRows, kHalfLoadVecCols, GmemCopyAtomAsync, kHalfLoadVecCols>::TiledCopy;
 
   using SmemLayoutQ = decltype(make_smem_matrix_layout<2 * kBlockM, kInt8LoadVecCols>());
   using SmemLayoutdO = decltype(make_smem_matrix_layout<2 * kBlockM, kInt8LoadVecCols>());
