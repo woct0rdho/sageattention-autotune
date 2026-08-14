@@ -372,7 +372,8 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dV_acc); ++idx)
         {
-          dKV_accum_frag(dim_block, idx) += static_cast<float>(dV_acc(idx)) * dV_scale;
+          dKV_accum_frag(dim_block, idx) =
+            fmaf(static_cast<float>(dV_acc(idx)), dV_scale, dKV_accum_frag(dim_block, idx));
         }
       }
     }
@@ -399,7 +400,8 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dK_acc); ++idx)
         {
-          dKV_accum_frag(dim_block, idx) += static_cast<float>(dK_acc(idx)) * dK_scale;
+          dKV_accum_frag(dim_block, idx) =
+            fmaf(static_cast<float>(dK_acc(idx)), dK_scale, dKV_accum_frag(dim_block, idx));
         }
       }
     }
