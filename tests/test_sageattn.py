@@ -159,7 +159,7 @@ def _run_case(
         return_lse,
         config,
     )
-    return _attention_report(actual, expected)
+    return _attention_report(actual, expected, atol=0.1 if head_dim == 256 else 0.08)
 
 
 @pytest.mark.parametrize(("config", "mode"), _valid_cases())

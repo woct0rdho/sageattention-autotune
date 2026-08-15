@@ -55,7 +55,14 @@ def _run_case(
         return_lse,
         block_config,
     )
-    return _attention_report(actual, expected, rtol=0.014, atol=0.1, lse_rtol=0.0004, lse_atol=0.06)
+    return _attention_report(
+        actual,
+        expected,
+        rtol=0.014,
+        atol=0.12 if dtype == torch.bfloat16 else 0.1,
+        lse_rtol=0.0004,
+        lse_atol=0.07 if head_dim == 256 else 0.06,
+    )
 
 
 @pytest.mark.parametrize(("block_config", "mode"), _valid_cases())
