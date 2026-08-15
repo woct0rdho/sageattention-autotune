@@ -85,7 +85,7 @@ def run(seq_len: int, heads: int, seed: int) -> None:
         dq_dynamic[:, row0:row1, :] += torch.matmul(dynamic_rec, k_dequant)
         dk_dynamic += torch.matmul(dynamic_rec.transpose(1, 2), q_block_dequant)
         dynamic_stats["count"] += heads * rows * seq_len
-        dynamic_stats["zero"] += (dynamic_int[:, :, :rows, :].reshape(heads, k_blocks, -1) == 0).sum().item()
+        dynamic_stats["zero"] += int((dynamic_int[:, :, :rows, :].reshape(heads, k_blocks, -1) == 0).sum().item())
 
         for candidate in CANDIDATES:
             interval, guard = candidate
@@ -106,8 +106,8 @@ def run(seq_len: int, heads: int, seed: int) -> None:
             valid_unclamped = unclamped[:, :, :rows, :].reshape(heads, k_blocks, -1)
             valid_quantized = quantized[:, :, :rows, :].reshape(heads, k_blocks, -1)
             stats[candidate]["count"] += heads * rows * seq_len
-            stats[candidate]["zero"] += (valid_quantized == 0).sum().item()
-            stats[candidate]["sat"] += (valid_unclamped.abs() > 127).sum().item()
+            stats[candidate]["zero"] += int((valid_quantized == 0).sum().item())
+            stats[candidate]["sat"] += int((valid_unclamped.abs() > 127).sum().item())
 
     print(f"seq={seq_len} heads={heads} seed={seed}")
     print(

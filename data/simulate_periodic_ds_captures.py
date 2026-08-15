@@ -133,7 +133,7 @@ def run_case(
         dq_dynamic[:, row0:row1, :] += torch.matmul(dynamic_rec, k_dequant)
         dk_dynamic += torch.matmul(dynamic_rec.transpose(1, 2), q_block_dequant)
         dynamic_stats["count"] += head_count * rows * seq_len
-        dynamic_stats["zero"] += (dynamic_int[:, :, :rows, :] == 0).sum().item()
+        dynamic_stats["zero"] += int((dynamic_int[:, :, :rows, :] == 0).sum().item())
 
         for interval in INTERVALS:
             if q_block % interval == 0:
