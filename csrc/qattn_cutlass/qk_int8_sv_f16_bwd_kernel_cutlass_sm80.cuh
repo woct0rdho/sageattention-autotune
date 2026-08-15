@@ -596,35 +596,53 @@ __device__ __forceinline__ void load_row_state_pair(const GLse gLse,
   }
 }
 
-template <typename Storage, typename Fragment>
+template <bool LaneMajor = false, typename Storage, typename Fragment>
 __device__ __forceinline__ void store_packed_mma_b_fragment(Storage &storage,
                                                             const Fragment &fragment,
                                                             const int32_t tile,
                                                             const int32_t lane_id)
 {
-  auto words = cute::recast<uint32_t>(fragment);
-  static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
-  auto *const packed = reinterpret_cast<uint32_t *>(storage.begin());
-#pragma unroll
-  for (int32_t word = 0; word < 4; ++word)
+  if constexpr (LaneMajor)
   {
-    packed[(tile * 4 + word) * warpSize + lane_id] = words(word);
+    auto packets = cute::recast<cute::uint128_t>(fragment);
+    static_assert(cute::size(packets) == 1, "INT8 MMA B fragments must contain one 16-byte packet");
+    storage.begin()[tile * warpSize + lane_id] = packets(0);
+  }
+  else
+  {
+    auto words = cute::recast<uint32_t>(fragment);
+    static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
+    auto *const packed = reinterpret_cast<uint32_t *>(storage.begin());
+#pragma unroll
+    for (int32_t word = 0; word < 4; ++word)
+    {
+      packed[(tile * 4 + word) * warpSize + lane_id] = words(word);
+    }
   }
 }
 
-template <typename Storage, typename Fragment>
+template <bool LaneMajor = false, typename Storage, typename Fragment>
 __device__ __forceinline__ void load_packed_mma_b_fragment(const Storage &storage,
                                                            Fragment &fragment,
                                                            const int32_t tile,
                                                            const int32_t lane_id)
 {
-  auto words = cute::recast<uint32_t>(fragment);
-  static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
-  const auto *const packed = reinterpret_cast<const uint32_t *>(storage.begin());
-#pragma unroll
-  for (int32_t word = 0; word < 4; ++word)
+  if constexpr (LaneMajor)
   {
-    words(word) = packed[(tile * 4 + word) * warpSize + lane_id];
+    auto packets = cute::recast<cute::uint128_t>(fragment);
+    static_assert(cute::size(packets) == 1, "INT8 MMA B fragments must contain one 16-byte packet");
+    packets(0) = storage.begin()[tile * warpSize + lane_id];
+  }
+  else
+  {
+    auto words = cute::recast<uint32_t>(fragment);
+    static_assert(cute::size(words) == 4, "INT8 MMA B fragments must contain four words");
+    const auto *const packed = reinterpret_cast<const uint32_t *>(storage.begin());
+#pragma unroll
+    for (int32_t word = 0; word < 4; ++word)
+    {
+      words(word) = packed[(tile * 4 + word) * warpSize + lane_id];
+    }
   }
 }
 
@@ -853,7 +871,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
         [&](auto coord) { return cute::get<0>(coord) < params.seq_len; });
       cute::clear(fragment);
       cute::copy_if(predicate, thr_mma_score.partition_B(gKdQ), fragment);
-      store_packed_mma_b_fragment(shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
+      store_packed_mma_b_fragment<Traits::kCtaN == 128>(shared.k_i8_mma_b, fragment, warp_id * kDimBlocks + dim_block, lane_id);
     }
   }
   // The cooperative K/V load crosses warp ownership; publish it before V fragments are read.
@@ -938,7 +956,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
       const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
       auto fragment = thr_mma_score.partition_fragment_B(sQdK);
       cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(fragment));
-      store_packed_mma_b_fragment(shared.QdO_mma_b.q_i8_mma_b, fragment, warp_id, lane_id);
+      store_packed_mma_b_fragment<Traits::kCtaN == 128>(shared.QdO_mma_b.q_i8_mma_b, fragment, warp_id, lane_id);
     }
     else if (warp_id < 2 * kDimBlocks)
     {
@@ -947,7 +965,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
       const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
       auto fragment = thr_mma_score.partition_fragment_B(sdOdV);
       cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sdOdV), thr_copy_transposed_b.retile_D(fragment));
-      store_packed_mma_b_fragment(shared.QdO_mma_b.dO_i8_mma_b, fragment, dim_block, lane_id);
+      store_packed_mma_b_fragment<Traits::kCtaN == 128>(shared.QdO_mma_b.dO_i8_mma_b, fragment, dim_block, lane_id);
     }
     auto acc_score_0 = cute::partition_fragment_C(score_mma, BlockMNShape{});
     auto acc_score_1 = cute::partition_fragment_C(score_mma, BlockMNShape{});
@@ -1208,7 +1226,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
         auto dV_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dV_acc);
         auto tdVdO = thr_mma_score.partition_fragment_B(sdOdV);
-        load_packed_mma_b_fragment(shared.QdO_mma_b.dO_i8_mma_b, tdVdO, dim_base / Traits::kBlockK, lane_id);
+        load_packed_mma_b_fragment<Traits::kCtaN == 128>(shared.QdO_mma_b.dO_i8_mma_b, tdVdO, dim_base / Traits::kBlockK, lane_id);
         cute::gemm(thr_mma_score, tdVP, tdVdO, dV_acc);
         const int32_t dim_block = dim_base / Traits::kBlockK;
         const float dO_scale = gdOScale[dO_scale_base + dim_block];
@@ -1225,7 +1243,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
         auto dK_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dK_acc);
         auto tdKQ = thr_mma_score.partition_fragment_B(sQdK);
-        load_packed_mma_b_fragment(shared.QdO_mma_b.q_i8_mma_b, tdKQ, dim_block, lane_id);
+        load_packed_mma_b_fragment<Traits::kCtaN == 128>(shared.QdO_mma_b.q_i8_mma_b, tdKQ, dim_block, lane_id);
         cute::gemm(thr_mma_score, tdKdS, tdKQ, dK_acc);
 #pragma unroll
         for (int32_t idx = 0; idx < cute::size(dK_acc); ++idx)
@@ -1279,7 +1297,7 @@ void fused_mma_kernel_k128_8warp(const int8_t *__restrict__ const Q,
           const auto sKPair = cute::local_tile(sK, k_pair_shape, cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
           const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
           auto tdQK = thr_mma_score.partition_fragment_B(sKdQ);
-          load_packed_mma_b_fragment(
+          load_packed_mma_b_fragment<Traits::kCtaN == 128>(
             shared.k_i8_mma_b,
             tdQK,
             dQ_pair * kDimBlocks + dim_base / Traits::kBlockK,
