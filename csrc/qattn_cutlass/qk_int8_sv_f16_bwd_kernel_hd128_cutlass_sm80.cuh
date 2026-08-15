@@ -2,6 +2,45 @@
 
 namespace sageattention::qattn_cutlass_bwd {
 
+template <typename Layout, typename Pointer, typename Fragment>
+__device__ __forceinline__ void scatter_mma_b_fragment_to_mirror(
+  Pointer mirror_storage,
+  const int32_t dim_block,
+  Fragment const &fragment,
+  const int32_t lane_id)
+{
+  auto words = cute::recast<uint32_t>(fragment);
+  constexpr Layout layout{};
+  const int32_t row = lane_id >> 2;
+  auto *const mirror_bytes = reinterpret_cast<int8_t *>(mirror_storage);
+  const uint32_t smem_address = cute::cast_smem_ptr_to_uint(
+    mirror_bytes + packed_elements<int8_t>() * layout(row, dim_block) + 4 * (lane_id & 3));
+  asm volatile(
+    "st.shared.u32 [%0], %1;\n"
+    "st.shared.u32 [%0 + 1024], %2;\n"
+    "st.shared.u32 [%0 + 2048], %3;\n"
+    "st.shared.u32 [%0 + 3072], %4;\n"
+    :: "r"(smem_address), "r"(words(0)), "r"(words(1)), "r"(words(2)), "r"(words(3)));
+}
+
+template <typename Layout, typename Pointer, typename Fragment>
+__device__ __forceinline__ void load_mma_b_fragment_from_mirror(
+  Pointer mirror_storage,
+  const int32_t dim_block,
+  Fragment &fragment,
+  const int32_t lane_id)
+{
+  auto words = cute::recast<uint32_t>(fragment);
+  constexpr Layout layout{};
+  auto *const mirror_bytes = reinterpret_cast<int8_t *>(mirror_storage);
+  const uint32_t smem_address = cute::cast_smem_ptr_to_uint(
+    mirror_bytes + packed_elements<int8_t>() * layout(lane_id, dim_block));
+  asm volatile(
+    "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+    : "=r"(words(0)), "=r"(words(1)), "=r"(words(2)), "=r"(words(3))
+    : "r"(smem_address));
+}
+
 template <int32_t HeadDim, int32_t CtaM, int32_t CtaN, int32_t NumWarps, int32_t QuantBlockQ, int32_t QuantBlockK, bool IsAligned, bool SmoothK>
 __global__ __maxnreg__(255)
 void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
@@ -87,6 +126,8 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
   constexpr int32_t dO_stage_offset = cute::cosize_v<typename Traits::SmemLayoutdO>;
   constexpr int32_t dO_fp16_stage_offset = cute::cosize_v<typename Storage::SmemLayoutdOFp16Pair>;
   constexpr int32_t kCtaNLoadRows = Traits::kCtaNLoadRows;
+  static_assert(q_stage_offset == dO_stage_offset && 2 * q_stage_offset == dO_fp16_stage_offset,
+                "D128 Q/dO mirrors must exactly alias one consumed FP16 dO stage");
 
   auto sKStorage = make_smem_tensor(shared.k_i8, typename Traits::SmemLayoutK{});
   auto sVStorage = make_smem_tensor(shared.v, typename Traits::SmemLayoutV{});
@@ -347,6 +388,45 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         cute::make_coord(cute::_0{}, n_tile & 1));
       cute::copy(tiled_copy_score_c, tCrdS, thr_copy_score_c.partition_D(sdSMirrorHalf));
     }
+
+    constexpr auto mirror_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockM>{}, cute::Int<Traits::kBlockK>{});
+    {
+      auto *const mirror_stage = shared.dO_fp16_pair.begin() + q_dO_stage * dO_fp16_stage_offset;
+      const auto sQPair = cute::local_tile(
+        sQ,
+        mirror_pair_shape,
+        cute::make_coord(cute::_0{}, warp_id));
+      const auto sQdK = qattn_cutlass::make_int8_transposed_b_view(sQPair);
+      auto fragment = thr_mma_score.partition_fragment_B(sQdK);
+      cute::copy(
+        tiled_copy_transposed_b,
+        thr_copy_transposed_b.partition_S(sQdK),
+        thr_copy_transposed_b.retile_D(fragment));
+      scatter_mma_b_fragment_to_mirror<typename Traits::SmemLayoutQ>(
+        mirror_stage,
+        warp_id,
+        fragment,
+        lane_id);
+    }
+    {
+      auto *const mirror_stage = shared.dO_fp16_pair.begin() + q_dO_stage * dO_fp16_stage_offset;
+      const auto sdOPair = cute::local_tile(
+        sdOInt8,
+        mirror_pair_shape,
+        cute::make_coord(cute::_0{}, warp_id));
+      const auto sdOdV = qattn_cutlass::make_int8_transposed_b_view(sdOPair);
+      auto fragment = thr_mma_score.partition_fragment_B(sdOdV);
+      cute::copy(
+        tiled_copy_transposed_b,
+        thr_copy_transposed_b.partition_S(sdOdV),
+        thr_copy_transposed_b.retile_D(fragment));
+      scatter_mma_b_fragment_to_mirror<typename Traits::SmemLayoutdO>(
+        mirror_stage + q_stage_offset,
+        warp_id,
+        fragment,
+        lane_id);
+    }
+
     __syncthreads();
 
     if (n_valid && m_half == 0)
@@ -365,8 +445,15 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         auto dV_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dV_acc);
         auto tdVdO = thr_mma_score.partition_fragment_B(sdOdV);
-        cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sdOdV), thr_copy_transposed_b.retile_D(tdVdO));
+        auto *const dO_mirror = shared.dO_fp16_pair.begin() +
+          q_dO_stage * dO_fp16_stage_offset + q_stage_offset;
+        load_mma_b_fragment_from_mirror<typename Traits::SmemLayoutdO>(
+          dO_mirror,
+          dim_base / Traits::kBlockK,
+          tdVdO,
+          lane_id);
         cute::gemm(thr_mma_score, tdVP, tdVdO, dV_acc);
+        __syncwarp();
         const int32_t dim_block = dim_base / Traits::kBlockK;
         const float dV_scale = p_scale * gdOScale[(m_pair_base / (2 * Traits::kBlockM)) * kDimBlocks + dim_block];
 #pragma unroll
@@ -393,8 +480,14 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         auto dK_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
         cute::clear(dK_acc);
         auto tdKQ = thr_mma_score.partition_fragment_B(sQdK);
-        cute::copy(tiled_copy_transposed_b, thr_copy_transposed_b.partition_S(sQdK), thr_copy_transposed_b.retile_D(tdKQ));
+        auto *const q_mirror = shared.dO_fp16_pair.begin() + q_dO_stage * dO_fp16_stage_offset;
+        load_mma_b_fragment_from_mirror<typename Traits::SmemLayoutQ>(
+          q_mirror,
+          dim_base / Traits::kBlockK,
+          tdKQ,
+          lane_id);
         cute::gemm(thr_mma_score, tdKdS, tdKQ, dK_acc);
+        __syncwarp();
         const int32_t dim_block = dim_base / Traits::kBlockK;
         const float dK_scale = dS_scale * q_block_scale;
 #pragma unroll
