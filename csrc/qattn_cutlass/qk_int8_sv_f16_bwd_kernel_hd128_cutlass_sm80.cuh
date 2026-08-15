@@ -527,11 +527,14 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
     {
       const int32_t dQ_dim_begin = n_pair * kdQDimBlocksPerOwner * Traits::kBlockK;
 #pragma unroll
-      for (int32_t dim_offset = 0; dim_offset < kdQDimBlocksPerOwner * Traits::kBlockK; dim_offset += Traits::kBlockK)
+      for (int32_t dim_offset = 0; dim_offset < kdQDimBlocksPerOwner * Traits::kBlockK; dim_offset += 2 * Traits::kBlockK)
       {
-        const int32_t dim_base = dQ_dim_begin + dim_offset;
-        auto dQ_acc = cute::partition_fragment_C(score_mma, BlockMNShape{});
-        cute::clear(dQ_acc);
+        const int32_t dim_base_0 = dQ_dim_begin + dim_offset;
+        const int32_t dim_base_1 = dim_base_0 + Traits::kBlockK;
+        auto dQ_acc_0 = cute::partition_fragment_C(score_mma, BlockMNShape{});
+        auto dQ_acc_1 = cute::partition_fragment_C(score_mma, BlockMNShape{});
+        cute::clear(dQ_acc_0);
+        cute::clear(dQ_acc_1);
 #pragma unroll
         for (int32_t dQ_pair = 0; dQ_pair < kdQNPairs; ++dQ_pair)
         {
@@ -540,30 +543,47 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
           auto sdQScratch = cute::recast<int8_t>(sdQScratchStorage);
           auto sdSdQ = cute::local_tile(sdQScratch, dS_tile_shape, cute::make_coord(cute::_0{}, cute::_0{}));
           constexpr auto k_pair_shape = cute::make_shape(cute::Int<2 * Traits::kBlockN>{}, cute::Int<Traits::kBlockK>{});
-          const auto sKPair = cute::local_tile(
+          auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ);
+          cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ), thr_copy_score_a.retile_D(tdQdS));
+          const auto sKPair0 = cute::local_tile(
             sK,
             k_pair_shape,
-            cute::make_coord(dQ_pair, dim_base / Traits::kBlockK));
-          const auto sKdQ = qattn_cutlass::make_int8_transposed_b_view(sKPair);
-          auto tdQdS = thr_mma_score.partition_fragment_A(sdSdQ);
-          auto tdQK = thr_mma_score.partition_fragment_B(sKdQ);
-          cute::copy(tiled_copy_score_a, thr_copy_score_a.partition_S(sdSdQ), thr_copy_score_a.retile_D(tdQdS));
-          load_packed_mma_b_fragment(shared.k_i8_mma_b, tdQK, dQ_pair * kDimBlocks + dim_base / Traits::kBlockK, lane_id);
-          cute::gemm(thr_mma_score, tdQdS, tdQK, dQ_acc);
+            cute::make_coord(dQ_pair, dim_base_0 / Traits::kBlockK));
+          const auto sKdQ0 = qattn_cutlass::make_int8_transposed_b_view(sKPair0);
+          auto tdQK0 = thr_mma_score.partition_fragment_B(sKdQ0);
+          load_packed_mma_b_fragment(shared.k_i8_mma_b, tdQK0, dQ_pair * kDimBlocks + dim_base_0 / Traits::kBlockK, lane_id);
+          cute::gemm(thr_mma_score, tdQdS, tdQK0, dQ_acc_0);
+          const auto sKPair1 = cute::local_tile(
+            sK,
+            k_pair_shape,
+            cute::make_coord(dQ_pair, dim_base_1 / Traits::kBlockK));
+          const auto sKdQ1 = qattn_cutlass::make_int8_transposed_b_view(sKPair1);
+          auto tdQK1 = thr_mma_score.partition_fragment_B(sKdQ1);
+          load_packed_mma_b_fragment(shared.k_i8_mma_b, tdQK1, dQ_pair * kDimBlocks + dim_base_1 / Traits::kBlockK, lane_id);
+          cute::gemm(thr_mma_score, tdQdS, tdQK1, dQ_acc_1);
         }
-        auto dQ_float = cute::make_fragment_like<float>(dQ_acc);
+        auto dQ_float_0 = cute::make_fragment_like<float>(dQ_acc_0);
+        auto dQ_float_1 = cute::make_fragment_like<float>(dQ_acc_1);
         const float dQ_scale = dS_scale * k_block_scale;
 #pragma unroll
-        for (int32_t idx = 0; idx < cute::size(dQ_acc); ++idx)
+        for (int32_t idx = 0; idx < cute::size(dQ_acc_0); ++idx)
         {
-          dQ_float(idx) = static_cast<float>(dQ_acc(idx)) * dQ_scale;
+          dQ_float_0(idx) = static_cast<float>(dQ_acc_0(idx)) * dQ_scale;
+          dQ_float_1(idx) = static_cast<float>(dQ_acc_1(idx)) * dQ_scale;
         }
         float *const dQ_head = dQAccum + batch * params.stride_bz_dQAccum + head * params.stride_h_dQAccum;
         accumulate_dQ_float_fragment_workspace<IsAligned, Traits>(
-          dQ_float,
+          dQ_float_0,
           dQ_head,
           m_base,
-          dim_base,
+          dim_base_0,
+          params.seq_len,
+          lane_id);
+        accumulate_dQ_float_fragment_workspace<IsAligned, Traits>(
+          dQ_float_1,
+          dQ_head,
+          m_base,
+          dim_base_1,
           params.seq_len,
           lane_id);
       }
