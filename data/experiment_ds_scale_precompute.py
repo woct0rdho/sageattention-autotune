@@ -219,9 +219,9 @@ def run_record(
                 dq_candidate[:, row0:row1, :] += torch.matmul(reconstructed, k_dequant)
                 dk_candidate += torch.matmul(reconstructed.transpose(1, 2), q_block_dequant)
                 stats = scale_counts[(predictor, guard)]
-                stats["count"] += heads * valid_mask.sum().item()
-                stats["sat"] += ((unclamped.abs() > 127) & valid_mask).sum().item()
-                stats["zero"] += ((quantized == 0) & valid_mask).sum().item()
+                stats["count"] += heads * int(valid_mask.sum().item())
+                stats["sat"] += int(((unclamped.abs() > 127) & valid_mask).sum().item())
+                stats["zero"] += int(((quantized == 0) & valid_mask).sum().item())
 
     scale_rows: list[dict[str, Any]] = []
     dynamic_dq = metric(dq_dynamic, dq_exact)

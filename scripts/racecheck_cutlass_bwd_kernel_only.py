@@ -88,7 +88,6 @@ def main() -> None:
     importlib.import_module("sageattention._qattn_cutlass_sm80")
     operator = torch.ops.sageattention_qattn_cutlass_sm80.qk_int8_sv_f16_accum_f32_attn_bwd_cutlass
     shape = (1, args.seq_len, args.num_heads, 64) if args.layout == "NHD" else (1, args.num_heads, args.seq_len, 64)
-    torch.manual_seed(0)
     q = torch.randn(shape, device="cuda", dtype=torch.float16)
     k = torch.randn_like(q)
     value = torch.randn_like(q)

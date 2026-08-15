@@ -25,11 +25,10 @@ def _make_qkvo(
         shape = (batch_size, seq_len, num_heads, head_dim)
     else:
         shape = (batch_size, num_heads, seq_len, head_dim)
-    generator = torch.Generator(device="cuda").manual_seed(0)
-    q = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    k = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    v = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
-    dout = torch.randn(shape, device="cuda", dtype=torch.float16, generator=generator)
+    q = torch.randn(shape, device="cuda", dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    dout = torch.randn_like(q)
     return q, k, v, dout
 
 

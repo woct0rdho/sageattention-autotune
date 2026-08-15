@@ -548,7 +548,6 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=50)
     parser.add_argument("--mode", choices=["all", "end-to-end", "kernel-only"], default="all")
     parser.add_argument("--smooth-k", nargs="+", choices=["false", "true"], default=["false"])
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--csv", type=Path, help="Optional path to write benchmark rows as CSV.")
     args = parser.parse_args()
 
@@ -556,8 +555,6 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
 
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
     block_configs = _parse_block_configs(args.block_configs)
     include_end_to_end = args.mode in ("all", "end-to-end")
     include_kernel_only = args.mode in ("all", "kernel-only")
