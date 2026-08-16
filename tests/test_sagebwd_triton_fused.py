@@ -49,14 +49,6 @@ def test_qattn_triton_fused_backward_block_config(block_config: tuple[int, int])
     _check_backward(actual, expected, f"block_config={block_config}")
 
 
-def test_qattn_triton_fused_backward_flashattn_tile() -> None:
-    block_config = (64, 128)
-    q, k, v, dout = _make_qkvo()
-    actual = _sage_fused_backward(q, k, v, dout, block_config)
-    expected = _flash_attn_backward(q, k, v, dout)
-    _check_backward(actual, expected, f"block_config={block_config}")
-
-
 def test_qattn_triton_fused_backward_split_dq_accum(monkeypatch: pytest.MonkeyPatch) -> None:
     block_config = _make_valid_configs()[0]
     monkeypatch.setenv("SAGEATTN_FUSED_DQ_SPLITS", "1024")

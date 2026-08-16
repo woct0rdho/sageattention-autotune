@@ -112,6 +112,22 @@ inline Params prepare_params(const Tensor &query,
   check_workspace_tensor(dS_q_factors, "dS_q_factors", 4, torch::headeronly::ScalarType::Float);
   check_workspace_tensor(dS_k_factors, "dS_k_factors", 3, torch::headeronly::ScalarType::Float);
 
+  CHECK_SAME_DEVICE(query, key);
+  CHECK_SAME_DEVICE(query, query_scale);
+  CHECK_SAME_DEVICE(query, key_scale);
+  CHECK_SAME_DEVICE(query, value);
+  CHECK_SAME_DEVICE(query, dO);
+  CHECK_SAME_DEVICE(query, lse);
+  CHECK_SAME_DEVICE(query, delta);
+  CHECK_SAME_DEVICE(query, dQ_accum);
+  CHECK_SAME_DEVICE(query, dS_sum);
+  CHECK_SAME_DEVICE(query, dO_int8);
+  CHECK_SAME_DEVICE(query, dO_scale);
+  CHECK_SAME_DEVICE(query, dS_q_factors);
+  CHECK_SAME_DEVICE(query, dS_k_factors);
+  CHECK_SAME_DEVICE(query, dK);
+  CHECK_SAME_DEVICE(query, dV);
+
   STD_TORCH_CHECK(query.size(3) == 64 || query.size(3) == 128, "CUTLASS qattn backward currently supports head_dim 64 or 128");
   STD_TORCH_CHECK(blk_q == 32 && blk_k == 64, "Focused CUTLASS qattn backward requires QBlock=32 and KBlock=64");
   Params params = {

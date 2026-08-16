@@ -4,12 +4,10 @@
 #include "qk_int8_sv_f16_params_cutlass_sm80.cuh"
 #include "../utils.cuh"
 
-#include <torch/csrc/stable/ops.h>
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 
 #include <cstdint>
-#include <optional>
 #include <stdexcept>
 
 namespace sageattention::qattn_cutlass {
@@ -46,6 +44,12 @@ inline void check_launch_tensors(const Tensor &query,
   CHECK_CUDA(query_scale);
   CHECK_CUDA(key_scale);
 
+  CHECK_SAME_DEVICE(query, key);
+  CHECK_SAME_DEVICE(query, value);
+  CHECK_SAME_DEVICE(query, output);
+  CHECK_SAME_DEVICE(query, query_scale);
+  CHECK_SAME_DEVICE(query, key_scale);
+
   CHECK_CONTIGUOUS(query);
   CHECK_CONTIGUOUS(key);
   CHECK_LASTDIM_CONTIGUOUS(value);
@@ -72,6 +76,7 @@ inline LaunchParams prepare_launch_params(const Tensor &query,
                                           const Tensor &key,
                                           const Tensor &value,
                                           const Tensor &output,
+                                          const std::optional<Tensor> &lse,
                                           const Tensor &query_scale,
                                           const Tensor &key_scale,
                                           const TensorLayout tensor_layout,
@@ -79,7 +84,8 @@ inline LaunchParams prepare_launch_params(const Tensor &query,
                                           const int64_t blk_q,
                                           const int64_t blk_k,
                                           const int64_t warp_q,
-                                          const int64_t warp_k)
+                                          const int64_t warp_k,
+                                          const bool return_lse)
 {
   check_launch_tensors(query, key, value, output, query_scale, key_scale);
 
@@ -163,6 +169,18 @@ inline LaunchParams prepare_launch_params(const Tensor &query,
   STD_TORCH_CHECK(params.qo_len > 0 && params.kv_len > 0, "CUTLASS qattn requires positive sequence lengths");
   STD_TORCH_CHECK(params.num_qo_heads % params.num_kv_heads == 0, "num_qo_heads must be divisible by num_kv_heads");
   params.num_kv_groups = params.num_qo_heads / params.num_kv_heads;
+  if (return_lse)
+  {
+    STD_TORCH_CHECK(lse.has_value(), "lse is required when return_lse is true");
+    const Tensor &lse_tensor = lse.value();
+    CHECK_CUDA(lse_tensor);
+    CHECK_SAME_DEVICE(query, lse_tensor);
+    CHECK_CONTIGUOUS(lse_tensor);
+    CHECK_DTYPE(lse_tensor, torch::headeronly::ScalarType::Float);
+    CHECK_DIMS(lse_tensor, 3);
+    CHECK_SHAPE(lse_tensor, params.batch_size, params.num_qo_heads, params.qo_len);
+    params.lse = lse_tensor.mutable_data_ptr<float>();
+  }
 
   constexpr int32_t kQuantBlockQ = 32;
   constexpr int32_t kQuantBlockK = 64;
@@ -178,19 +196,20 @@ inline LaunchParams prepare_launch_params(const Tensor &query,
 
 #include "generated/qk_int8_sv_f16_accum_f32_attn_cutlass_dispatch.cuh"
 
-Tensor qk_int8_sv_f16_accum_f32_attn_cutlass(const Tensor &query,
-                                             const Tensor &key,
-                                             const Tensor &value,
-                                             const Tensor &output,
-                                             const Tensor &query_scale,
-                                             const Tensor &key_scale,
-                                             const int64_t tensor_layout,
-                                             const double sm_scale,
-                                             const int64_t blk_q,
-                                             const int64_t blk_k,
-                                             const int64_t warp_q,
-                                             const int64_t warp_k,
-                                             const bool return_lse)
+void qk_int8_sv_f16_accum_f32_attn_cutlass(const Tensor &query,
+                                           const Tensor &key,
+                                           const Tensor &value,
+                                           const Tensor &output,
+                                           const std::optional<Tensor> &lse,
+                                           const Tensor &query_scale,
+                                           const Tensor &key_scale,
+                                           const int64_t tensor_layout,
+                                           const double sm_scale,
+                                           const int64_t blk_q,
+                                           const int64_t blk_k,
+                                           const int64_t warp_q,
+                                           const int64_t warp_k,
+                                           const bool return_lse)
 {
   namespace qattn_cutlass = sageattention::qattn_cutlass;
 
@@ -201,6 +220,7 @@ Tensor qk_int8_sv_f16_accum_f32_attn_cutlass(const Tensor &query,
     key,
     value,
     output,
+    lse,
     query_scale,
     key_scale,
     layout,
@@ -208,13 +228,8 @@ Tensor qk_int8_sv_f16_accum_f32_attn_cutlass(const Tensor &query,
     blk_q,
     blk_k,
     warp_q,
-    warp_k);
-
-  auto lse = return_lse
-    ? torch::stable::new_empty(query, {launch_params.batch_size, launch_params.num_qo_heads, launch_params.qo_len}, std::make_optional(torch::headeronly::ScalarType::Float))
-    : torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float));
-  launch_params.lse = return_lse ? lse.mutable_data_ptr<float>() : nullptr;
+    warp_k,
+    return_lse);
 
   qattn_cutlass::launch_configured_kernel(launch_params, return_lse);
-  return lse;
 }

@@ -1,12 +1,23 @@
+import importlib
 import warnings
 from typing import Literal, overload
 
 import torch
 
 from .cuda_autotune import _eager_autotune_select, _sageattn_autotuned
-from .cuda_compile import _qattn_sm80
 from .triton.quant_per_thread import per_thread_int8
-from .utils import DEFAULT_PV_ACCUM_DTYPE, LOG2_E, _lse_correction, _pad_qkv
+from .utils import (
+    DEFAULT_PV_ACCUM_DTYPE,
+    LOG2_E,
+    _allocate_forward_outputs,
+    _format_forward_outputs,
+    _is_compiling_or_fake,
+    _lse_correction,
+    _pad_qkv,
+)
+
+importlib.import_module(f"{__package__}._qattn_sm80")
+_qattn_sm80 = torch.ops.sageattention_qattn_sm80
 
 SageAttnResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
@@ -59,19 +70,22 @@ def sageattn_qk_int8_pv_fp16_cuda(
     assert sm_scale is None
     assert attn_mask is None
 
-    if torch.compiler.is_compiling():
-        if return_lse:
-            raise NotImplementedError("torch.compile with return_lse=True is not supported.")
-        return _sageattn_autotuned(
+    if _is_compiling_or_fake(q):
+        output, lse = _allocate_forward_outputs(q, tensor_layout, return_lse)
+        _sageattn_autotuned(
             q,
             k,
             v,
+            output,
+            lse,
             tensor_layout,
             is_causal,
             pv_accum_dtype,
             smooth_k,
             smooth_v,
+            return_lse,
         )
+        return _format_forward_outputs(output, lse, q.size(-1), return_lse)
 
     qk_config = _eager_autotune_select(
         q,
@@ -141,6 +155,38 @@ def _sageattn_configured(
     return_lse: bool,
     qk_config: tuple[int, int, int, int],
 ) -> SageAttnResult:
+    output, lse = _allocate_forward_outputs(q, tensor_layout, return_lse)
+    _sageattn_configured_out(
+        q,
+        k,
+        v,
+        output,
+        lse,
+        tensor_layout,
+        is_causal,
+        pv_accum_dtype,
+        smooth_k,
+        smooth_v,
+        return_lse,
+        qk_config,
+    )
+    return _format_forward_outputs(output, lse, q.size(-1), return_lse)
+
+
+def _sageattn_configured_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
+    tensor_layout: str,
+    is_causal: bool,
+    pv_accum_dtype: str,
+    smooth_k: bool,
+    smooth_v: bool,
+    return_lse: bool,
+    qk_config: tuple[int, int, int, int],
+) -> None:
     dtype = q.dtype
     if not q.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
@@ -192,14 +238,13 @@ def _sageattn_configured(
         tensor_layout=tensor_layout,
     )
 
-    output = torch.empty(q.size(), device=q.device, dtype=dtype)
-
     if pv_accum_dtype == "fp32":
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(
+        _qattn_sm80.qk_int8_sv_f16_accum_f32_attn(
             q_int8,
             k_int8,
             v.to(torch.float16),
             output,
+            lse,
             q_scale,
             k_scale,
             layout_i,
@@ -215,11 +260,12 @@ def _sageattn_configured(
         if smooth_v:
             vm = v.mean(dim=seq_dim_index)
             smoothed_v = (v - vm.unsqueeze(seq_dim_index)).to(torch.float16)
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
+            _qattn_sm80.qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(
                 q_int8,
                 k_int8,
                 smoothed_v,
                 output,
+                lse,
                 q_scale,
                 k_scale,
                 vm,
@@ -233,11 +279,12 @@ def _sageattn_configured(
                 return_lse,
             )
         else:
-            lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(
+            _qattn_sm80.qk_int8_sv_f16_accum_f16_attn(
                 q_int8,
                 k_int8,
                 v.to(torch.float16),
                 output,
+                lse,
                 q_scale,
                 k_scale,
                 layout_i,
@@ -250,11 +297,12 @@ def _sageattn_configured(
                 return_lse,
             )
     elif pv_accum_dtype == "fp16+fp32":
-        lse = _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(
+        _qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf(
             q_int8,
             k_int8,
             v.to(torch.float16),
             output,
+            lse,
             q_scale,
             k_scale,
             layout_i,
@@ -269,12 +317,11 @@ def _sageattn_configured(
     else:
         raise ValueError("pv_accum_dtype must be 'fp32', 'fp16', or 'fp16+fp32'.")
 
-    output = output[..., :head_dim]
     if not return_lse:
-        return output
+        return
 
+    assert lse is not None
     lse /= LOG2_E
     if smooth_k:
         assert km is not None
         lse += _lse_correction(q, km, tensor_layout, head_dim_index) * sm_scale
-    return output, lse

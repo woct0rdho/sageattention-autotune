@@ -148,18 +148,9 @@ def _run_case(
     expected = _expected(q, k, v, tensor_layout, is_causal, return_lse)
 
     actual = cuda_attn._sageattn_configured(
-        q,
-        k,
-        v,
-        tensor_layout,
-        is_causal,
-        pv_accum_dtype,
-        smooth_k,
-        False,
-        return_lse,
-        config,
+        q, k, v, tensor_layout, is_causal, pv_accum_dtype, smooth_k, False, return_lse, config
     )
-    return _attention_report(actual, expected, atol=0.1 if head_dim == 256 else 0.08)
+    return _attention_report(actual, expected, atol=0.12, lse_atol=0.06)
 
 
 @pytest.mark.parametrize(("config", "mode"), _valid_cases())

@@ -4,7 +4,13 @@ import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
 from . import autotune_utils
+from .torch_compile_patch import (
+    install_mutation_only_custom_op_autotuning,
+    register_mutation_only_custom_op_functionalization,
+)
 from .triton.attn_autotune import _valid_attn_configs
+
+install_mutation_only_custom_op_autotuning()
 
 _TRITON_BLOCK_CONFIGS = (
     (256, 64),
@@ -78,51 +84,44 @@ def _eager_autotune_select(
     )
 
 
-@torch.library.custom_op("sageattention_internal::sageattn_triton_autotuned", mutates_args=())
+@torch.library.custom_op("sageattention_internal::sageattn_triton_autotuned", mutates_args={"output", "lse"})
 def _sageattn_triton_autotuned(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
     tensor_layout: str,
     is_causal: bool,
     pv_accum_dtype: str,
     smooth_k: bool,
+    return_lse: bool,
     block_m: int = 0,
     block_n: int = 0,
-) -> torch.Tensor:
-    from .triton_attn import _sageattn_triton_configured
+) -> None:
+    from .triton_attn import _sageattn_triton_configured_out
 
     block_config = (block_m, block_n)
     block_configs = _valid_configs(q.size(-1), is_causal, q.device.index)
     if min(block_config) <= 0 or block_config not in block_configs:
         block_config = block_configs[0]
 
-    return _sageattn_triton_configured(
+    _sageattn_triton_configured_out(
         q,
         k,
         v,
+        output,
+        lse,
         tensor_layout,
         is_causal,
         pv_accum_dtype,
         smooth_k,
-        False,
+        return_lse,
         block_config,
     )
 
 
-@_sageattn_triton_autotuned.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    tensor_layout: str,
-    is_causal: bool,
-    pv_accum_dtype: str,
-    smooth_k: bool,
-    block_m: int = 0,
-    block_n: int = 0,
-) -> torch.Tensor:
-    return torch.empty_like(q)
+register_mutation_only_custom_op_functionalization(_sageattn_triton_autotuned)
 
 
 register_custom_op_autotuning(

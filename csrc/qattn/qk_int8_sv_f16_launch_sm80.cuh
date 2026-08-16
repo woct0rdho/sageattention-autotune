@@ -3,6 +3,7 @@
 #include "qk_int8_sv_f16_kernel_sm80.cuh"
 #include "../dispatch_utils.h"
 
+#include <optional>
 #include <stdexcept>
 
 enum class TensorLayout {
@@ -43,13 +44,14 @@ struct Sm80QkLaunchParams {
   int stride_bz_o;
   int stride_seq_o;
   int stride_h_o;
-  Tensor lse;
+  float *lse;
 };
 
 inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
                                                         const Tensor &key,
                                                         const Tensor &value,
                                                         const Tensor &output,
+                                                        const std::optional<Tensor> &lse,
                                                         const Tensor &query_scale,
                                                         const Tensor &key_scale,
                                                         const TensorLayout tensor_layout,
@@ -61,6 +63,12 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
   CHECK_CUDA(output);
   CHECK_CUDA(query_scale);
   CHECK_CUDA(key_scale);
+
+  CHECK_SAME_DEVICE(query, key);
+  CHECK_SAME_DEVICE(query, value);
+  CHECK_SAME_DEVICE(query, output);
+  CHECK_SAME_DEVICE(query, query_scale);
+  CHECK_SAME_DEVICE(query, key_scale);
 
   CHECK_CONTIGUOUS(query);
   CHECK_CONTIGUOUS(key);
@@ -102,7 +110,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     static_cast<int>(output.stride(0)),
     0,
     0,
-    torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float)),
+    nullptr,
   };
 
   if (tensor_layout == TensorLayout::kNHD)
@@ -113,6 +121,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     params.num_kv_heads = static_cast<int>(key.size(2));
     CHECK_SHAPE(key, params.batch_size, params.kv_len, params.num_kv_heads, params.head_dim);
     CHECK_SHAPE(value, params.batch_size, params.kv_len, params.num_kv_heads, params.head_dim);
+    CHECK_SHAPE(output, params.batch_size, params.qo_len, params.num_qo_heads, params.head_dim);
 
     params.stride_seq_q = static_cast<int>(query.stride(1));
     params.stride_seq_k = static_cast<int>(key.stride(1));
@@ -132,6 +141,7 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
     params.num_kv_heads = static_cast<int>(key.size(1));
     CHECK_SHAPE(key, params.batch_size, params.num_kv_heads, params.kv_len, params.head_dim);
     CHECK_SHAPE(value, params.batch_size, params.num_kv_heads, params.kv_len, params.head_dim);
+    CHECK_SHAPE(output, params.batch_size, params.num_qo_heads, params.qo_len, params.head_dim);
 
     params.stride_seq_q = static_cast<int>(query.stride(2));
     params.stride_seq_k = static_cast<int>(key.stride(2));
@@ -149,9 +159,18 @@ inline Sm80QkLaunchParams prepare_sm80_qk_launch_params(const Tensor &query,
   }
 
   params.num_kv_groups = params.num_qo_heads / params.num_kv_heads;
-  params.lse = return_lse
-    ? torch::stable::new_empty(query, {params.batch_size, params.num_qo_heads, params.qo_len}, std::make_optional(torch::headeronly::ScalarType::Float))
-    : torch::stable::new_empty(query, {0}, std::make_optional(torch::headeronly::ScalarType::Float));
+  if (return_lse)
+  {
+    STD_TORCH_CHECK(lse.has_value(), "lse is required when return_lse is true");
+    const Tensor &lse_tensor = lse.value();
+    CHECK_CUDA(lse_tensor);
+    CHECK_SAME_DEVICE(query, lse_tensor);
+    CHECK_CONTIGUOUS(lse_tensor);
+    CHECK_DTYPE(lse_tensor, torch::headeronly::ScalarType::Float);
+    CHECK_DIMS(lse_tensor, 3);
+    CHECK_SHAPE(lse_tensor, params.batch_size, params.num_qo_heads, params.qo_len);
+    params.lse = lse_tensor.mutable_data_ptr<float>();
+  }
 
   return params;
 }
@@ -195,7 +214,7 @@ void launch_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
     const_ptr<int8_t>(ctx.key),
     const_ptr<half>(ctx.value),
     mutable_ptr<DTypeOut>(ctx.output),
-    ReturnLse ? mutable_ptr<float>(ctx.params.lse) : nullptr,
+    ctx.params.lse,
     const_ptr<float>(ctx.query_scale),
     const_ptr<float>(ctx.key_scale),
     static_cast<const DTypeOut*>(ctx.value_mean),
@@ -242,24 +261,25 @@ void launch_configured_sm80_qk_kernel(const Sm80QkLaunchContext &ctx)
 }
 
 template <typename DTypeSVAccum, bool UseInstBuffer, ComputeUnit DenominatorAccumUnit, bool FuseVMean>
-Tensor run_sm80_qk_attn(const Tensor &query,
-                        const Tensor &key,
-                        const Tensor &value,
-                        const Tensor &output,
-                        const Tensor &query_scale,
-                        const Tensor &key_scale,
-                        const Tensor *value_mean,
-                        const int64_t tensor_layout,
-                        const bool is_causal,
-                        const double sm_scale,
-                        const int64_t blk_q,
-                        const int64_t blk_k,
-                        const int64_t warp_q,
-                        const int64_t warp_k,
-                        const bool return_lse)
+void run_sm80_qk_attn(const Tensor &query,
+                      const Tensor &key,
+                      const Tensor &value,
+                      const Tensor &output,
+                      const std::optional<Tensor> &lse,
+                      const Tensor &query_scale,
+                      const Tensor &key_scale,
+                      const Tensor *value_mean,
+                      const int64_t tensor_layout,
+                      const bool is_causal,
+                      const double sm_scale,
+                      const int64_t blk_q,
+                      const int64_t blk_k,
+                      const int64_t warp_q,
+                      const int64_t warp_k,
+                      const bool return_lse)
 {
   const auto layout = parse_tensor_layout(tensor_layout);
-  const auto params = prepare_sm80_qk_launch_params(query, key, value, output, query_scale, key_scale, layout, return_lse);
+  const auto params = prepare_sm80_qk_launch_params(query, key, value, output, lse, query_scale, key_scale, layout, return_lse);
   const void *value_mean_ptr = nullptr;
 
   if constexpr (FuseVMean)
@@ -267,6 +287,7 @@ Tensor run_sm80_qk_attn(const Tensor &query,
     STD_TORCH_CHECK(value_mean != nullptr, "value_mean is required when fusing V mean");
     const Tensor &value_mean_tensor = *value_mean;
     CHECK_CUDA(value_mean_tensor);
+    CHECK_SAME_DEVICE(query, value_mean_tensor);
     CHECK_CONTIGUOUS(value_mean_tensor);
     CHECK_DIMS(value_mean_tensor, 3);
     STD_TORCH_CHECK(value_mean_tensor.scalar_type() == output.scalar_type(), "value_mean and output must have the same dtype");
@@ -301,5 +322,4 @@ Tensor run_sm80_qk_attn(const Tensor &query,
       });
     });
   });
-  return params.lse;
 }
