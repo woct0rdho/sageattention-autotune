@@ -21,35 +21,6 @@ _qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
 CutlassSageBwdResult = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
-@torch.library.register_fake("sageattention_qattn_cutlass_sm80::qk_int8_sv_f16_accum_f32_attn_bwd_cutlass")
-def _bwd_fake_impl(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    query_scale: torch.Tensor,
-    key_scale: torch.Tensor,
-    value: torch.Tensor,
-    grad_output: torch.Tensor,
-    lse: torch.Tensor,
-    delta: torch.Tensor,
-    dq_accum: torch.Tensor,
-    ds_sum: torch.Tensor,
-    do_int8: torch.Tensor,
-    do_scale: torch.Tensor,
-    ds_q_factors: torch.Tensor,
-    ds_k_factors: torch.Tensor,
-    grad_key: torch.Tensor,
-    grad_value: torch.Tensor,
-    tensor_layout: int,
-    sm_scale: float,
-    blk_q: int,
-    blk_k: int,
-    bwd_block_m: int,
-    bwd_block_n: int,
-    smooth_k: bool,
-) -> None:
-    return None
-
-
 def _sageattn_cutlass_bwd_configured(
     q: torch.Tensor,
     k: torch.Tensor,

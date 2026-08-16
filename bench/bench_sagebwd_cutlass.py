@@ -10,8 +10,7 @@ import torch
 from flash_attn import flash_attn_func
 
 from sageattention.cutlass_attn import _sageattn_cutlass_configured
-from sageattention.cutlass_bwd import _BWD_CONFIGS, _BWD_CONFIGS_BY_HEAD_DIM
-from sageattention.cutlass_compile import _qattn_cutlass_sm80
+from sageattention.cutlass_bwd import _BWD_CONFIGS, _BWD_CONFIGS_BY_HEAD_DIM, _qattn_cutlass_sm80
 from sageattention.triton.cutlass_bwd import convert_dq, preprocess_delta_zero_dq
 from sageattention.triton.quant_per_block import per_block_int8
 from sageattention.utils import _lse_correction

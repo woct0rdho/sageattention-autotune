@@ -4,7 +4,13 @@ import torch
 from torch._inductor.kernel.custom_op import CustomOpConfig, register_custom_op_autotuning
 
 from . import autotune_utils
+from .torch_compile_patch import (
+    install_mutation_only_custom_op_autotuning,
+    register_mutation_only_custom_op_functionalization,
+)
 from .utils import _padded_head_dim
+
+install_mutation_only_custom_op_autotuning()
 
 _AUTOTUNE_CONFIGS = (
     (128, 64, 32, 64),
@@ -77,58 +83,48 @@ def _eager_autotune_select(
     )
 
 
-@torch.library.custom_op("sageattention_internal::sageattn_autotuned", mutates_args=())
+@torch.library.custom_op("sageattention_internal::sageattn_autotuned", mutates_args={"output", "lse"})
 def _sageattn_autotuned(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
     tensor_layout: str,
     is_causal: bool,
     pv_accum_dtype: str,
     smooth_k: bool,
     smooth_v: bool,
+    return_lse: bool,
     blk_q: int = 0,
     blk_k: int = 0,
     warp_q: int = 0,
     warp_k: int = 0,
-) -> torch.Tensor:
-    from .cuda_attn import _sageattn_configured
+) -> None:
+    from .cuda_attn import _sageattn_configured_out
 
     qk_config = (blk_q, blk_k, warp_q, warp_k)
     configs = _valid_configs(q.size(-1), is_causal, q.device.index)
     if min(qk_config) <= 0 or qk_config not in configs:
         qk_config = configs[0]
 
-    return _sageattn_configured(
+    _sageattn_configured_out(
         q,
         k,
         v,
+        output,
+        lse,
         tensor_layout,
         is_causal,
         pv_accum_dtype,
         smooth_k,
         smooth_v,
-        False,
+        return_lse,
         qk_config,
     )
 
 
-@_sageattn_autotuned.register_fake
-def _(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    tensor_layout: str,
-    is_causal: bool,
-    pv_accum_dtype: str,
-    smooth_k: bool,
-    smooth_v: bool,
-    blk_q: int = 0,
-    blk_k: int = 0,
-    warp_q: int = 0,
-    warp_k: int = 0,
-) -> torch.Tensor:
-    return torch.empty_like(q)
+register_mutation_only_custom_op_functionalization(_sageattn_autotuned)
 
 
 register_custom_op_autotuning(

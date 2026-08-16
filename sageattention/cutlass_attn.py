@@ -1,11 +1,21 @@
+import importlib
 from typing import Literal, overload
 
 import torch
 
 from .cutlass_autotune import _eager_autotune_select, _sageattn_cutlass_autotuned
-from .cutlass_compile import _qattn_cutlass_sm80
 from .triton.quant_per_block import per_block_int8
-from .utils import LOG2_E, _lse_correction, _pad_qkv
+from .utils import (
+    LOG2_E,
+    _allocate_forward_outputs,
+    _format_forward_outputs,
+    _is_compiling_or_fake,
+    _lse_correction,
+    _pad_qkv,
+)
+
+importlib.import_module(f"{__package__}._qattn_cutlass_sm80")
+_qattn_cutlass_sm80 = torch.ops.sageattention_qattn_cutlass_sm80
 
 CutlassSageAttnResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
@@ -62,10 +72,10 @@ def sageattn_qk_int8_pv_fp16_cutlass(
     if smooth_v:
         raise ValueError("CUTLASS qattn currently does not support smooth_v.")
 
-    if torch.compiler.is_compiling():
-        if return_lse:
-            raise NotImplementedError("torch.compile with return_lse=True is not supported.")
-        return _sageattn_cutlass_autotuned(q, k, v, tensor_layout, smooth_k)
+    if _is_compiling_or_fake(q):
+        output, lse = _allocate_forward_outputs(q, tensor_layout, return_lse)
+        _sageattn_cutlass_autotuned(q, k, v, output, lse, tensor_layout, smooth_k, return_lse)
+        return _format_forward_outputs(output, lse, q.size(-1), return_lse)
 
     qk_config = _eager_autotune_select(q, k, v, tensor_layout, smooth_k, return_lse)
     return _sageattn_cutlass_configured(q, k, v, tensor_layout, smooth_k, return_lse, qk_config)
@@ -104,20 +114,42 @@ def _sageattn_cutlass_configured(
     return_lse: bool,
     qk_config: tuple[int, int, int, int],
 ) -> CutlassSageAttnResult:
+    output, lse = _allocate_forward_outputs(q, tensor_layout, return_lse)
+    _sageattn_cutlass_configured_out(
+        q,
+        k,
+        v,
+        output,
+        lse,
+        tensor_layout,
+        smooth_k,
+        return_lse,
+        qk_config,
+    )
+    return _format_forward_outputs(output, lse, q.size(-1), return_lse)
+
+
+def _sageattn_cutlass_configured_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
+    tensor_layout: str,
+    smooth_k: bool,
+    return_lse: bool,
+    qk_config: tuple[int, int, int, int],
+) -> None:
     if not q.is_cuda or not k.is_cuda or not v.is_cuda:
         raise ValueError("Input tensors must be CUDA tensors.")
     if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
         raise ValueError("CUTLASS qattn currently supports fp16 q, k, and v only.")
     if q.device != k.device or q.device != v.device:
         raise ValueError("All tensors must be on the same device.")
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise ValueError("All tensors must have the same dtype.")
     if k.shape != v.shape:
         raise ValueError("k and v must have the same shape.")
 
     head_dim, q, k, v = _pad_qkv(q, k, v)
-    if q.size(-1) not in (64, 128):
-        raise ValueError("CUTLASS qattn currently supports padded head_dim 64 or 128.")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Last dimension of q, k, and v must be contiguous.")
 
@@ -151,12 +183,12 @@ def _sageattn_cutlass_configured(
         tensor_layout=tensor_layout,
     )
 
-    output = torch.empty_like(q)
-    lse = _qattn_cutlass_sm80.qk_int8_sv_f16_accum_f32_attn_cutlass(
+    _qattn_cutlass_sm80.qk_int8_sv_f16_accum_f32_attn_cutlass(
         q_int8,
         k_int8,
         v,
         output,
+        lse,
         q_scale,
         k_scale,
         layout_i,
@@ -168,12 +200,11 @@ def _sageattn_cutlass_configured(
         return_lse,
     )
 
-    output = output[..., :head_dim]
     if not return_lse:
-        return output
+        return
 
+    assert lse is not None
     lse /= LOG2_E
     if smooth_k:
         assert km is not None
         lse += _lse_correction(q, km, tensor_layout, head_dim_index) * sm_scale
-    return output, lse

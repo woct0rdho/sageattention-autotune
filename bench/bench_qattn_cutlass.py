@@ -8,10 +8,12 @@ from pathlib import Path
 import torch
 from flash_attn import flash_attn_func
 
-from sageattention.cuda_attn import _sageattn_configured
-from sageattention.cuda_compile import _qattn_sm80
-from sageattention.cutlass_attn import _CUTLASS_QK_QUANT_CONFIG, _sageattn_cutlass_configured
-from sageattention.cutlass_compile import _qattn_cutlass_sm80
+from sageattention.cuda_attn import _qattn_sm80, _sageattn_configured
+from sageattention.cutlass_attn import (
+    _CUTLASS_QK_QUANT_CONFIG,
+    _qattn_cutlass_sm80,
+    _sageattn_cutlass_configured,
+)
 from sageattention.triton.quant_per_block import per_block_int8
 from sageattention.triton.quant_per_thread import per_thread_int8
 
@@ -166,7 +168,16 @@ def _prequantized_inputs(
             WARPK=warp_k,
             tensor_layout=layout,
         )
-    return q_int8, k_int8, v, torch.empty_like(q), q_scale, k_scale, 1 if layout == "HND" else 0, q.size(-1) ** -0.5
+    return (
+        q_int8,
+        k_int8,
+        v,
+        torch.empty_like(q),
+        q_scale,
+        k_scale,
+        1 if layout == "HND" else 0,
+        q.size(-1) ** -0.5,
+    )
 
 
 def _cuda_kernel_only(
@@ -186,6 +197,7 @@ def _cuda_kernel_only(
         k_int8,
         v,
         out,
+        None,
         q_scale,
         k_scale,
         layout_i,
@@ -217,6 +229,7 @@ def _cutlass_kernel_only(
         k_int8,
         v,
         out,
+        None,
         q_scale,
         k_scale,
         layout_i,

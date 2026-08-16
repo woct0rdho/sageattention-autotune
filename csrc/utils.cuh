@@ -24,6 +24,9 @@ inline cudaStream_t get_current_cuda_stream(const torch::stable::Tensor &tensor)
 #define CHECK_CUDA(x) \
   STD_TORCH_CHECK(x.is_cuda(), "Tensor " #x " must be on CUDA")
 
+#define CHECK_SAME_DEVICE(reference, x) \
+  STD_TORCH_CHECK((x).get_device_index() == (reference).get_device_index(), "Tensor " #x " must be on the same device as tensor " #reference)
+
 #define CHECK_DTYPE(x, true_dtype) \
   STD_TORCH_CHECK(x.scalar_type() == true_dtype, "Tensor " #x " must have dtype (" #true_dtype ")")
 

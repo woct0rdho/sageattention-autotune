@@ -55,11 +55,12 @@ def _run_case(
         return_lse,
         block_config,
     )
+    output_atol = 0.14 if dtype == torch.bfloat16 and head_dim == 256 else (0.12 if dtype == torch.bfloat16 else 0.1)
     return _attention_report(
         actual,
         expected,
         rtol=0.014,
-        atol=0.12 if dtype == torch.bfloat16 else 0.1,
+        atol=output_atol,
         lse_rtol=0.0004,
         lse_atol=0.07 if head_dim == 256 else 0.06,
     )

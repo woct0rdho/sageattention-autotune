@@ -97,18 +97,21 @@ def _prepare_sage_backward_inputs(
         BLKK=block_n,
         tensor_layout="NHD",
     )
-    out, lse = _attn_forward(
+    out = torch.empty_like(v)
+    lse = torch.empty((q.size(0), q.size(2), q.size(1)), device=q.device, dtype=torch.float32)
+    _attn_forward(
         q_int8,
         k_int8,
         v,
         q_scale,
         k_scale,
+        out,
+        lse,
         tensor_layout="NHD",
         is_causal=False,
         pv_accum_dtype="fp32",
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        output_dtype=v.dtype,
         return_lse=True,
     )
     return q_int8, k_int8, v, dout, out, lse, q_scale, k_scale, k_mean

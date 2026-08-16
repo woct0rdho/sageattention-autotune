@@ -27,6 +27,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "Tensor key, "
             "Tensor value, "
             "Tensor(a!) output, "
+            "Tensor(b!)? lse, "
             "Tensor query_scale, "
             "Tensor key_scale, "
             "int tensor_layout, "
@@ -37,12 +38,13 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int warp_q, "
             "int warp_k, "
             "bool return_lse"
-          ") -> Tensor");
+          ") -> ()");
     m.def("qk_int8_sv_f16_accum_f16_attn("
             "Tensor query, "
             "Tensor key, "
             "Tensor value, "
             "Tensor(a!) output, "
+            "Tensor(b!)? lse, "
             "Tensor query_scale, "
             "Tensor key_scale, "
             "int tensor_layout, "
@@ -53,12 +55,13 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int warp_q, "
             "int warp_k, "
             "bool return_lse"
-          ") -> Tensor");
+          ") -> ()");
     m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf("
             "Tensor query, "
             "Tensor key, "
             "Tensor value, "
             "Tensor(a!) output, "
+            "Tensor(b!)? lse, "
             "Tensor query_scale, "
             "Tensor key_scale, "
             "int tensor_layout, "
@@ -69,12 +72,13 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int warp_q, "
             "int warp_k, "
             "bool return_lse"
-          ") -> Tensor");
+          ") -> ()");
     m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn("
             "Tensor query, "
             "Tensor key, "
             "Tensor value, "
             "Tensor(a!) output, "
+            "Tensor(b!)? lse, "
             "Tensor query_scale, "
             "Tensor key_scale, "
             "Tensor value_mean, "
@@ -86,7 +90,7 @@ STABLE_TORCH_LIBRARY(sageattention_qattn_sm80, m) {
             "int warp_q, "
             "int warp_k, "
             "bool return_lse"
-          ") -> Tensor");
+          ") -> ()");
 }
 
 // Registers CUDA implementations

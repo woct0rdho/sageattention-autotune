@@ -294,15 +294,15 @@ def forward(
     v: torch.Tensor,
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
+    output: torch.Tensor,
+    lse: torch.Tensor | None,
     tensor_layout: str,
     is_causal: bool,
     pv_accum_dtype: str,
     BLOCK_M: int,
     BLOCK_N: int,
-    output_dtype: torch.dtype,
     return_lse: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    o = torch.empty(q.shape, device=q.device, dtype=output_dtype)
+) -> None:
 
     if tensor_layout == "HND":
         b, h_qo, qo_len, head_dim = q.shape
@@ -311,7 +311,7 @@ def forward(
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
         stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
-        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(1), o.stride(2)
+        stride_bz_o, stride_h_o, stride_seq_o = output.stride(0), output.stride(1), output.stride(2)
     elif tensor_layout == "NHD":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = k.shape
@@ -319,7 +319,7 @@ def forward(
         stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
         stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
         stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
-        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(2), o.stride(1)
+        stride_bz_o, stride_h_o, stride_seq_o = output.stride(0), output.stride(2), output.stride(1)
     else:
         raise ValueError(f"tensor_layout {tensor_layout} not supported")
 
@@ -333,10 +333,12 @@ def forward(
 
     num_kv_groups = h_qo // h_kv
 
-    if return_lse:
-        lse = torch.empty([b, h_qo, qo_len], device=q.device, dtype=torch.float32)
-    else:
-        lse = torch.empty([0], device=q.device, dtype=torch.float32)
+    if output.shape != q.shape or output.device != q.device or output.stride(-1) != 1:
+        raise ValueError("output must match the query shape and device with a contiguous last dimension")
+    if return_lse and (
+        lse is None or lse.shape != (b, h_qo, qo_len) or lse.device != q.device or lse.dtype != torch.float32
+    ):
+        raise ValueError("lse must match the selected layout, query device, and float32 dtype")
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
     _attn_fwd[grid](
@@ -345,7 +347,7 @@ def forward(
         v,
         q_scale,
         k_scale,
-        o,
+        output,
         lse,
         stride_bz_q,
         stride_h_q,
@@ -375,5 +377,3 @@ def forward(
         Q_BUCKET=_autotune_seq_len_bucket(qo_len),
         K_BUCKET=_autotune_seq_len_bucket(kv_len),
     )
-
-    return o, lse
