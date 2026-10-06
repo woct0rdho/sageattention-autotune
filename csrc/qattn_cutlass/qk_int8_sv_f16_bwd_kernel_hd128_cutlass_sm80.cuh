@@ -303,12 +303,26 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
     auto rPFloat = cute::recast<float>(acc_score);
     float p_max_abs = 0.0f;
     const float score_scale = q_block_scale * k_block_scale;
+    // Fold the softmax scale into one FFMA per element and, for raw K, fold the dS
+    // dequantization into the same chain. The dS predictor does not depend on p, so it
+    // is hoisted above the reconstruction loop.
+    const int32_t q_factor_next = q_block_index + 1 < dS_q_extent ? q_block_index + 1 : q_block_index;
+    const float dO_l2_max = fmaxf(gdSQFactors[2 * q_block_index], gdSQFactors[2 * q_factor_next]);
+    const float delta_abs_max = fmaxf(gdSQFactors[2 * q_block_index + 1], gdSQFactors[2 * q_factor_next + 1]);
+    const float predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
+      (dO_l2_max * gdSKFactors[k_factor_index] + delta_abs_max);
+    const float dS_scale = predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
+    const float inv_dS_scale = 1.0f / dS_scale;
+    const float folded_score_scale = score_scale * sm_scale;
+    const float folded_dS_scale = sm_scale * inv_dS_scale;
     const int32_t row_state_0 = m_half * Traits::kBlockM + lane_id / 4;
     const int32_t row_state_1 = row_state_0 + 8;
     const float lse_0 = sLse(row_state_0);
     const float lse_1 = sLse(row_state_1);
     const float delta_0 = sDelta(row_state_0);
     const float delta_1 = sDelta(row_state_1);
+    const float delta_0_scaled = delta_0 * folded_dS_scale;
+    const float delta_1_scaled = delta_1 * folded_dS_scale;
 #pragma unroll
     for (int32_t idx = 0; idx < cute::size(acc_score); ++idx)
     {
@@ -321,9 +335,15 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
       if (IsAligned || (row < params.seq_len && col < params.seq_len))
       {
         const bool upper_row = (idx & 2) != 0;
-        const float score = static_cast<float>(acc_score(idx)) * score_scale;
-        p = expf(score * sm_scale - (upper_row ? lse_1 : lse_0));
-        dS = p * (acc_dp(idx) - (upper_row ? delta_1 : delta_0)) * sm_scale;
+        p = expf(fmaf(static_cast<float>(acc_score(idx)), folded_score_scale, -(upper_row ? lse_1 : lse_0)));
+        if constexpr (SmoothK)
+        {
+          dS = p * (acc_dp(idx) - (upper_row ? delta_1 : delta_0)) * sm_scale;
+        }
+        else
+        {
+          dS = p * fmaf(acc_dp(idx), folded_dS_scale, -(upper_row ? delta_1_scaled : delta_0_scaled));
+        }
         p_max_abs = fmaxf(p_max_abs, p);
       }
       rPFloat(idx) = p;
@@ -344,14 +364,7 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
     __syncthreads();
 
     const float p_scale = fmaxf(shared.p_scale[warp_id], shared.p_scale[warp_id ^ 1]);
-    const int32_t q_factor_next = q_block_index + 1 < dS_q_extent ? q_block_index + 1 : q_block_index;
-    const float dO_l2_max = fmaxf(gdSQFactors[2 * q_block_index], gdSQFactors[2 * q_factor_next]);
-    const float delta_abs_max = fmaxf(gdSQFactors[2 * q_block_index + 1], gdSQFactors[2 * q_factor_next + 1]);
-    const float predicted_dS_max = kdSPredictorGuard * sm_scale / static_cast<float>(params.seq_len) *
-      (dO_l2_max * gdSKFactors[k_factor_index] + delta_abs_max);
-    const float dS_scale = predicted_dS_max * kInt8ScaleInv + kInt8ScaleFloor;
     const float inv_p_scale = 1.0f / p_scale;
-    const float inv_dS_scale = 1.0f / dS_scale;
     constexpr auto transposed_store_shape = cute::make_shape(cute::Int<Traits::kBlockN>{}, cute::Int<Traits::kBlockM>{});
     auto sPTile = cute::local_tile(sPPair, transposed_store_shape, cute::make_coord(cute::_0{}, m_half));
     auto sdSTile = cute::local_tile(sdSPair, transposed_store_shape, cute::make_coord(cute::_0{}, m_half));
@@ -372,7 +385,14 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
         if (IsAligned || (row < params.seq_len && col < params.seq_len))
         {
           p_i8 = round_to_int8(rPFloat(idx) * inv_p_scale);
-          dS_i8 = round_to_int8(acc_dp(idx) * inv_dS_scale);
+          if constexpr (SmoothK)
+          {
+            dS_i8 = round_to_int8(acc_dp(idx) * inv_dS_scale);
+          }
+          else
+          {
+            dS_i8 = round_to_int8(acc_dp(idx));
+          }
         }
         rP(idx) = p_i8;
         rdS(idx) = dS_i8;
@@ -523,11 +543,13 @@ void fused_mma_kernel_hd128_2d(const int8_t *__restrict__ const Q,
       load_row_state_pair(gLse, gDelta, sLse, sDelta, next_m_pair_base, params.seq_len, lane_id);
     }
 
-    if ((n_tile & 1) == 0)
     {
-      const int32_t dQ_dim_begin = n_pair * kdQDimBlocksPerOwner * Traits::kBlockK;
+      // Balanced dQ: every warp owns two adjacent D16 slices for its own M16 half, so the
+      // grouped two-slice loop still amortizes each dS fragment while the dQ tail is spread
+      // over all eight warps instead of four.
+      const int32_t dQ_dim_begin = n_tile * 2 * Traits::kBlockK;
 #pragma unroll
-      for (int32_t dim_offset = 0; dim_offset < kdQDimBlocksPerOwner * Traits::kBlockK; dim_offset += 2 * Traits::kBlockK)
+      for (int32_t dim_offset = 0; dim_offset < 2 * Traits::kBlockK; dim_offset += 2 * Traits::kBlockK)
       {
         const int32_t dim_base_0 = dQ_dim_begin + dim_offset;
         const int32_t dim_base_1 = dim_base_0 + Traits::kBlockK;
